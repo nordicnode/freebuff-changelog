@@ -1,0 +1,1966 @@
+Date: 2026-10-14T11:13:55Z
+Category: CLI
+Areas: CLI
+Commit nature: production
+Stats: +651 / -84
+Analysis notes: CLI changes across 2 file(s) (+651/−84).
+Modified files: cli/src/utils/run-state-storage.ts, cli/src/utils/write-file-atomic.ts
+Key facts (ground the WHY and DETAIL sentences in these): - Cheap shape summary so a failure log says what the payload looked like. Tolerates a non-array `messages`: this runs only when the state is already suspect, and a diagnostic that throws on the shape it exists to describe just replaces the real failure with its own. - The one character each file's JSON must start with. - Rate-limited like every other save issue, but logged at error level: this is a bug in whatever handed us the state, and until ticket #180 nothing reported it. - The first character and the length only. Anything more could be the user's prompt text, and this is a diagnostic. - The parsed document, or null when there was nothing usable to restore. - Read one chat-state file, and set its bytes aside before anything can replace them.
+Structured facts (extracted mechanically from the diff; copy names and values verbatim, never round or rename):
+- Constants newly defined: CHAT_STATE_JSON_PREFIX = { runState: '{', messages: '[' } as const (a definition alone changes nothing at runtime; if the diff shows no reader, say it is in place and does nothing yet)
+- Exports added: AtomicWriteFs, setAtomicWriteFsForTesting
+- Behavior asserted by new tests (test titles, verbatim; the hunks themselves are omitted): "a transcript is never destroyed" ; "saveChatState never writes the literal text null over a transcript" ; "saveChatState never writes the literal text null over a run state" ; "a null-content transcript survives the load instead of being replaced" ; "an unparseable transcript is kept, not replaced with an empty array" ; "an unparseable run state is kept too" ; "a transcript that is readable is never moved aside" ; "a first load with no files on disk quarantines nothing" ; "refuses to resume rather than hand back a state that would overwrite unreadable bytes" ; "durability" ; "flushes the contents before the rename publishes the name" ; "flushes the directory entry after the rename" ; "does not publish the name when the flush fails" ; "async: flushes the contents before the rename publishes the name"
+Module & File Purpose (ground-truth documentation from touched files):
+- File `cli/src/utils/write-file-atomic.ts`:
+```
+// Unique per-write temp suffix. A plain `${pid}.tmp` collides when a sync
+// exit-flush and an async checkpoint write target the same file concurrently
+// (both share the pid): they'd write and rename the SAME temp path, tearing
+// each other's output. A random component makes every write self-contained.
+```
+Subsystem Architecture Documentation (from nearby package guides):
+- From `cli/README.md`:
+```markdown
+# @codebuff/cli
+
+A Terminal User Interface (TUI) package built with OpenTUI and React.
+
+## Installation
+
+```bash
+bun install
+```
+
+## Development
+
+Run the TUI in development mode:
+
+```bash
+bun run dev
+```
+
+## Testing
+
+Run the test suite:
+
+```bash
+bun test
+```
+
+### Interactive E2E Testing
+
+For testing interactive CLI features, install tmux:
+
+```bash
+# macOS
+brew install tmux
+
+# Ubuntu/Debian
+sudo apt-get install tmux
+
+# Windows (via WSL)
+wsl --install
+sudo apt-get install tmux
+```
+
+Then run the proof-of-concept:
+
+```bash
+bun run test:tmux-poc
+```
+
+[freebuff product prompt text omitted]
+
+```bash
+# ❌ Broken: tmux send-keys -t session "hello"
+# ✅ Works:  tmux send-keys -t session $'\e[200~hello\e[201~'
+```
+
+See [tmux.knowledge.md](tmux.knowledge.md) for comprehensive tmux documentation and [src/__tests__/README.md](src/__tests__/README.md) for testing documentation.
+
+## Build
+
+Build the package:
+
+```bash
+bun run build
+```
+
+## Run
+
+Run the built TUI:
+
+```bash
+bun run start
+```
+
+Or use the binary directly:
+
+```bash
+codebuff-tui
+```
+
+## Features
+```
+Complete Source of Modified Files (for complete module context):
+- File `cli/src/utils/run-state-storage.ts` (679 lines):
+```
+import * as fs from 'fs'
+import path from 'path'
+import { randomUUID } from 'node:crypto'
+
+import {
+  getCurrentChatDir,
+  getMostRecentChatDir,
+  getProjectDataDir,
+} from '../project-files'
+import {
+  CHAT_MESSAGES_FILENAME,
+  writeChatMeta,
+} from './chat-meta'
+import { logger } from './logger'
+import { classifyStringifyError, serializeForPersistence } from './safe-json'
+import { writeFileAtomic, writeFileAtomicAsync } from './write-file-atomic'
+
+import type { ChatMessage } from '../types/chat'
+import type { RunState } from '@codebuff/sdk'
+
+const RUN_STATE_FILENAME = 'run-state.json'
+
+type SavedChatState = {
+  runState: RunState
+  messages: ChatMessage[]
+  chatId?: string
+}
+
+type LiveChatState = {
+  runState: RunState
+  messages: ChatMessage[]
+}
+
+let liveChatStateProvider: {
+  ownerId: string
+  chatDir: string
+  provide: () => LiveChatState | null
+} | null = null
+
+/**
+ * Register a provider for the in-flight chat state. While a run is active,
+ * exit paths call flushLiveChatState() to persist the latest checkpoint so a
+ * quit/crash doesn't lose the turn. ownerId ties the provider to a specific
+ * run so a stale run can't clear a newer run's provider. The chat directory
+ * is captured at registration time so a later chat switch can't redirect the
+ * flush into a different chat's directory.
+ */
+export function setLiveChatStateProvider(
+  ownerId: string,
+  provide: () => LiveChatState | null,
+): void {
+  liveChatStateProvider = { ownerId, chatDir: resolveCurrentChatDir(), provide }
+}
+
+export function clearLiveChatStateProvider(ownerId: string): void {
+  if (liveChatStateProvider?.ownerId === ownerId) {
+    liveChatStateProvider = null
+  }
+}
+
+/**
+ * Synchronously persist the in-flight chat state, if any. Safe to call from
+ * process exit/signal handlers (saveChatState uses writeFileSync).
+ */
+export function flushLiveChatState(): void {
+  try {
+    // The process is exiting, so the async drain will never get to run:
+    // write any queued checkpoints synchronously first. Each is bound to the
+    // chat dir captured when it was scheduled. The live provider below may
+    // overwrite one of these with strictly newer state — that order is
+    // intentional.
+    for (const [chatDir, state] of pendingCheckpoints) {
+      saveChatState(state.runState, state.messages, chatDir)
+    }
+    pendingCheckpoints.clear()
+
+    const provider = liveChatStateProvider
+    if (!provider) {
+      return
+    }
+    // The provider reads live store state. Once the user has switched to a
+    // different chat (/new, resuming from /history), that state no longer
+    // matches the provider's chat directory — flushing would overwrite the
+    // run's chat with another conversation's messages. Skip instead; the
+    // run's last checkpoint was flushed from the queue above.
+    if (provider.chatDir !== resolveCurrentChatDir()) {
+      return
+    }
+    const state = provider.provide()
+    if (state) {
+      saveChatState(state.runState, state.messages, provider.chatDir)
+    }
+  } catch {
+    // Best-effort - never block process exit.
+  }
+}
+
+// Test-only escape hatch: persistence normally resolves the chat directory
+// through project-files (under the user's real config dir). Tests point it at
+// a temp directory instead of mocking module internals — mock.module leaks
+// across bun test files and os.homedir() ignores $HOME on macOS, so both of
+// those seams are unreliable (see docs/testing.md: DI over module mocking).
+let chatDirOverride: string | undefined
+
+export function setChatDirOverrideForTesting(dir: string | undefined): void {
+  chatDirOverride = dir
+}
+
+/**
+ * Resolve the directory of the currently active chat. Persistence callers
+ * must capture this at the moment the state is captured (run start, snapshot
+ * time) and pass it through to the save — resolving it again at write time
+ * races with chat switches (/new, resuming from /history) and would write one
+ * chat's transcript into another chat's directory.
+ */
+export function resolveCurrentChatDir(): string {
+  if (chatDirOverride) {
+    fs.mkdirSync(chatDirOverride, { recursive: true })
+    return chatDirOverride
+  }
+  return getCurrentChatDir()
+}
+
+// Chat-state saves fail in prod for reasons that are chronic, not transient:
+// a transcript with a cyclic or over-string-limit payload fails identically on
+// every 5s checkpoint, and a full disk stays full. Logging each attempt at
+// error level made this a top-3 error by volume (~19k/day). Instead, each
+// distinct issue per chat dir is logged at most once per interval, and
+// environment/payload failures log as warnings — only genuinely unexpected
+// errors keep the error level.
+const SAVE_LOG_INTERVAL_MS = 5 * 60 * 1000
+const saveIssueLastLoggedAt = new Map<string, number>()
+
+function shouldLogSaveIssue(key: string): boolean {
+  const now = Date.now()
+  const last = saveIssueLastLoggedAt.get(key)
+  if (last !== undefined && now - last < SAVE_LOG_INTERVAL_MS) {
+    return false
+  }
+  saveIssueLastLoggedAt.set(key, now)
+  return true
+}
+
+/**
+ * Logging must never break persistence: these paths run inside checkpoint
+ * drains and exit flushes, where a throwing logger (e.g. analytics transport
+ * not initialized) would otherwise lose the save or reject the drain.
+ */
+function bestEffortLog(
+  level: 'warn' | 'error',
+  payload: Record<string, unknown>,
+  message: string,
+): void {
+  try {
+    logger[level](payload, message)
+  } catch {
+    // Best-effort only.
+  }
+}
+
+type SaveErrorClass = 'cyclic' | 'oom' | 'disk' | 'other'
+
+function classifySaveError(error: unknown): SaveErrorClass {
+  const fromStringify = classifyStringifyError(error)
+  if (fromStringify) return fromStringify
+  const msg = error instanceof Error ? error.message : String(error)
+  // Environmental filesystem failures: retrying won't help and there is
+  // nothing to fix server-side (full disk, AV holding a rename lock, etc.).
+  if (/ENOSPC|EDQUOT|EROFS|EPERM|EACCES|EBUSY|EMFILE|ENFILE/.test(msg)) {
+    return 'disk'
+  }
+  return 'other'
+}
+
+/** Cheap shape summary so a failure log says what the payload looked like.
+ *  Tolerates a non-array `messages`: this runs only when the state is already
+ *  suspect, and a diagnostic that throws on the shape it exists to describe
+ *  just replaces the real failure with its own. */
+function chatShapeSummary(runState: RunState, messages: ChatMessage[]) {
+  const list = Array.isArray(messages) ? messages : []
+  let blockCount = 0
+  for (const message of list) {
+    blockCount += message?.blocks?.length ?? 0
+  }
+  return {
+    messageCount: Array.isArray(messages) ? messages.length : null,
+    blockCount,
+    runStateKeys:
+      runState && typeof runState === 'object'
+        ? Object.keys(runState as object).slice(0, 20)
+        : [],
+  }
+}
+
+type SerializedChatState = {
+  runStateJson?: string
+  messagesJson?: string
+}
+
+/** The one character each file's JSON must start with. */
+const CHAT_STATE_JSON_PREFIX = { runState: '{', messages: '[' } as const
+
+/**
+ * Refuse to persist anything that is not the document the file is supposed to
+ * hold. `JSON.stringify` answers the four-byte string `null` for null, NaN and
+ * a value whose toJSON returns nothing, and `undefined` for undefined — and
+ * `'null'` is *truthy*, so it sailed through the `if (serialized.messagesJson)`
+ * guard below and replaced a user's whole transcript with the literal text
+ * `null`, with no crash involved. On the next load that parses to null and
+ * reads as "no transcript". Writing nothing leaves the previous good file in
+ * place, which is always the better of the two outcomes.
+ */
+// Returns a plain boolean, not a `json is string` predicate: the caller's
+// `json` is already typed `string`, so a predicate narrows the negative branch
+// to `never` and the defensive `typeof` checks in the refusal log stop
+// compiling. The runtime check stays, because SerializeResult's `string` comes
+// from JSON.stringify's lib type, which answers `undefined` for undefined.
+function isPersistableJson(
+  json: unknown,
+  part: 'runState' | 'messages',
+): boolean {
+  return (
+    typeof json === 'string' && json.startsWith(CHAT_STATE_JSON_PREFIX[part])
+  )
+}
+
+/**
+ * Serialize the two chat-state files independently, so a poisoned run state
+ * cannot block persisting the transcript (and vice versa). Cyclic and
+ * over-limit payloads are rescued by serializeForPersistence's fallback pass;
+ * the fallback diagnostics (cycle paths, truncation counts) are logged so the
+ * source of a bad payload can be found from prod logs.
+ */
+function serializeChatState(
+  runState: RunState,
+  messages: ChatMessage[],
+  chatDir: string,
+): SerializedChatState {
+  const result: SerializedChatState = {}
+  for (const part of ['runState', 'messages'] as const) {
+    const value = part === 'runState' ? runState : messages
+    try {
+      const { json, fallback } = serializeForPersistence(value)
+      if (!isPersistableJson(json, part)) {
+        // Rate-limited like every other save issue, but logged at error level:
+        // this is a bug in whatever handed us the state, and until ticket #180
+        // nothing reported it.
+        if (shouldLogSaveIssue(`${chatDir}|nonpersistable|${part}`)) {
+          bestEffortLog(
+            'error',
+            {
+              part,
+              // The first character and the length only. Anything more could
+              // be the user's prompt text, and this is a diagnostic.
+              jsonType: typeof json,
+              jsonPrefix: typeof json === 'string' ? json.slice(0, 1) : null,
+              jsonBytes: typeof json === 'string' ? json.length : null,
+              ...chatShapeSummary(runState, messages),
+            },
+            'Refusing to persist non-document chat state (keeping the file on disk)',
+          )
+        }
+        continue
+      }
+      if (part === 'runState') {
+        result.runStateJson = json
+      } else {
+        result.messagesJson = json
+      }
+      if (fallback && shouldLogSaveIssue(`${chatDir}|fallback|${part}`)) {
+        bestEffortLog(
+          'warn',
+          {
+            part,
+            reason: fallback.reason,
+            cyclePaths: fallback.cyclePaths,
+            truncatedStrings: fallback.truncatedStrings,
+            jsonBytes: json.length,
+            ...chatShapeSummary(runState, messages),
+          },
+          'Chat state serialized via fallback (broke cycles or truncated oversized strings)',
+        )
+      }
+    } catch (error) {
+      const errorClass = classifySaveError(error)
+      if (shouldLogSaveIssue(`${chatDir}|serialize|${part}|${errorClass}`)) {
+        bestEffortLog(
+          errorClass === 'other' ? 'error' : 'warn',
+          {
+            part,
+            errorClass,
+            error: error instanceof Error ? error.message : String(error),
+            ...chatShapeSummary(runState, messages),
+          },
+          'Failed to serialize chat state',
+        )
+      }
+    }
+  }
+  return result
+}
+
+function logSaveWriteFailure(
+  error: unknown,
+  chatDir: string,
+  message: string,
+): void {
+  const errorClass = classifySaveError(error)
+  if (!shouldLogSaveIssue(`${chatDir}|write|${errorClass}`)) {
+    return
+  }
+  bestEffortLog(
+    errorClass === 'other' ? 'error' : 'warn',
+    {
+      errorClass,
+      error: error instanceof Error ? error.message : String(error),
+    },
+    message,
+  )
+}
+
+/**
+ * Save both the RunState and ChatMessage[] to disk.
+ *
+ * `chatDir` should be captured when the state itself is captured (e.g. at run
+ * start) and passed through. Defaulting to the current chat dir is only safe
+ * when the caller knows no chat switch can have happened in between.
+ */
+export function saveChatState(
+  runState: RunState,
+  messages: ChatMessage[],
+  chatDir: string = resolveCurrentChatDir(),
+): void {
+  // Compact JSON: these files are rewritten on every checkpoint and grow to
+  // multiple MB; pretty-printing roughly doubles the write.
+  const serialized = serializeChatState(runState, messages, chatDir)
+  if (!serialized.runStateJson && !serialized.messagesJson) {
+    return
+  }
+  try {
+    // The dir existed when the save was captured, but may have been removed
+    // since (e.g. the chat deleted from /history mid-run).
+    fs.mkdirSync(chatDir, { recursive: true })
+    if (serialized.runStateJson) {
+      writeFileAtomic(
+        path.join(chatDir, RUN_STATE_FILENAME),
+        serialized.runStateJson,
+      )
+    }
+    if (serialized.messagesJson) {
+      writeFileAtomic(
+        path.join(chatDir, CHAT_MESSAGES_FILENAME),
+        serialized.messagesJson,
+      )
+      // Sidecar summary so /history can list this chat without parsing the
+      // (unbounded) chat-messages.json. Must be written after the messages
+      // file: it records the file's size/mtime to detect staleness.
+      writeChatMeta(chatDir, messages)
+    }
+  } catch (error) {
+    logSaveWriteFailure(error, chatDir, 'Failed to save chat state')
+  }
+}
+
+/**
+ * Async counterpart to saveChatState. Serializes and writes off the caller's
+ * tick so a multi-MB transcript doesn't block the CLI's render/input thread.
+ */
+async function saveChatStateAsync(
+  runState: RunState,
+  messages: ChatMessage[],
+  chatDir: string,
+): Promise<void> {
+  const serialized = serializeChatState(runState, messages, chatDir)
+  if (!serialized.runStateJson && !serialized.messagesJson) {
+    return
+  }
+  try {
+    await fs.promises.mkdir(chatDir, { recursive: true })
+    if (serialized.runStateJson) {
+      await writeFileAtomicAsync(
+        path.join(chatDir, RUN_STATE_FILENAME),
+        serialized.runStateJson,
+      )
+    }
+    if (serialized.messagesJson) {
+      await writeFileAtomicAsync(
+        path.join(chatDir, CHAT_MESSAGES_FILENAME),
+        serialized.messagesJson,
+      )
+      // Sidecar summary so /history can list this chat without parsing the
+      // (unbounded) chat-messages.json. Written after the messages file: it
+      // records that file's size/mtime to detect staleness. The meta write is
+      // tiny, so keeping it synchronous here is fine.
+      writeChatMeta(chatDir, messages)
+    }
+  } catch (error) {
+    logSaveWriteFailure(error, chatDir, 'Failed to save chat state (async)')
+  }
+}
+
+// In-flight checkpoint writer. The SDK emits an onStateSnapshot roughly every
+// 5s at step boundaries while a run streams; the CLI used to persist each one
+// synchronously (cloneDeep in the SDK + two multi-MB JSON.stringify + two
+// blocking disk writes on the CLI), all on the render/input thread. In long
+// sessions that periodic stall is what users experience as "freezes". Instead,
+// schedule the write asynchronously and collapse bursts to a single in-flight
+// write, always persisting the latest state.
+// Coalesced per chat directory: a burst of checkpoints for the same chat
+// collapses to the latest, but a checkpoint for one chat can never displace a
+// still-queued checkpoint for another (e.g. the final flush of a chat the
+// user just switched away from).
+const pendingCheckpoints = new Map<string, LiveChatState>()
+let checkpointDrain: Promise<void> | null = null
+
+async function drainCheckpoints(): Promise<void> {
+  while (pendingCheckpoints.size > 0) {
+    // Yield first so serialization never runs on the same tick that scheduled
+    // us (that tick is often mid-render or handling a keystroke). Entries stay
+    // in the map while we yield, so the synchronous exit flush can still write
+    // them if the process quits before we resume.
+    await new Promise<void>((resolve) => setImmediate(resolve))
+    const entry = pendingCheckpoints.entries().next()
+    if (entry.done) {
+      break
+    }
+    const [chatDir, state] = entry.value
+    pendingCheckpoints.delete(chatDir)
+    // Write to the chat dir captured at schedule time: the current chat may
+    // have rotated (/new, /history resume) while this write sat in the queue,
+    // and resolving the dir here would dump this state into the wrong chat.
+    await saveChatStateAsync(state.runState, state.messages, chatDir)
+  }
+}
+
+/**
+ * Schedule an asynchronous, coalescing checkpoint save. Safe to call at a high
+ * rate: only one write runs at a time and intermediate states are dropped in
+ * favor of the latest (per chat). Use this for periodic in-flight checkpoints;
+ * use the synchronous saveChatState for one-shot authoritative saves (turn
+ * completion, exit flush).
+ */
+export function scheduleCheckpointSave(
+  runState: RunState,
+  messages: ChatMessage[],
+  chatDir: string = resolveCurrentChatDir(),
+): void {
+  pendingCheckpoints.set(chatDir, { runState, messages })
+  if (!checkpointDrain) {
+    checkpointDrain = drainCheckpoints().finally(() => {
+      checkpointDrain = null
+    })
+  }
+}
+
+/**
+ * Wait until all queued/in-flight checkpoint writes have flushed. Call this
+ * before an authoritative synchronous save (turn completion / error) so that a
+ * still-running async write can't land after — and clobber — the final state.
+ * Relies on the run having stopped scheduling checkpoints (the SDK's snapshot
+ * timer stops once the run settles), so the queue reaches idle.
+ */
+export async function settleCheckpointSave(): Promise<void> {
+  await checkpointDrain
+}
+
+type PersistedChatFile = {
+  /** The parsed document, or null when there was nothing usable to restore. */
+  value: unknown
+  outcome: 'ok' | 'missing' | 'damaged' | 'unpreserved' | 'unreadable'
+}
+
+/**
+ * Read one chat-state file, and set its bytes aside before anything can
+ * replace them.
+ *
+ * Substituting an empty transcript for an unreadable one used to be a one-way
+ * door: the load returned `messages: []`, the next turn's save wrote that empty
+ * array straight back over the file, and a transcript that a human (or a later
+ * fix) could still have read was gone. A partial write, a half-flushed file or
+ * a shape we simply do not recognise are all recoverable by hand — but only
+ * while the bytes exist. So quarantine first, exactly as
+ * freebuff-desktop's session journal and state file do, and only then let the
+ * caller carry on with a fallback.
+ *
+ * Quarantining happens on the read, not the write: the writer would have to
+ * re-read and re-parse a multi-MB transcript on every 5s checkpoint to notice,
+ * and the read is already the moment we know the file is unusable.
+ *
+ * A file that parses but is not the right kind of document counts as damaged.
+ * Four bytes of `null` parse perfectly well into `null`, and that is the exact
+ * artifact support ticket #180 reported — it must be preserved too, not nodded
+ * through as "no messages".
+ */
+function readPersistedChatFile(
+  filePath: string,
+  part: 'runState' | 'messages',
+): PersistedChatFile {
+  let raw: string
+  try {
+    raw = fs.readFileSync(filePath, 'utf8')
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code
+    if (code === 'ENOENT') {
+      return { value: null, outcome: 'missing' }
+    }
+    // EACCES, EISDIR, EIO: there may be perfectly good bytes behind this, and
+    // we cannot even copy them. Do not touch the file.
+    logger.warn({ filePath, part, code }, 'Could not open persisted chat state')
+    return { value: null, outcome: 'unreadable' }
+  }
+
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(raw)
+  } catch (error) {
+    return quarantinePersistedChatFile(filePath, part, {
+      reason: 'unparseable',
+      bytes: raw.length,
+      error: error instanceof Error ? error.message : String(error),
+    })
+  }
+
+  const shapeOk =
+    part === 'messages'
+      ? Array.isArray(parsed)
+      : !!parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+  if (!shapeOk) {
+    return quarantinePersistedChatFile(filePath, part, {
+      reason: 'wrong-shape',
+      bytes: raw.length,
+      parsedType: parsed === null ? 'null' : typeof parsed,
+    })
+  }
+
+  return { value: parsed, outcome: 'ok' }
+}
+
+function quarantinePersistedChatFile(
+  filePath: string,
+  part: 'runState' | 'messages',
+  detail: Record<string, unknown>,
+): PersistedChatFile {
+  const quarantine = `${filePath}.corrupt-${randomUUID()}`
+  try {
+    fs.renameSync(filePath, quarantine)
+  } catch (error) {
+    logger.error(
+      {
+        filePath,
+        part,
+        ...detail,
+        error: error instanceof Error ? error.message : String(error),
+      },
+      'Damaged chat state could not be set aside; leaving it untouched',
+    )
+    return { value: null, outcome: 'unpreserved' }
+  }
+  // Kept, not deleted: the user's transcript is in there, and a later fix or a
+  // support request can still get it back.
+  logger.warn(
+    { filePath, part, quarantine, ...detail },
+    'Damaged chat state moved aside; restoring what is left',
+  )
+  return { value: null, outcome: 'damaged' }
+}
+
+/**
+ * Load both RunState and ChatMessage[] from a specific chat directory or the most recent one.
+ * When chatId is provided, it is used to locate the chat directory; otherwise the most
+ * recently modified chat directory is used.
+ * Returns null if no previous chat exists or files can't be parsed.
+ */
+export function loadMostRecentChatState(
+  chatId?: string,
+): SavedChatState | null {
+  try {
+    let chatDir: string | null = chatDirOverride ?? null
+
+    if (!chatDir && chatId && chatId.trim().length > 0) {
+      const baseDir = path.join(getProjectDataDir(), 'chats')
+      const candidateDir = path.join(baseDir, chatId.trim())
+      if (
+        fs.existsSync(candidateDir) &&
+        fs.statSync(candidateDir).isDirectory()
+      ) {
+        chatDir = candidateDir
+      } else {
+        logger.debug(
+          { candidateDir, chatId },
+          'Requested chatId directory not found, falling back to most recent chat directory',
+        )
+      }
+    }
+
+    if (!chatDir) {
+      chatDir = getMostRecentChatDir()
+    }
+
+    if (!chatDir) {
+      logger.debug('No previous chat directory found')
+      return null
+    }
+
+    const runStatePath = path.join(chatDir, RUN_STATE_FILENAME)
+    const messagesPath = path.join(chatDir, CHAT_MESSAGES_FILENAME)
+
+    // Parse the two files independently: a missing or torn run-state.json
+    // must not lose the transcript, and vice versa. Restore whatever is
+    // readable and fall back for the rest.
+    const loadedRunState = readPersistedChatFile(runStatePath, 'runState')
+    const loadedMessages = readPersistedChatFile(messagesPath, 'messages')
+
+    // Either file holds bytes we could neither read nor move aside. We must
+    // not hand back a state whose next save would land on top of them: a
+    // rename replaces a file the process cannot read, so "unreadable" is not
+    // "unwritable". Refusing the whole chat sends the session to a fresh chat
+    // directory, which leaves this one exactly as the user found it.
+    const unsafe = (outcome: PersistedChatFile['outcome']) =>
+      outcome === 'unpreserved' || outcome === 'unreadable'
+    if (unsafe(loadedRunState.outcome) || unsafe(loadedMessages.outcome)) {
+      logger.error(
+        {
+          runStatePath,
+          messagesPath,
+          runStateOutcome: loadedRunState.outcome,
+          messagesOutcome: loadedMessages.outcome,
+        },
+        'Refusing to resume a chat whose state could not be read or set aside',
+      )
+      return null
+    }
+
+    let runState: RunState | null = loadedRunState.value as RunState | null
+    let messages: ChatMessage[] | null = loadedMessages.value as
+      | ChatMessage[]
+      | null
+
+    if (!runState && !messages) {
+      logger.debug(
+        { runStatePath, messagesPath },
+        'No readable state files in chat directory',
+      )
+      return null
+    }
+
+    runState ??= {
+      output: {
+        type: 'error',
+        message: 'Previous run state could not be restored.',
+      },
+    } as RunState
+    runState.traceSessionId ??= randomUUID()
+    messages ??= []
+
+    const resolvedChatId = path.basename(chatDir)
+
+    logger.info(
+      {
+        runStatePath,
+        messagesPath,
+        messageCount: messages.length,
+        chatId: resolvedChatId,
+      },
+      'Loaded chat state from chat directory',
+    )
+
+    return { runState, messages, chatId: resolvedChatId }
+  } catch (error) {
+    logger.error(
+      {
+        error: error instanceof Error ? error.message : String(error),
+      },
+      'Failed to load chat state',
+    )
+    return null
+  }
+}
+```
+- File `cli/src/utils/write-file-atomic.ts` (161 lines):
+```
+import * as fs from 'fs'
+import { randomUUID } from 'node:crypto'
+import * as path from 'path'
+
+// Unique per-write temp suffix. A plain `${pid}.tmp` collides when a sync
+// exit-flush and an async checkpoint write target the same file concurrently
+// (both share the pid): they'd write and rename the SAME temp path, tearing
+// each other's output. A random component makes every write self-contained.
+function tempPathFor(filePath: string): string {
+  return `${filePath}.${process.pid}.${randomUUID()}.tmp`
+}
+
+/**
+ * Every filesystem call an atomic write makes, as one seam.
+ *
+ * A successful fsync leaves no trace in the resulting file: the only way to
+ * tell a durable write from a non-durable one, short of cutting the machine's
+ * power, is the sequence of syscalls it makes. Tests substitute a recording
+ * delegate here to assert that sequence. Modelled on freebuff-desktop's
+ * `JournalStore` (server/repo/session-journal.ts), which exists for the same
+ * reason.
+ */
+export type AtomicWriteFs = {
+  openSync: typeof fs.openSync
+  writeFileSync: typeof fs.writeFileSync
+  fsyncSync: typeof fs.fsyncSync
+  closeSync: typeof fs.closeSync
+  renameSync: typeof fs.renameSync
+  unlinkSync: typeof fs.unlinkSync
+  promises: {
+    open: typeof fs.promises.open
+    rename: typeof fs.promises.rename
+    unlink: typeof fs.promises.unlink
+  }
+}
+
+const nodeAtomicWriteFs: AtomicWriteFs = fs
+
+let activeFs: AtomicWriteFs = nodeAtomicWriteFs
+
+/**
+ * Test-only seam, in the style of `setChatDirOverrideForTesting`: bun's
+ * `mock.module` leaks across test files, so the durability tests inject a
+ * recording delegate instead (see docs/testing.md: DI over module mocking).
+ */
+export function setAtomicWriteFsForTesting(
+  override: AtomicWriteFs | undefined,
+): void {
+  activeFs = override ?? nodeAtomicWriteFs
+}
+
+/**
+ * Flush the directory entry itself, so the *name* created by the rename is on
+ * disk too. Best-effort: by the time this runs the rename has already
+ * succeeded, so an fsync a filesystem refuses for a directory (win32 cannot
+ * open one through node:fs at all; some network and fuse mounts answer EINVAL)
+ * must not turn a completed write into a thrown error.
+ */
+function syncDirectory(directory: string): void {
+  if (process.platform === 'win32') return
+  try {
+    const handle = activeFs.openSync(directory, 'r')
+    try {
+      activeFs.fsyncSync(handle)
+    } finally {
+      activeFs.closeSync(handle)
+    }
+  } catch {
+    // See above: the data and the new name are already published.
+  }
+}
+
+async function syncDirectoryAsync(directory: string): Promise<void> {
+  if (process.platform === 'win32') return
+  try {
+    const handle = await activeFs.promises.open(directory, 'r')
+    try {
+      await handle.sync()
+    } finally {
+      await handle.close()
+    }
+  } catch {
+    // See syncDirectory.
+  }
+}
+
+/**
+ * Write a file atomically *and durably*: write to a temp file in the same
+ * directory, flush it, then rename over the target and flush the directory.
+ * Chat files grow to multiple MB and are rewritten on every agent step, so a
+ * plain writeFileSync interrupted by a crash/kill leaves truncated JSON that
+ * hides the chat from /history.
+ *
+ * The fsync is not optional. Rename is atomic, not durable: flush the contents
+ * before publishing the new name, or a power loss can leave a correctly-sized
+ * file of NUL bytes — which is what a user whose machine was hard-crashed
+ * mid-session got, in place of their whole transcript. Same reasoning, same
+ * discipline, as freebuff-desktop's session journal and state file.
+ *
+ * The cost is deliberate. Every caller writes session state a user cannot
+ * reproduce, at human rates — a few writes per turn, plus a checkpoint drain
+ * that coalesces to one in-flight write per chat — so none of them pays an
+ * fsync per keystroke or per token.
+ */
+export function writeFileAtomic(filePath: string, data: string): void {
+  const tmpPath = tempPathFor(filePath)
+  try {
+    // 'wx' so a temp path that somehow already exists is a loud error rather
+    // than a silent clobber of another write's bytes.
+    const fd = activeFs.openSync(tmpPath, 'wx')
+    try {
+      // Given an fd, writeFileSync loops until every byte is written; a bare
+      // writeSync may not.
+      activeFs.writeFileSync(fd, data)
+      activeFs.fsyncSync(fd)
+    } finally {
+      activeFs.closeSync(fd)
+    }
+    activeFs.renameSync(tmpPath, filePath)
+    syncDirectory(path.dirname(filePath))
+  } catch (error) {
+    try {
+      activeFs.unlinkSync(tmpPath)
+    } catch {
+      // Ignore cleanup errors; the original error is what matters
+    }
+    throw error
+  }
+}
+
+/**
+ * Async counterpart to writeFileAtomic. Used by the in-flight checkpoint writer
+ * so serializing + flushing a multi-MB transcript doesn't block the CLI's
+ * render/input thread. Same tmp-flush-rename-flush guarantee; the flushes run
+ * on the libuv threadpool, not the render thread.
+ */
+export async function writeFileAtomicAsync(
+  filePath: string,
+  data: string,
+): Promise<void> {
+  const tmpPath = tempPathFor(filePath)
+  try {
+    const handle = await activeFs.promises.open(tmpPath, 'wx')
+    try {
+      await handle.writeFile(data)
+      await handle.sync()
+    } finally {
+      await handle.close()
+    }
+    await activeFs.promises.rename(tmpPath, filePath)
+    await syncDirectoryAsync(path.dirname(filePath))
+  } catch (error) {
+    try {
+      await activeFs.promises.unlink(tmpPath)
+    } catch {
+      // Ignore cleanup errors; the original error is what matters
+    }
+    throw error
+  }
+}
+```
+Where the symbols this change introduces are used elsewhere, at this same revision (the code that reads them; this is evidence for the WHAT and the WHY, and it is the only source for who consumes this change):
+- File `cli/src/utils/__tests__/run-state-storage.test.ts` (35 matching lines):
+```
+const savedMessages = JSON.parse(fs.readFileSync(messagesPath, 'utf8'))
+      expect(savedMessages[0].blocks[0].type).toBe('agent')
+      expect(savedMessages[0].blocks[0].blocks).toHaveLength(2)
+    })
+  })
+})
+
+describe('live chat state provider', () => {
+  // Point persistence at a temp dir via the explicit test override — module
+  // seams (mock.module, HOME, spyOn on auth) are unreliable across bun test
+  // files and platforms.
+  const chatDir = path.join(TEST_ROOT, 'codebuff-test-live-chatdir')
+
+  const testRunState = (marker: string): RunState =>
+    ({
+      output: { type: 'error', message: marker },
+    }) as unknown as RunState
+
+  const testMessages = (marker: string): ChatMessage[] => [
+    {
+      id: 'msg-1',
+      variant: 'user',
+      content: marker,
+      timestamp: new Date().toISOString(),
+    },
+  ]
+
+  const readSavedMessages = () =>
+    JSON.parse(
+      fs.readFileSync(path.join(chatDir, 'chat-messages.json'), 'utf8'),
+    ) as ChatMessage[]
+
+  beforeEach(() => {
+    fs.rmSync(chatDir, { recursive: true, force: true })
+    setChatDirOverrideForTesting(chatDir)
+  })
+
+  afterEach(() => {
+    clearLiveChatStateProvider('run-a')
+    clearLiveChatStateProvider('run-b')
+    setChatDirOverrideForTesting(undefined)
+    fs.rmSync(chatDir, { recursive: true, force: true })
+  })
+
+  test('flushLiveChatState persists the provided state', () => {
+    setLiveChatStateProvider('run-a', () => ({
+      runState: testRunState('checkpoint'),
+```
+- File `cli/src/utils/__tests__/chat-meta.test.ts` (17 matching lines):
+```
+getFirstUserPrompt,
+  readChatMeta,
+  writeChatMeta,
+} from '../chat-meta'
+import {
+  saveChatState,
+  setChatDirOverrideForTesting,
+} from '../run-state-storage'
+
+import type { ChatMessage } from '../../types/chat'
+import type { RunState } from '@codebuff/sdk'
+
+let chatDir = ''
+
+function userMessage(content: string): ChatMessage {
+  return {
+    id: `msg-${content}`,
+    variant: 'user',
+    content,
+    timestamp: new Date().toISOString(),
+    blocks: [],
+  }
+}
+
+/** Write chat-messages.json so writeChatMeta can stat it. */
+function writeMessagesFile(messages: ChatMessage[]): void {
+  fs.writeFileSync(
+    path.join(chatDir, CHAT_MESSAGES_FILENAME),
+    JSON.stringify(messages),
+  )
+}
+
+describe('chat-meta', () => {
+  beforeEach(() => {
+    chatDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codebuff-meta-'))
+    setChatDirOverrideForTesting(chatDir)
+  })
+
+  afterEach(() => {
+    setChatDirOverrideForTesting(undefined)
+    fs.rmSync(chatDir, { recursive: true, force: true })
+  })
+
+  test('getFirstUserPrompt returns first user message, truncated', () => {
+    const messages: ChatMessage[] = [
+      { ...userMessage(''), variant: 'agent' },
+      userMessage('hello there'),
+```
+- File `cli/src/utils/__tests__/sponsored-run.test.ts` (16 matching lines):
+```
+record,
+        ]
+      },
+      remove: (runId) => {
+        inflight = inflight.filter((existing) => existing.runId !== runId)
+      },
+      pid: 4242,
+      isAlive: (pid) => pid === 4242,
+    },
+    target: async () => ({ kind: 'repo', repoFullName: 'acme/app' }),
+    agentId: () => 'base3-free-test',
+    // The real overrides would start an OS sandbox; the context they are built
+    // from is what these tests are about, and the recorder in it is real.
+    overrideTools: (context) => {
+      contexts.push(context)
+      return {} as SponsoredOverrideTools
+    },
+    ...over,
+  }
+  const service = new SponsoredRun(root, deps)
+  return {
+    root,
+    deps,
+    service,
+    reported,
+…
+return task
+}
+
+async function acceptThrough(f: ReturnType<typeof fakes>) {
+  const consent = await f.service.consentFor(PROPOSAL, reviewedTask())
+  if (!consent.ok) throw new Error(consent.message)
+  return {
+    consent,
+    outcome: await f.service.accept(PROPOSAL, consent.runId, reviewedTask()),
+  }
+}
+
+/** Accept, start the turn, and let the "run" write through the real recorder. */
+async function runThrough(
+  f: ReturnType<typeof fakes>,
+  edit: (context: SponsoredToolContext) => Promise<void> = async () => {},
+) {
+  const accepted = await acceptThrough(f)
+  const plan = await f.service.startTurn()
+  if (!plan) throw new Error('expected a plan')
+  await edit(f.contexts.at(-1)!)
+  return { ...accepted, plan }
+}
+
+async function settle(): Promise<void> {
+…
+plan.onModelEvent()
+    await settle()
+    expect(f.reported.map((r) => r.state)).toEqual(['failed'])
+    expect(f.inflight()).toEqual([])
+  })
+})
+
+describe('the verdict is read off the run’s own edits', () => {
+  test('a run that finishes while signed out keeps its verdict in the outbox, not the in-flight sweep', async () => {
+    let token: string | null = 'session-token'
+    const f = fakes({ getToken: () => token })
+    await runThrough(f, async (context) => {
+      await context.recorder.around('src/app.ts', async () => {
+        writeFileSync(join(f.root, 'src', 'app.ts'), 'export const app = 2\n')
+      })
+    })
+    token = null
+    await f.service.settleTurn({ errorText: null, aborted: false })
+    await settle()
+    // Persisted, not sent: the session is gone, and the flush waits for one.
+    expect(f.service.state.phase).toBe('delivered')
+    expect(f.terminalReports()).toContain('"state":"delivered"')
+    expect(f.inflight()).toEqual([])
+    expect(f.reported).toEqual([])
+    token = 'session-token'
+```
+- File `cli/src/utils/__tests__/write-file-atomic.test.ts` (13 matching lines):
+```
+return fs.promises.unlink(target)
+        },
+      },
+    },
+  }
+}
+
+describe('durability', () => {
+  let recorder: ReturnType<typeof recordingFs>
+
+  beforeEach(() => {
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codebuff-atomic-fsync-'))
+    recorder = recordingFs()
+    setAtomicWriteFsForTesting(recorder.fs)
+  })
+
+  afterEach(() => {
+    setAtomicWriteFsForTesting(undefined)
+    fs.rmSync(tempDir, { recursive: true, force: true })
+  })
+
+  test('flushes the contents before the rename publishes the name', () => {
+    writeFileAtomic(path.join(tempDir, 'out.json'), '{"a":1}')
+
+    const fsyncBeforeRename =
+      recorder.calls.indexOf('fsyncSync') < recorder.calls.indexOf('renameSync')
+    expect(recorder.calls).toContain('fsyncSync')
+    expect(recorder.calls).toContain('renameSync')
+    expect(fsyncBeforeRename).toBe(true)
+    expect(recorder.calls.slice(0, 5)).toEqual([
+      'openSync',
+      'writeFileSync',
+      'fsyncSync',
+      'closeSync',
+      'renameSync',
+    ])
+  })
+```
+- File `cli/src/utils/__tests__/chat-history.test.ts` (10 matching lines):
+```
+info: () => {},
+    warn: () => {},
+    error: () => {},
+    fatal: () => {},
+  },
+}))
+
+import { deleteChatSession, getAllChats } from '../chat-history'
+
+let tempDataDir = ''
+
+function writeChat(chatId: string, prompt: string) {
+  const chatDir = path.join(tempDataDir, 'chats', chatId)
+  fs.mkdirSync(chatDir, { recursive: true })
+  fs.writeFileSync(
+    path.join(chatDir, 'chat-messages.json'),
+    JSON.stringify([
+      {
+        id: `${chatId}-message`,
+        variant: 'user',
+        content: prompt,
+        timestamp: new Date().toISOString(),
+        blocks: [],
+      },
+    ]),
+  )
+}
+…
+'{"not":"an array"}',
+    )
+
+    const chats = getAllChats(500, tempDataDir)
+
+    expect(chats).toHaveLength(1)
+    expect(chats[0].chatId).toBe('chat-not-array')
+    expect(chats[0].unreadable).toBe(true)
+  })
+
+  test('getAllChats prefers the chat-meta.json sidecar over parsing messages', () => {
+    writeChat('chat-with-meta', 'prompt from messages file')
+    const chatDir = path.join(tempDataDir, 'chats', 'chat-with-meta')
+    const stats = fs.statSync(path.join(chatDir, 'chat-messages.json'))
+    fs.writeFileSync(
+      path.join(chatDir, 'chat-meta.json'),
+      JSON.stringify({
+        messageCount: 42,
+        firstPrompt: 'prompt from meta',
+        messagesSize: stats.size,
+        messagesMtimeMs: stats.mtimeMs,
+      }),
+    )
+
+    const chats = getAllChats(500, tempDataDir)
+```
+- File `cli/src/utils/__tests__/sponsored-receipts.test.ts` (6 matching lines):
+```
+expect(readFileSync(file, 'utf8')).toContain('receipts')
+    expect(statSync(file).mode & 0o777).toBe(0o600)
+    expect(() => store.write('../escape', '{}')).toThrow()
+  })
+})
+
+describe('recording and undoing', () => {
+  test('the before-image is the user’s, however many times the run edits', async () => {
+    const root = join(PARENT, 'project-a')
+    mkdirSync(root, { recursive: true })
+    writeFileSync(join(root, 'a.ts'), 'original\n')
+    const store = sponsoredReceiptStore(join(PARENT, 'store-a'))
+    const recorder = new SponsoredEditRecorder(
+      {
+        runId: RUN_ID,
+        proposalId: 'p',
+        advertiserName: 'Acme',
+        projectRoot: root,
+      },
+      store,
+    )
+    for (const draft of ['first\n', 'second\n', 'final\n']) {
+      await recorder.around('a.ts', async () => {
+        writeFileSync(join(root, 'a.ts'), draft)
+      })
+    }
+    const ledger = readSponsoredLedger(store, RUN_ID)!
+    const result = undoSponsoredReceipts(ledger, store)
+    expect(result.restored).toEqual(['a.ts'])
+    expect(readFileSync(join(root, 'a.ts'), 'utf8')).toBe('original\n')
+    expect(readSponsoredLedger(store, RUN_ID)!.undoneAt).toBeNumber()
+    expect(
+      undoSponsoredReceipts(readSponsoredLedger(store, RUN_ID)!, store),
+    ).toMatchObject({ alreadyUndone: true })
+  })
+
+  test('a write that is put back by the run itself is not a change', async () => {
+    const root = join(PARENT, 'project-b')
+    mkdirSync(root, { recursive: true })
+    writeFileSync(join(root, 'b.ts'), 'same\n')
+    const recorder = new SponsoredEditRecorder(
+      {
+        runId: '00000000-0000-4000-8000-00000000000b',
+        proposalId: 'p',
+        advertiserName: 'Acme',
+        projectRoot: root,
+      },
+      sponsoredReceiptStore(join(PARENT, 'store-b')),
+    )
+    await recorder.around('b.ts', async () => {
+      writeFileSync(join(root, 'b.ts'), 'changed\n')
+    })
+    await recorder.around('b.ts', async () => {
+```
+Tests this commit changed (added lines only; the assertions are what the change is expected to do, not a description of the feature):
+- File `cli/src/utils/__tests__/run-state-storage.test.ts`: "a transcript is never destroyed"; "saveChatState never writes the literal text null over a transcript"; "saveChatState never writes the literal text null over a run state"; "a null-content transcript survives the load instead of being replaced"; "an unparseable transcript is kept, not replaced with an empty array"; "an unparseable run state is kept too"; "a transcript that is readable is never moved aside"; "a first load with no files on disk quarantines nothing"
+```
+/**
+ * Support ticket #180: a user's session files were present but held the four
+ * bytes `null` — the whole transcript gone. Two independent paths produced
+ * that, and both of them are one-way doors unless the bytes are kept.
+ */
+describe('a transcript is never destroyed', () => {
+  const chatDir = path.join(TEST_ROOT, 'codebuff-test-nulled-chatdir')
+  const runState = { output: { type: 'error', message: 'x' } } as RunState
+  const messages: ChatMessage[] = [
+    {
+      id: 'msg-1',
+      variant: 'user',
+      content: 'the prompt',
+      timestamp: new Date().toISOString(),
+    },
+  ]
+  const messagesPath = () => path.join(chatDir, 'chat-messages.json')
+  const runStatePath = () => path.join(chatDir, 'run-state.json')
+  const quarantined = (file: string) =>
+    fs
+      .readdirSync(chatDir)
+      .filter((name) => name.startsWith(`${file}.corrupt-`))
+  beforeEach(() => {
+    fs.rmSync(chatDir, { recursive: true, force: true })
+    setChatDirOverrideForTesting(chatDir)
+  })
+  afterEach(() => {
+    setChatDirOverrideForTesting(undefined)
+    fs.rmSync(chatDir, { recursive: true, force: true })
+  })
+  test('saveChatState never writes the literal text null over a transcript', () => {
+    saveChatState(runState, messages)
+    // `JSON.stringify(null)` is the string 'null', which is truthy — so this
+    // used to sail through the save's own guard and replace the transcript
+    // with four bytes, no crash required.
+    saveChatState(runState, null as unknown as ChatMessage[], chatDir)
+    expect(fs.readFileSync(messagesPath(), 'utf8')).not.toBe('null')
+    expect(JSON.parse(fs.readFileSync(messagesPath(), 'utf8'))).toHaveLength(1)
+  })
+  test('saveChatState never writes the literal text null over a run state', () => {
+    saveChatState(runState, messages)
+    saveChatState(null as unknown as RunState, messages, chatDir)
+    expect(fs.readFileSync(runStatePath(), 'utf8')).not.toBe('null')
+    expect(
+      JSON.parse(fs.readFileSync(runStatePath(), 'utf8')).output.
+```
+- File `cli/src/utils/__tests__/write-file-atomic.test.ts`: "durability"; "flushes the contents before the rename publishes the name"; "flushes the directory entry after the rename"; "does not publish the name when the flush fails"; "async: flushes the contents before the rename publishes the name"; "async: flushes the directory entry after the rename"; "async: does not publish the name when the flush fails"
+```
+import {
+  setAtomicWriteFsForTesting,
+  writeFileAtomic,
+  writeFileAtomicAsync,
+} from '../write-file-atomic'
+import type { AtomicWriteFs } from '../write-file-atomic'
+/**
+ * A successful fsync leaves no trace in the file it flushed, so durability can
+ * only be asserted through the syscalls. These wrap the real fs — every call
+ * still happens for real — and record the order, which is the thing that
+ * matters: the contents must be on disk before the rename publishes the name,
+ * or a crash can leave a correctly-sized file of NUL bytes where the user's
+ * transcript was.
+ */
+function recordingFs(): { calls: string[]; fs: AtomicWriteFs } {
+  const calls: string[] = []
+  return {
+    calls,
+    fs: {
+      openSync: (...args: Parameters<typeof fs.openSync>) => {
+        calls.push('openSync')
+        return fs.openSync(...args)
+      },
+      writeFileSync: ((...args: any[]) => {
+        calls.push('writeFileSync')
+        return (fs.writeFileSync as any)(...args)
+      }) as typeof fs.writeFileSync,
+      fsyncSync: (fd: number) => {
+        calls.push('fsyncSync')
+        return fs.fsyncSync(fd)
+      },
+      closeSync: (fd: number) => {
+        calls.push('closeSync')
+        return fs.closeSync(fd)
+      },
+      renameSync: (from: fs.PathLike, to: fs.PathLike) => {
+        calls.push('renameSync')
+        return fs.renameSync(from, to)
+      },
+      unlinkSync: (target: fs.PathLike) => {
+        calls.push('unlinkSync')
+        return fs.unlinkSync(target)
+      },
+      promises: {
+        open: async (...args: Parameters<typeof fs.promises.open>) => {
+          calls.push('open')
+          const handle = await fs.promises.open(...args)
+          return {
+            writeFile: (data: any) => {
+              calls.push('writeFile')
+              return handle.writeFile(data)
+            },
+            sync: () => {
+              calls.push('sync')
+              return handle.sync()
+            },
+            close: () => {
+              calls.push('close')
+
+```
+Diff (source hunks; lockfiles and pure test hunks omitted, except in a lockfile-only commit):
+```diff
+diff --git a/cli/src/utils/run-state-storage.ts b/cli/src/utils/run-state-storage.ts
+index 228a32c05..64eecce16 100644
+--- a/cli/src/utils/run-state-storage.ts
++++ b/cli/src/utils/run-state-storage.ts
+@@ -150,88 +150,140 @@ function bestEffortLog(
+   level: 'warn' | 'error',
+   payload: Record<string, unknown>,
+   message: string,
+ ): void {
+   try {
+     logger[level](payload, message)
+   } catch {
+     // Best-effort only.
+   }
+ }
+ 
+ type SaveErrorClass = 'cyclic' | 'oom' | 'disk' | 'other'
+ 
+ function classifySaveError(error: unknown): SaveErrorClass {
+   const fromStringify = classifyStringifyError(error)
+   if (fromStringify) return fromStringify
+   const msg = error instanceof Error ? error.message : String(error)
+   // Environmental filesystem failures: retrying won't help and there is
+   // nothing to fix server-side (full disk, AV holding a rename lock, etc.).
+   if (/ENOSPC|EDQUOT|EROFS|EPERM|EACCES|EBUSY|EMFILE|ENFILE/.test(msg)) {
+     return 'disk'
+   }
+   return 'other'
+ }
+ 
+-/** Cheap shape summary so a failure log says what the payload looked like. */
++/** Cheap shape summary so a failure log says what the payload looked like.
++ *  Tolerates a non-array `messages`: this runs only when the state is already
++ *  suspect, and a diagnostic that throws on the shape it exists to describe
++ *  just replaces the real failure with its own. */
+ function chatShapeSummary(runState: RunState, messages: ChatMessage[]) {
++  const list = Array.isArray(messages) ? messages : []
+   let blockCount = 0
+-  for (const message of messages) {
+-    blockCount += message.blocks?.length ?? 0
++  for (const message of list) {
++    blockCount += message?.blocks?.length ?? 0
+   }
+   return {
+-    messageCount: messages.length,
++    messageCount: Array.isArray(messages) ? messages.length : null,
+     blockCount,
+     runStateKeys:
+       runState && typeof runState === 'object'
+         ? Object.keys(runState as object).slice(0, 20)
+         : [],
+   }
+ }
+ 
+ type SerializedChatState = {
+   runStateJson?: string
+   messagesJson?: string
+ }
+ 
++/** The one character each file's JSON must start with. */
++const CHAT_STATE_JSON_PREFIX = { runState: '{', messages: '[' } as const
++
++/**
++ * Refuse to persist anything that is not the document the file is supposed to
++ * hold. `JSON.stringify` answers the four-byte string `null` for null, NaN and
++ * a value whose toJSON returns nothing, and `undefined` for undefined — and
++ * `'null'` is *truthy*, so it sailed through the `if (serialized.messagesJson)`
++ * guard below and replaced a user's whole transcript with the literal text
++ * `null`, with no crash involved. On the next load that parses to null and
++ * reads as "no transcript". Writing nothing leaves the previous good file in
++ * place, which is always the better of the two outcomes.
++ */
++// Returns a plain boolean, not a `json is string` predicate: the caller's
++// `json` is already typed `string`, so a predicate narrows the negative branch
++// to `never` and the defensive `typeof` checks in the refusal log stop
++// compiling. The runtime check stays, because SerializeResult's `string` comes
++// from JSON.stringify's lib type, which answers `undefined` for undefined.
++function isPersistableJson(
++  json: unknown,
++  part: 'runState' | 'messages',
++): boolean {
++  return (
++    typeof json === 'string' && json.startsWith(CHAT_STATE_JSON_PREFIX[part])
++  )
++}
++
+ /**
+  * Serialize the two chat-state files independently, so a poisoned run state
+  * cannot block persisting the transcript (and vice versa). Cyclic and
+  * over-limit payloads are rescued by serializeForPersistence's fallback pass;
+  * the fallback diagnostics (cycle paths, truncation counts) are logged so the
+  * source of a bad payload can be found from prod logs.
+  */
+ function serializeChatState(
+   runState: RunState,
+   messages: ChatMessage[],
+   chatDir: string,
+ ): SerializedChatState {
+   const result: SerializedChatState = {}
+   for (const part of ['runState', 'messages'] as const) {
+     const value = part === 'runState' ? runState : messages
+     try {
+       const { json, fallback } = serializeForPersistence(value)
++      if (!isPersistableJson(json, part)) {
++        // Rate-limited like every other save issue, but logged at error level:
++        // this is a bug in whatever handed us the state, and until ticket #180
++        // nothing reported it.
++        if (shouldLogSaveIssue(`${chatDir}|nonpersistable|${part}`)) {
++          bestEffortLog(
++            'error',
++            {
++              part,
++              // The first character and the length only. Anything more could
++              // be the user's prompt text, and this is a diagnostic.
++              jsonType: typeof json,
++              jsonPrefix: typeof json === 'string' ? json.slice(0, 1) : null,
++              jsonBytes: typeof json === 'string' ? json.length : null,
++              ...chatShapeSummary(runState, messages),
++            },
++            'Refusing to persist non-document chat state (keeping the file on disk)',
++          )
++        }
++        continue
++      }
+       if (part === 'runState') {
+         result.runStateJson = json
+       } else {
+         result.messagesJson = json
+       }
+       if (fallback && shouldLogSaveIssue(`${chatDir}|fallback|${part}`)) {
+         bestEffortLog(
+           'warn',
+           {
+             part,
+             reason: fallback.reason,
+             cyclePaths: fallback.cyclePaths,
+             truncatedStrings: fallback.truncatedStrings,
+             jsonBytes: json.length,
+             ...chatShapeSummary(runState, messages),
+           },
+           'Chat state serialized via fallback (broke cycles or truncated oversized strings)',
+         )
+       }
+     } catch (error) {
+       const errorClass = classifySaveError(error)
+       if (shouldLogSaveIssue(`${chatDir}|serialize|${part}|${errorClass}`)) {
+         bestEffortLog(
+           errorClass === 'other' ? 'error' : 'warn',
+           {
+@@ -390,121 +442,222 @@ async function drainCheckpoints(): Promise<void> {
+  */
+ export function scheduleCheckpointSave(
+   runState: RunState,
+   messages: ChatMessage[],
+   chatDir: string = resolveCurrentChatDir(),
+ ): void {
+   pendingCheckpoints.set(chatDir, { runState, messages })
+   if (!checkpointDrain) {
+     checkpointDrain = drainCheckpoints().finally(() => {
+       checkpointDrain = null
+     })
+   }
+ }
+ 
+ /**
+  * Wait until all queued/in-flight checkpoint writes have flushed. Call this
+  * before an authoritative synchronous save (turn completion / error) so that a
+  * still-running async write can't land after — and clobber — the final state.
+  * Relies on the run having stopped scheduling checkpoints (the SDK's snapshot
+  * timer stops once the run settles), so the queue reaches idle.
+  */
+ export async function settleCheckpointSave(): Promise<void> {
+   await checkpointDrain
+ }
+ 
++type PersistedChatFile = {
++  /** The parsed document, or null when there was nothing usable to restore. */
++  value: unknown
++  outcome: 'ok' | 'missing' | 'damaged' | 'unpreserved' | 'unreadable'
++}
++
++/**
++ * Read one chat-state file, and set its bytes aside before anything can
++ * replace them.
++ *
++ * Substituting an empty transcript for an unreadable one used to be a one-way
++ * door: the load returned `messages: []`, the next turn's save wrote that empty
++ * array straight back over the file, and a transcript that a human (or a later
++ * fix) could still have read was gone. A partial write, a half-flushed file or
++ * a shape we simply do not recognise are all recoverable by hand — but only
++ * while the bytes exist. So quarantine first, exactly as
++ * freebuff-desktop's session journal and state file do, and only then let the
++ * caller carry on with a fallback.
++ *
++ * Quarantining happens on the read, not the write: the writer would have to
++ * re-read and re-parse a multi-MB transcript on every 5s checkpoint to notice,
++ * and the read is already the moment we know the file is unusable.
++ *
++ * A file that parses but is not the right kind of document counts as damaged.
++ * Four bytes of `null` parse perfectly well into `null`, and that is the exact
++ * artifact support ticket #180 reported — it must be preserved too, not nodded
++ * through as "no messages".
++ */
++function readPersistedChatFile(
++  filePath: string,
++  part: 'runState' | 'messages',
++): PersistedChatFile {
++  let raw: string
++  try {
++    raw = fs.readFileSync(filePath, 'utf8')
++  } catch (error) {
++    const code = (error as NodeJS.ErrnoException).code
++    if (code === 'ENOENT') {
++      return { value: null, outcome: 'missing' }
++    }
++    // EACCES, EISDIR, EIO: there may be perfectly good bytes behind this, and
++    // we cannot even copy them. Do not touch the file.
++    logger.warn({ filePath, part, code }, 'Could not open persisted chat state')
++    return { value: null, outcome: 'unreadable' }
++  }
++
++  let parsed: unknown
++  try {
++    parsed = JSON.parse(raw)
++  } catch (error) {
++    return quarantinePersistedChatFile(filePath, part, {
++      reason: 'unparseable',
++      bytes: raw.length,
++      error: error instanceof Error ? error.message : String(error),
++    })
++  }
++
++  const shapeOk =
++    part === 'messages'
++      ? Array.isArray(parsed)
++      : !!parsed && typeof parsed === 'object' && !Array.isArray(parsed)
++  if (!shapeOk) {
++    return quarantinePersistedChatFile(filePath, part, {
++      reason: 'wrong-shape',
++      bytes: raw.length,
++      parsedType: parsed === null ? 'null' : typeof parsed,
++    })
++  }
++
++  return { value: parsed, outcome: 'ok' }
++}
++
++function quarantinePersistedChatFile(
++  filePath: string,
++  part: 'runState' | 'messages',
++  detail: Record<string, unknown>,
++): PersistedChatFile {
++  const quarantine = `${filePath}.corrupt-${randomUUID()}`
++  try {
++    fs.renameSync(filePath, quarantine)
++  } catch (error) {
++    logger.error(
++      {
++        filePath,
++        part,
++        ...detail,
++        error: error instanceof Error ? error.message : String(error),
++      },
++      'Damaged chat state could not be set aside; leaving it untouched',
++    )
++    return { value: null, outcome: 'unpreserved' }
++  }
++  // Kept, not deleted: the user's transcript is in there, and a later fix or a
++  // support request can still get it back.
++  logger.warn(
++    { filePath, part, quarantine, ...detail },
++    'Damaged chat state moved aside; restoring what is left',
++  )
++  return { value: null, outcome: 'damaged' }
++}
++
+ /**
+  * Load both RunState and ChatMessage[] from a specific chat directory or the most recent one.
+  * When chatId is provided, it is used to locate the chat directory; otherwise the most
+  * recently modified chat directory is used.
+  * Returns null if no previous chat exists or files can't be parsed.
+  */
+ export function loadMostRecentChatState(
+   chatId?: string,
+ ): SavedChatState | null {
+   try {
+     let chatDir: string | null = chatDirOverride ?? null
+ 
+     if (!chatDir && chatId && chatId.trim().length > 0) {
+       const baseDir = path.join(getProjectDataDir(), 'chats')
+       const candidateDir = path.join(baseDir, chatId.trim())
+       if (
+         fs.existsSync(candidateDir) &&
+         fs.statSync(candidateDir).isDirectory()
+       ) {
+         chatDir = candidateDir
+       } else {
+         logger.debug(
+           { candidateDir, chatId },
+           'Requested chatId directory not found, falling back to most recent chat directory',
+         )
+       }
+     }
+ 
+     if (!chatDir) {
+       chatDir = getMostRecentChatDir()
+     }
+ 
+     if (!chatDir) {
+       logger.debug('No previous chat directory found')
+       return null
+     }
+ 
+     const runStatePath = path.join(chatDir, RUN_STATE_FILENAME)
+     const messagesPath = path.join(chatDir, CHAT_MESSAGES_FILENAME)
+ 
+     // Parse the two files independently: a missing or torn run-state.json
+     // must not lose the transcript, and vice versa. Restore whatever is
+     // readable and fall back for the rest.
+-    let runState: RunState | null = null
+-    try {
+-      runState = JSON.parse(fs.readFileSync(runStatePath, 'utf8')) as RunState
+-    } catch (error) {
+-      logger.warn(
++    const loadedRunState = readPersistedChatFile(runStatePath, 'runState')
++    const loadedMessages = readPersistedChatFile(messagesPath, 'messages')
++
++    // Either file holds bytes we could neither read nor move aside. We must
++    // not hand back a state whose next save would land on top of them: a
++    // rename replaces a file the process cannot read, so "unreadable" is not
++    // "unwritable". Refusing the whole chat sends the session to a fresh chat
++    // directory, which leaves this one exactly as the user found it.
++    const unsafe = (outcome: PersistedChatFile['outcome']) =>
++      outcome === 'unpreserved' || outcome === 'unreadable'
++    if (unsafe(loadedRunState.outcome) || unsafe(loadedMessages.outcome)) {
++      logger.error(
+         {
+           runStatePath,
+-          error: error instanceof Error ? error.message : String(error),
+-        },
+-        'Could not read run state; restoring transcript without agent context',
+-      )
+-    }
+-
+-    let messages: ChatMessage[] | null = null
+-    try {
+-      messages = JSON.parse(
+-        fs.readFileSync(messagesPath, 'utf8'),
+-      ) as ChatMessage[]
+-    } catch (error) {
+-      logger.warn(
+-        {
+           messagesPath,
+-          error: error instanceof Error ? error.message : String(error),
++          runStateOutcome: loadedRunState.outcome,
++          messagesOutcome: loadedMessages.outcome,
+         },
+-        'Could not read chat messages; restoring agent context without transcript',
++        'Refusing to resume a chat whose state could not be read or set aside',
+       )
++      return null
+     }
+ 
++    let runState: RunState | null = loadedRunState.value as RunState | null
++    let messages: ChatMessage[] | null = loadedMessages.value as
++      | ChatMessage[]
++      | null
++
+     if (!runState && !messages) {
+       logger.debug(
+         { runStatePath, messagesPath },
+         'No readable state files in chat directory',
+       )
+       return null
+     }
+ 
+     runState ??= {
+       output: {
+         type: 'error',
+         message: 'Previous run state could not be restored.',
+       },
+     } as RunState
+     runState.traceSessionId ??= randomUUID()
+     messages ??= []
+ 
+     const resolvedChatId = path.basename(chatDir)
+ 
+     logger.info(
+       {
+         runStatePath,
+         messagesPath,
+         messageCount: messages.length,
+         chatId: resolvedChatId,
+diff --git a/cli/src/utils/write-file-atomic.ts b/cli/src/utils/write-file-atomic.ts
+index 85b922e24..c96c06054 100644
+--- a/cli/src/utils/write-file-atomic.ts
++++ b/cli/src/utils/write-file-atomic.ts
+@@ -1,54 +1,160 @@
+ import * as fs from 'fs'
+ import { randomUUID } from 'node:crypto'
++import * as path from 'path'
+ 
+ // Unique per-write temp suffix. A plain `${pid}.tmp` collides when a sync
+ // exit-flush and an async checkpoint write target the same file concurrently
+ // (both share the pid): they'd write and rename the SAME temp path, tearing
+ // each other's output. A random component makes every write self-contained.
+ function tempPathFor(filePath: string): string {
+   return `${filePath}.${process.pid}.${randomUUID()}.tmp`
+ }
+ 
+ /**
+- * Write a file atomically: write to a temp file in the same directory, then
+- * rename over the target. Chat files grow to multiple MB and are rewritten on
+- * every agent step, so a plain writeFileSync interrupted by a crash/kill
+- * leaves truncated JSON that hides the chat from /history.
++ * Every filesystem call an atomic write makes, as one seam.
++ *
++ * A successful fsync leaves no trace in the resulting file: the only way to
++ * tell a durable write from a non-durable one, short of cutting the machine's
++ * power, is the sequence of syscalls it makes. Tests substitute a recording
++ * delegate here to assert that sequence. Modelled on freebuff-desktop's
++ * `JournalStore` (server/repo/session-journal.ts), which exists for the same
++ * reason.
++ */
++export type AtomicWriteFs = {
++  openSync: typeof fs.openSync
++  writeFileSync: typeof fs.writeFileSync
++  fsyncSync: typeof fs.fsyncSync
++  closeSync: typeof fs.closeSync
++  renameSync: typeof fs.renameSync
++  unlinkSync: typeof fs.unlinkSync
++  promises: {
++    open: typeof fs.promises.open
++    rename: typeof fs.promises.rename
++    unlink: typeof fs.promises.unlink
++  }
++}
++
++const nodeAtomicWriteFs: AtomicWriteFs = fs
++
++let activeFs: AtomicWriteFs = nodeAtomicWriteFs
++
++/**
++ * Test-only seam, in the style of `setChatDirOverrideForTesting`: bun's
++ * `mock.module` leaks across test files, so the durability tests inject a
++ * recording delegate instead (see docs/testing.md: DI over module mocking).
++ */
++export function setAtomicWriteFsForTesting(
++  override: AtomicWriteFs | undefined,
++): void {
++  activeFs = override ?? nodeAtomicWriteFs
++}
++
++/**
++ * Flush the directory entry itself, so the *name* created by the rename is on
++ * disk too. Best-effort: by the time this runs the rename has already
++ * succeeded, so an fsync a filesystem refuses for a directory (win32 cannot
++ * open one through node:fs at all; some network and fuse mounts answer EINVAL)
++ * must not turn a completed write into a thrown error.
++ */
++function syncDirectory(directory: string): void {
++  if (process.platform === 'win32') return
++  try {
++    const handle = activeFs.openSync(directory, 'r')
++    try {
++      activeFs.fsyncSync(handle)
++    } finally {
++      activeFs.closeSync(handle)
++    }
++  } catch {
++    // See above: the data and the new name are already published.
++  }
++}
++
++async function syncDirectoryAsync(directory: string): Promise<void> {
++  if (process.platform === 'win32') return
++  try {
++    const handle = await activeFs.promises.open(directory, 'r')
++    try {
++      await handle.sync()
++    } finally {
++      await handle.close()
++    }
++  } catch {
++    // See syncDirectory.
++  }
++}
++
++/**
++ * Write a file atomically *and durably*: write to a temp file in the same
++ * directory, flush it, then rename over the target and flush the directory.
++ * Chat files grow to multiple MB and are rewritten on every agent step, so a
++ * plain writeFileSync interrupted by a crash/kill leaves truncated JSON that
++ * hides the chat from /history.
++ *
++ * The fsync is not optional. Rename is atomic, not durable: flush the contents
++ * before publishing the new name, or a power loss can leave a correctly-sized
++ * file of NUL bytes — which is what a user whose machine was hard-crashed
++ * mid-session got, in place of their whole transcript. Same reasoning, same
++ * discipline, as freebuff-desktop's session journal and state file.
++ *
++ * The cost is deliberate. Every caller writes session state a user cannot
++ * reproduce, at human rates — a few writes per turn, plus a checkpoint drain
++ * that coalesces to one in-flight write per chat — so none of them pays an
++ * fsync per keystroke or per token.
+  */
+ export function writeFileAtomic(filePath: string, data: string): void {
+   const tmpPath = tempPathFor(filePath)
+   try {
+-    fs.writeFileSync(tmpPath, data)
+-    fs.renameSync(tmpPath, filePath)
++    // 'wx' so a temp path that somehow already exists is a loud error rather
++    // than a silent clobber of another write's bytes.
++    const fd = activeFs.openSync(tmpPath, 'wx')
++    try {
++      // Given an fd, writeFileSync loops until every byte is written; a bare
++      // writeSync may not.
++      activeFs.writeFileSync(fd, data)
++      activeFs.fsyncSync(fd)
++    } finally {
++      activeFs.closeSync(fd)
++    }
++    activeFs.renameSync(tmpPath, filePath)
++    syncDirectory(path.dirname(filePath))
+   } catch (error) {
+     try {
+-      fs.unlinkSync(tmpPath)
++      activeFs.unlinkSync(tmpPath)
+     } catch {
+       // Ignore cleanup errors; the original error is what matters
+     }
+     throw error
+   }
+ }
+ 
+ /**
+  * Async counterpart to writeFileAtomic. Used by the in-flight checkpoint writer
+  * so serializing + flushing a multi-MB transcript doesn't block the CLI's
+- * render/input thread. Same tmp-then-rename atomicity guarantee.
++ * render/input thread. Same tmp-flush-rename-flush guarantee; the flushes run
++ * on the libuv threadpool, not the render thread.
+  */
+ export async function writeFileAtomicAsync(
+   filePath: string,
+   data: string,
+ ): Promise<void> {
+   const tmpPath = tempPathFor(filePath)
+   try {
+-    await fs.promises.writeFile(tmpPath, data)
+-    await fs.promises.rename(tmpPath, filePath)
++    const handle = await activeFs.promises.open(tmpPath, 'wx')
++    try {
++      await handle.writeFile(data)
++      await handle.sync()
++    } finally {
++      await handle.close()
++    }
++    await activeFs.promises.rename(tmpPath, filePath)
++    await syncDirectoryAsync(path.dirname(filePath))
+   } catch (error) {
+     try {
+-      await fs.promises.unlink(tmpPath)
++      await activeFs.promises.unlink(tmpPath)
+     } catch {
+       // Ignore cleanup errors; the original error is what matters
+     }
+     throw error
+   }
+ }
+
+```
