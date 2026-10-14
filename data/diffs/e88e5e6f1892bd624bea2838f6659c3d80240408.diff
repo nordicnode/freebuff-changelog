@@ -1,0 +1,492 @@
+diff --git a/common/src/constants/byok.ts b/common/src/constants/byok.ts
+index d0242cff8..a5bd2b51b 100644
+--- a/common/src/constants/byok.ts
++++ b/common/src/constants/byok.ts
+@@ -1,6 +1,10 @@
+ export const BYOK_OPENROUTER_HEADER = 'x-openrouter-api-key'
+ export const BYOK_OPENROUTER_ENV_VAR = 'CODEBUFF_BYOK_OPENROUTER'
+ 
+ /** The user id an SDK BYOK run carries when its caller names none: every such
+  * run shares it, so it identifies nobody. */
+ export const BYOK_LOCAL_USER_ID = 'byok-local'
++
++/** Prefix of the run ids an SDK BYOK run mints for itself (it has no Codebuff
++ * run ledger), and how the runtime tells a BYOK run from a hosted one. */
++export const BYOK_RUN_ID_PREFIX = 'byok-'
+diff --git a/packages/agent-runtime/src/__tests__/compact-context-loop.test.ts b/packages/agent-runtime/src/__tests__/compact-context-loop.test.ts
+index 908673007..5d9caa189 100644
+--- a/packages/agent-runtime/src/__tests__/compact-context-loop.test.ts
++++ b/packages/agent-runtime/src/__tests__/compact-context-loop.test.ts
+@@ -1,32 +1,33 @@
+ /**
+  * End-to-end cover for the `compactContext` flag: compact-history.test.ts
+  * proves the algorithm, and this proves the runtime actually reaches it and
+  * that the rewritten history is what the model sees.
+  */
+ 
+ import * as analytics from '@codebuff/common/analytics'
++import { BYOK_RUN_ID_PREFIX } from '@codebuff/common/constants/byok'
+ import { TEST_USER_ID } from '@codebuff/common/old-constants'
+ import { createTestAgentRuntimeParams } from '@codebuff/common/testing/fixtures/agent-runtime'
+ import { clearMockedModules } from '@codebuff/common/testing/mock-modules'
+ import {
+   createMockDbOperations,
+   setupDbSpies,
+ } from '@codebuff/common/testing/mocks/database'
+ import { getInitialSessionState } from '@codebuff/common/types/session-state'
+ import { promptSuccess } from '@codebuff/common/util/error'
+ import { assistantMessage, userMessage } from '@codebuff/common/util/messages'
+ import {
+   afterAll,
+   afterEach,
+   beforeEach,
+   describe,
+   expect,
+   it,
+   mock,
+   spyOn,
+ } from 'bun:test'
+ 
+ import { loopAgentSteps } from '../run-agent-step'
+ import { clearAgentGeneratorCache } from '../run-programmatic-step'
+ import { createToolCallChunk, mockFileContext } from './test-utils'
+ 
+@@ -97,58 +98,59 @@ describe('compactContext in loopAgentSteps', () => {
+   ]
+ 
+   /**
+    * A conversation whose last assistant message landed `gapMinutes` before the
+    * live user prompt — i.e. the prompt cache has had that long to expire.
+    */
+   const idleHistory = (gapMinutes: number): Message[] => [
+     { ...userMessage('the first request'), sentAt: 1_000_000 },
+     ...bulkyRead(),
+     {
+       ...assistantMessage('DISTINCTIVE PRIOR ANSWER '.repeat(100)),
+       sentAt: 1_000_000,
+     },
+     {
+       ...userMessage('the live question'),
+       tags: ['USER_PROMPT'],
+       sentAt: 1_000_000 + gapMinutes * MINUTE,
+     },
+   ]
+ 
+   const runLoop = async (
+     template: AgentTemplate,
+     messageHistory: Message[],
+     prompt?: string,
+     logged?: unknown[],
++    runtimeOverrides: Record<string, unknown> = {},
+   ) => {
+     const {
+       agentTemplate: _,
+       localAgentTemplates: __,
+       ...baseRuntimeParams
+     } = createTestAgentRuntimeParams()
+ 
+-    runtimeImpl = { ...baseRuntimeParams }
++    runtimeImpl = { ...baseRuntimeParams, ...runtimeOverrides }
+     if (logged)
+       runtimeImpl.logger = {
+         ...baseRuntimeParams.logger,
+         info: (data: unknown) => logged.push(data),
+       }
+     runtimeImpl.promptAiSdkStream = mock(async function* (params: any) {
+       seenMessages.push(params.messages)
+       yield { type: 'text' as const, text: 'ok' }
+       yield createToolCallChunk('end_turn', {})
+       return promptSuccess('mock-message-id')
+     })
+ 
+     const sessionState = getInitialSessionState(mockFileContext)
+     return loopAgentSteps({
+       ...runtimeImpl,
+       agentType: template.id,
+       localAgentTemplates: { [template.id]: template },
+       repoId: undefined,
+       repoUrl: undefined,
+       userInputId: 'test-user-input',
+       agentState: {
+         ...sessionState.mainAgentState,
+         agentId: 'test-agent-id',
+         messageHistory,
+         output: undefined,
+@@ -187,50 +189,85 @@ describe('compactContext in loopAgentSteps', () => {
+     compactContext: { maxContextLength: 4096, cacheExpiryMs: null },
+   }
+ 
+   it('compacts at the context limit with no model request of its own', async () => {
+     const logged: unknown[] = []
+     const result = await runLoop(overBudget, idleHistory(0), undefined, logged)
+     expect(result.output.type).not.toBe('error')
+     expect(runtimeImpl.promptAiSdkStream).toHaveBeenCalledTimes(1)
+     const sent = seenMessages[0].map(textOf).join('\n')
+     expect(sent).toContain('<conversation_summary>')
+     expect(sent).toContain('the live question')
+     expect(JSON.stringify(seenMessages[0])).not.toContain(
+       'BULKY FILE BODY '.repeat(50),
+     )
+     expect(
+       logged.filter(
+         (data) =>
+           (data as { axiomEvent?: string }).axiomEvent ===
+           'context_compaction.followup',
+       ),
+     ).toEqual([
+       expect.objectContaining({ trigger_reason: 'context_limit' }),
+     ])
+   })
+ 
++  describe('when compaction cannot get under the budget', () => {
++    /** The run's error output appends the stack after the message. */
++    const firstLine = (output: { type: string; message?: string }) =>
++      output.message?.split('\n')[0]
++
++    /** The live request is kept verbatim, so one this large cannot shrink. */
++    const unshrinkable = (): Message[] => [
++      {
++        ...userMessage('LIVE REQUEST BODY '.repeat(5_000)),
++        tags: ['USER_PROMPT'],
++        sentAt: 1_000_000,
++      },
++    ]
++
++    it('points a hosted run at a larger-context model', async () => {
++      const result = await runLoop(overBudget, unshrinkable())
++      expect(runtimeImpl.promptAiSdkStream).not.toHaveBeenCalled()
++      expect(result.output.type).toBe('error')
++      expect(firstLine(result.output)).toBe(
++        "Agent run error: Compaction could not bring this conversation under the model's 4,096-token context budget. History has been preserved. Start a new thread, or switch to a model with a larger context window.",
++      )
++    })
++
++    it('keeps the context window hint for a BYOK run', async () => {
++      const result = await runLoop(overBudget, unshrinkable(), undefined, [], {
++        startAgentRun: async () => `${BYOK_RUN_ID_PREFIX}test-run`,
++      })
++      expect(runtimeImpl.promptAiSdkStream).not.toHaveBeenCalled()
++      expect(result.output.type).toBe('error')
++      expect(firstLine(result.output)).toBe(
++        "Agent run error: Compaction could not bring this conversation under the model's 4,096-token context budget. History has been preserved. Start a new thread, or give a BYOK connection a larger context window if its model supports one.",
++      )
++    })
++  })
++
+   it('leaves the history alone when the agent has not opted in', async () => {
+     await runLoop(baseTemplate, idleHistory(120))
+ 
+     const sent = seenMessages[0].map(textOf).join('\n')
+     expect(sent).toContain('DISTINCTIVE PRIOR ANSWER')
+     expect(sent).not.toContain('<conversation_summary>')
+   })
+ 
+   it('manual compaction makes no model request and preserves the live request', async () => {
+     const result = await runLoop(baseTemplate, idleHistory(0), '/compact')
+     expect(result.output.type).not.toBe('error')
+     expect(runtimeImpl.promptAiSdkStream).not.toHaveBeenCalled()
+     const history = result.agentState.messageHistory.map(textOf).join('\n')
+     expect(history).toContain('the live question')
+     expect(history).toContain('<conversation_summary>')
+     expect(history).not.toContain('/compact')
+   })
+ 
+   it('compacts on the idle trigger with no model request of its own', async () => {
+     const logged: unknown[] = []
+     const result = await runLoop(
+       { ...baseTemplate, compactContext: { cacheExpiryMinTokens: null } },
+       idleHistory(120),
+       undefined,
+       logged,
+diff --git a/packages/agent-runtime/src/compaction.ts b/packages/agent-runtime/src/compaction.ts
+index 9fe404c86..6ac16d8d3 100644
+--- a/packages/agent-runtime/src/compaction.ts
++++ b/packages/agent-runtime/src/compaction.ts
+@@ -76,50 +76,66 @@ export function compactedContextCeiling(params: {
+   maxOutputTokens?: number
+ }): number {
+   const suffixTokens = countTokensMessages(liveRequest(params.messages))
+   const budget = summaryBudget({ ...params, suffixTokens })
+   return params.fixedTokenCount + suffixTokens + Math.max(0, budget)
+ }
+ 
+ /**
+  * Whether an automatic compaction at `thresholdTokens` leaves real room to
+  * work in. When it cannot, the run keeps its history until the hard budget,
+  * where compaction is no longer optional.
+  */
+ export function automaticCompactionIsWorthwhile(params: {
+   messages: Message[]
+   maxContextLength: number
+   thresholdTokens: number
+   fixedTokenCount: number
+   maxOutputTokens?: number
+ }): boolean {
+   return (
+     compactedContextCeiling(params) <=
+     Math.floor(params.thresholdTokens * COMPACTION_LOW_WATER)
+   )
+ }
+ 
++/**
++ * Why the run stops when compaction left it over the hard budget, and the way
++ * out. A BYOK connection's window is the user's own setting; a hosted model's
++ * is fixed, so there the way out is another model. web's Desktop Cloud error
++ * passthrough matches the opening words.
++ */
++export function compactionOverBudgetMessage(params: {
++  maxContextLength: number
++  byok: boolean
++}): string {
++  const remedy = params.byok
++    ? 'give a BYOK connection a larger context window if its model supports one'
++    : 'switch to a model with a larger context window'
++  return `Compaction could not bring this conversation under the model's ${params.maxContextLength.toLocaleString('en-US')}-token context budget. History has been preserved. Start a new thread, or ${remedy}.`
++}
++
+ export function compactMechanically(params: {
+   messages: Message[]
+   maxContextLength: number
+   fixedTokenCount: number
+   targetTokens?: number
+   trigger?: CompactionTrigger | 'manual'
+   logger: Logger
+   runId?: string
+   model?: string
+   contextTokenCount?: number
+ }): {
+   messages: Message[]
+   summary: string
+   preTokens: number
+   postTokens: number
+ } | null {
+   const { model, contextTokenCount, ...historyParams } = params
+   let error: unknown
+   try {
+     const result = compactHistoryNow(historyParams)
+     if (result)
+       return {
+         messages: result.messages,
+         summary: result.summaryText,
+         preTokens: result.previousTokens + params.fixedTokenCount,
+diff --git a/packages/agent-runtime/src/run-agent-step.ts b/packages/agent-runtime/src/run-agent-step.ts
+index 916fde5da..1e691074e 100644
+--- a/packages/agent-runtime/src/run-agent-step.ts
++++ b/packages/agent-runtime/src/run-agent-step.ts
+@@ -1,72 +1,74 @@
+ import { contextPrunerBudgetForModel } from '@codebuff/common/constants/model-config'
+ import { compactionThreshold } from '@codebuff/common/constants/compaction-policy'
++import { BYOK_RUN_ID_PREFIX } from '@codebuff/common/constants/byok'
+ import {
+   supportsAssistantPrefill,
+   supportsCacheControl,
+ } from '@codebuff/common/old-constants'
+ import { PROJECT_PROFILE_TOOL_NAME } from '@codebuff/common/constants/project-profile'
+ import { TOOLS_WHICH_WONT_FORCE_NEXT_STEP } from '@codebuff/common/tools/constants'
+ import { parseAgentId } from '@codebuff/common/util/agent-id-parsing'
+ import {
+   GRAVITY_REPORT_NUDGE_EVENT,
+   TODO_PROGRESS_REMINDER_EVENT,
+ } from '@codebuff/common/util/axiom-only-log'
+ import { buildArray } from '@codebuff/common/util/array'
+ import {
+   AbortError,
+   FETCH_IDLE_TIMEOUT_USER_MESSAGE,
+   TRANSIENT_NETWORK_ERROR_USER_MESSAGE,
+   extractApiErrorDetails,
+   getErrorObject,
+   isAbortError,
+   isFetchIdleTimeoutError,
+   isTransientNetworkError,
+ } from '@codebuff/common/util/error'
+ import { serializeCacheDebugCorrelation } from '@codebuff/common/util/cache-debug'
+ import {
+   assistantMessage,
+   dropUnansweredToolCalls,
+   systemMessage,
+   userMessage,
+ } from '@codebuff/common/util/messages'
+ import { type ToolSet } from 'ai'
+ import { cloneDeep, mapValues } from 'lodash'
+ import z from 'zod/v4'
+ 
+ import {
+   evaluateCompactionTrigger,
+   MECHANICAL_TARGET_SHARE,
+ } from './compact-history'
+ import type { CompactionTrigger } from './compact-history'
+ import {
+   closeCompactionWindow,
+   openCompactionWindow,
+ } from './compaction-followup'
+ import type { CompactionWindow } from './compaction-followup'
+ import {
+   automaticCompactionIsWorthwhile,
++  compactionOverBudgetMessage,
+   compactMechanically,
+ } from './compaction'
+ import { CACHE_DEBUG_FULL_LOGGING } from './constants'
+ import { getMCPToolData } from './mcp'
+ import {
+   runProjectProfileReport,
+   shouldOfferProjectProfileTool,
+ } from './project-profile'
+ import { getAgentStreamFromTemplate } from './prompt-agent-stream'
+ import { isThinkOnlyResponse } from './util/think-tags'
+ import {
+   decideFollowupTodoNudge,
+   FOLLOWUP_TODO_NUDGE_TAG,
+ } from './util/followup-todo-nudge'
+ import {
+   endsOnSuggestPromptsBeforeAnswer,
+   SUGGEST_PROMPTS_BEFORE_ANSWER_MESSAGE,
+   SUGGEST_PROMPTS_BEFORE_ANSWER_TAG,
+ } from './util/suggest-prompts-before-answer'
+ import {
+   decideGravityReportNudge,
+   GRAVITY_REPORT_NUDGE_TAG,
+ } from './util/gravity-report-nudge'
+ import {
+   decideTodoProgressReminder,
+@@ -1456,51 +1458,54 @@ export async function loopAgentSteps(
+                 trigger,
+               })
+               currentAgentState.messageHistory = compacted.messages
+               currentAgentState.contextTokenBaseline = undefined
+               currentAgentState.contextTokenCount = compacted.postTokens
+               if (isRoot)
+                 params.onCompaction?.({
+                   trigger,
+                   thresholdTokens,
+                   summary: compacted.summary,
+                   preTokens: compacted.preTokens,
+                   postTokens: compacted.postTokens,
+                   durationMs: Date.now() - started,
+                 })
+             }
+           } finally {
+             if (isRoot) params.onCompactionEnd?.()
+           }
+           // A manual request is a maintenance operation, never a coding turn.
+           if (manualCompaction) break
+           if (
+             !compacted &&
+             currentAgentState.contextTokenCount > maxContextLength
+           ) {
+             throw new Error(
+-              `Compaction could not bring this conversation under the model's ${maxContextLength.toLocaleString('en-US')}-token context budget. History has been preserved. Start a new thread, or give a BYOK connection a larger context window if its model supports one.`,
++              compactionOverBudgetMessage({
++                maxContextLength,
++                byok: runId.startsWith(BYOK_RUN_ID_PREFIX),
++              }),
+             )
+           }
+           totalSteps++
+         }
+       }
+ 
+       // 1. Run programmatic step first if it exists
+       let n: number | undefined = undefined
+ 
+       if (agentTemplate.handleSteps) {
+         const programmaticResult = await runProgrammaticStep({
+           ...params,
+ 
+           agentState: currentAgentState,
+           localAgentTemplates,
+           nResponses,
+           onCostCalculated: async (credits: number) => {
+             currentAgentState.creditsUsed += credits
+             currentAgentState.directCreditsUsed += credits
+           },
+           prompt: currentPrompt,
+           runId,
+           stepNumber: totalSteps,
+           stepsComplete: shouldEndTurn,
+           system,
+diff --git a/sdk/src/impl/agent-runtime.ts b/sdk/src/impl/agent-runtime.ts
+index 1c454f4dc..d90793247 100644
+--- a/sdk/src/impl/agent-runtime.ts
++++ b/sdk/src/impl/agent-runtime.ts
+@@ -1,27 +1,27 @@
+ import { trackEvent as trackCommonEvent } from '@codebuff/common/analytics'
+-import { BYOK_LOCAL_USER_ID } from '@codebuff/common/constants/byok'
++import { BYOK_LOCAL_USER_ID, BYOK_RUN_ID_PREFIX } from '@codebuff/common/constants/byok'
+ import { env as clientEnvDefault } from '@codebuff/common/env'
+ import { getCiEnv } from '@codebuff/common/env-ci'
+ import { shouldTrackAnalyticsEvent } from '@codebuff/common/util/analytics-sampling'
+ import { success } from '@codebuff/common/util/error'
+ import { HostedServiceUnavailableError } from '@codebuff/agent-runtime/llm-api/codebuff-web-api'
+ 
+ import { getWebsiteUrl } from '../constants'
+ import type { ResolvedByokConnection } from '../byok'
+ import type { CodebuffRequestHeadersProvider } from './model-provider'
+ 
+ import {
+   addAgentStep,
+   fetchAgentFromDatabase,
+   finishAgentRun,
+   getUserInfoFromApiKey,
+   startAgentRun,
+ } from './database'
+ import { promptAiSdk, promptAiSdkStream, promptAiSdkStructured } from './llm'
+ 
+ import type {
+   AgentRuntimeDeps,
+   AgentRuntimeScopedDeps,
+ } from '@codebuff/common/types/contracts/agent-runtime'
+ import type { AgentTemplate } from '@codebuff/common/types/agent-template'
+ import type { DatabaseAgentCache } from '@codebuff/common/types/contracts/database'
+@@ -110,51 +110,51 @@ export function getAgentRuntimeImpl(
+       })
+     ) {
+       return
+     }
+ 
+     trackCommonEvent(eventParams)
+   }
+ 
+   return {
+     // Environment
+     clientEnv,
+     ciEnv: getCiEnv(),
+ 
+     // Database
+     getUserInfoFromApiKey: byok
+       ? async () => ({ id: BYOK_LOCAL_USER_ID }) as any
+       : getUserInfoFromApiKey,
+     // A BYOK run only uses its local agent registry. A missing local agent is
+     // an error, never a reason to send its prompt or identity to Freebuff.
+     // Otherwise a registry template is fetched through the publisher-trust
+     // gate: its handleSteps is code this process would eval.
+     fetchAgentFromDatabase: byok || disableAgentRegistry
+       ? async () => null
+       : (fetchParams) =>
+           fetchAgentFromDatabase({ ...fetchParams, trustedAgentPublishers }),
+-    startAgentRun: byok ? async () => `byok-${crypto.randomUUID()}` : startAgentRun,
++    startAgentRun: byok ? async () => `${BYOK_RUN_ID_PREFIX}${crypto.randomUUID()}` : startAgentRun,
+     finishAgentRun: byok ? async () => {} : finishAgentRun,
+     addAgentStep: byok ? async () => `byok-step-${crypto.randomUUID()}` : addAgentStep,
+ 
+     // Billing
+     consumeCreditsWithFallback: async () =>
+       success({
+         chargedToOrganization: false,
+       }),
+ 
+     // LLM. A BYOK run talks to the user's own provider, so the host's backend
+     // request headers never apply to it.
+     promptAiSdkStream: byok
+       ? ((params) => promptAiSdkStream({ ...params, byok } as any))
+       : requestHeaders
+         ? ((params) => promptAiSdkStream({ ...params, requestHeaders }))
+         : promptAiSdkStream,
+     promptAiSdk: byok
+       ? ((params) => promptAiSdk({ ...params, byok } as any))
+       : requestHeaders
+         ? ((params) => promptAiSdk({ ...params, requestHeaders }))
+         : promptAiSdk,
+     promptAiSdkStructured: byok
+       ? ((params) => promptAiSdkStructured({ ...params, byok } as any))
+       : requestHeaders
+         ? ((params) => promptAiSdkStructured({ ...params, requestHeaders }) as any)
