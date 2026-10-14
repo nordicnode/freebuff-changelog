@@ -1,0 +1,1975 @@
+Date: 2026-10-14T19:37:39Z
+Category: CLI
+Areas: CLI, Shared/Core
+Commit nature: production
+Stats: +140 / -4
+Analysis notes: CLI, Shared/Core changes across 3 file(s) (+140/−4).
+Modified files: cli/src/hooks/use-gravity-ad.ts, cli/src/utils/log-shipper.ts, common/src/util/log-data.ts
+Key facts (ground the WHY and DETAIL sentences in these): - One record ready for the wire: every `Error` in `data` replaced by its JSON form. - Shipping a summary-less row beats dropping the row. - The same payload with every `Error` replaced by its JSON form, as plain JSON values rather than a string. - Unwrapping here also applies the redaction in `redactErrorFieldForLog` on the client, so a URL, header set or request body hanging off an error is trimmed before it leaves the machine instead of after. - Buffer one record for shipping. Cheap, synchronous, never throws.
+Structured facts (extracted mechanically from the diff; copy names and values verbatim, never round or rename):
+- Exports added: toShippableRecord, toJsonSafeLogData
+- Behavior asserted by new tests (test titles, verbatim; the hunks themselves are omitted): "shipping an error" ; "keeps the reason across the hop to /api/logs" ; "leaves a record without a payload alone" ; "toJsonSafeLogData" ; "an error survives a JSON round trip to another process" ; "a bun network error keeps its code and gains its message" ; "redacts on the client, before the payload leaves the machine" ; "tolerates a circular payload and passes scalars through"
+Module & File Purpose (ground-truth documentation from touched files):
+- File `cli/src/utils/log-shipper.ts`:
+```
+/**
+ * Client-side shipper that mirrors CLI logs/events into the server's Axiom
+ * logs sink via POST /api/logs. Runs alongside PostHog (it does not replace
+ * it). Fully best-effort: batched, fire-and-forget, never throws, never logs
+ * through the app logger (which would recurse).
+ *
+ * Tuning via env:
+ *  - CODEBUFF_SHIP_LOGS 'true' | 'false'  (default: on outside dev/test)
+ */
+```
+- File `common/src/util/log-data.ts`:
+```
+/**
+ * Shared pieces of the Axiom log-row pipeline used by every producer that
+ * ingests rows — the long-lived sink (packages/logging/src/sink.ts) and the
+ * Convex direct-ingest helper (freebuff/web/convex/lib/axiom_log.ts). Living
+ * here keeps the serialized `data` contract and level ordering identical
+ * across producers, so APL queries behave the same regardless of which
+ * service emitted a row. Deliberately light on imports (the schemas module
+ * pulls only zod) so it stays safe for the Convex bundle.
+ */
+```
+Subsystem Architecture Documentation (from nearby package guides):
+- From `cli/README.md`:
+```markdown
+# @codebuff/cli
+
+A Terminal User Interface (TUI) package built with OpenTUI and React.
+
+## Installation
+
+```bash
+bun install
+```
+
+## Development
+
+Run the TUI in development mode:
+
+```bash
+bun run dev
+```
+
+## Testing
+
+Run the test suite:
+
+```bash
+bun test
+```
+
+### Interactive E2E Testing
+
+For testing interactive CLI features, install tmux:
+
+```bash
+# macOS
+brew install tmux
+
+# Ubuntu/Debian
+sudo apt-get install tmux
+
+# Windows (via WSL)
+wsl --install
+sudo apt-get install tmux
+```
+
+Then run the proof-of-concept:
+
+```bash
+bun run test:tmux-poc
+```
+
+[freebuff product prompt text omitted]
+
+```bash
+# ❌ Broken: tmux send-keys -t session "hello"
+# ✅ Works:  tmux send-keys -t session $'\e[200~hello\e[201~'
+```
+
+See [tmux.knowledge.md](tmux.knowledge.md) for comprehensive tmux documentation and [src/__tests__/README.md](src/__tests__/README.md) for testing documentation.
+
+## Build
+
+Build the package:
+
+```bash
+bun run build
+```
+
+## Run
+
+Run the built TUI:
+
+```bash
+bun run start
+```
+
+Or use the binary directly:
+
+```bash
+codebuff-tui
+```
+
+## Features
+```
+Complete Source of Modified Files (for complete module context):
+- File `cli/src/hooks/use-gravity-ad.ts` (816 lines):
+```
+import { WEBSITE_URL } from '@codebuff/sdk'
+import { AnalyticsEvent } from '@codebuff/common/constants/analytics-events'
+import { getAdUserAgent } from '@codebuff/common/util/ad-user-agent'
+import { FREEBUFF_EVENT_ID_HEADER } from '@codebuff/common/ads/ad-event-hygiene'
+import {
+  acknowledgeFirstPartyView,
+  type FirstPartyViewAckRequest,
+} from '@codebuff/common/ads/first-party-view-ack'
+import { createFirstPartyViewAckTelemetry } from '@codebuff/common/util/axiom-only-log'
+import { sanitizeTerminalStrings } from '@codebuff/common/util/terminal-safe-text'
+import { useRenderer } from '@opentui/react'
+import { useEffect, useRef, useState } from 'react'
+
+import { useTerminalLayout } from './use-terminal-layout'
+import { buildAdAuctionRequest } from '../ads/ad-request'
+import {
+  noteAdClicked,
+  noteAdTurnState,
+  noteAdsServed,
+  registerAdRenderer,
+  timedAdFetch,
+  timedApiCall,
+} from '../ads/ad-signals'
+import {
+  adEngagementRegistry,
+  armAdAdoptionWatch,
+} from '../ads/use-ad-engagement'
+import { trackAdClickAck, watchAdClickReturn } from '../ads/click-return'
+import { getAdsEnabled } from '../commands/ads'
+import { useChatStore } from '../state/chat-store'
+import { isUserActive, subscribeToActivity } from '../utils/activity-tracker'
+import { getAuthToken } from '../utils/auth'
+import { IS_FREEBUFF } from '../utils/constants'
+import { logger } from '../utils/logger'
+import { enqueueClientLog } from '../utils/log-shipper'
+import { AI_MESSAGE_ID_PREFIX } from '../utils/ai-message-id'
+import { trackEvent } from '../utils/analytics'
+import {
+  getAdDeviceInfo,
+  getCliAdRequestUserAgent,
+} from '../utils/ad-client-identity'
+import { clientEnvironmentHeaders } from '../utils/client-environment'
+import {
+  createLazyResponseAdQueue,
+  MAX_RESPONSE_AD_POOL_SIZE,
+  requestLazyResponseAds,
+} from '../utils/lazy-response-ads'
+
+import type { ChatMessage } from '../types/chat'
+import type { DockClickContext } from './use-dock-panel'
+
+const AD_ROTATION_INTERVAL_MS = 60 * 1000 // 60 seconds per ad
+const MAX_ADS_AFTER_ACTIVITY = 3 // Show up to 3 ads after last activity, then pause fetching new ads
+const ACTIVITY_THRESHOLD_MS = 30_000 // 30 seconds idle threshold for fetching new ads
+const MAX_AD_CACHE_SIZE = 50 // Maximum number of ads to keep in cache
+
+// Ad response type (normalized shape across providers; credits added after impression)
+export type AdResponse = {
+  adText: string
+  title: string
+  cta: string
+  url: string
+  favicon: string
+  clickUrl: string
+  impUrl: string
+  placementId?: string
+  provider?: AdProvider
+  credits?: number // Set after impression is recorded (in cents)
+  /**
+   * `Date.now()` when the auction RESPONSE was received (COD-365). The origin
+   * of `renderDelayMs` on the impression ack: receipt to card mount, so our
+   * own server latency (already on `ads.fetch_completed.duration_ms`) stays
+   * out of a client metric. Absent on ads that predate the stamp; the ack
+   * then simply omits the delay and the server stores unknown.
+   */
+  receivedAtMs?: number
+  /**
+   * Optional expanded creative for the dock's detail panel (COD-457). Only
+   * first-party creatives carry these; a Gravity or house ad arrives
+   * without them and the panel falls back to `adText`, no bullets, no diagram.
+   */
+  expandedBody?: string
+  bullets?: string[]
+  diagram?: string
+  /** Explicit server-owned partner designation. */
+  partnerBrand?: 'greptile'
+  /**
+   * Reviewed fill and ink, `#rrggbb`, for custom partner rows. Ordinary ads
+   * use them only with Greptile's explicit partner designation.
+   */
+  brandColor?: string
+  brandInk?: string
+}
+
+/**
+ * The one "no inline ads" value. It MUST keep its identity across renders:
+ * Chat's layout effect lists `responseAds` as a dependency and writes it into
+ * the message-block store, so a fresh `{}` per render (every render whenever
+ * ads are hidden) re-ran that effect after every commit, scheduling another
+ * store write and a synchronous re-render of every message block. During fast
+ * streaming that is the chain of commits-with-pending-updates that React counts
+ * toward "Maximum update depth exceeded" (#185).
+ */
+export const NO_RESPONSE_ADS: Record<string, AdResponse[]> = Object.freeze(
+  {},
+) as Record<string, AdResponse[]>
+
+export function visibleResponseAds(
+  visible: boolean,
+  responseAds: Record<string, AdResponse[]>,
+): Record<string, AdResponse[]> {
+  return visible ? responseAds : NO_RESPONSE_ADS
+}
+
+/**
+ * Whether the hook neither fetches nor acknowledges. A hidden hook makes no
+ * auction, so nothing is served that the screen cannot draw.
+ *
+ * That matters beyond cost: the ad-signal detector reads `viewed / served`
+ * per account (docs/freebuff-ad-signal-detection.md), so an ad fetched for a
+ * slot that is not on screen counts against the user. Freebuff ignores the
+ * compact-height rule because its chat slot always draws; a caller whose
+ * slot can be hidden passes `enabled: false` for exactly as long as it is.
+ */
+export function shouldHideGravityAds(params: {
+  enabled: boolean
+  terminalHeight: number
+  isFreeMode: boolean
+}): boolean {
+  const isVeryCompactHeight = params.terminalHeight <= 17
+  return !params.enabled || (isVeryCompactHeight && !params.isFreeMode)
+}
+
+/**
+ * Milliseconds from auction-response receipt to now, or undefined when the ad
+ * carries no receipt time. Never negative: a clock that moved backwards is a
+ * zero, not a rejection, mirroring the server's clamp.
+ */
+export function renderDelaySinceReceipt(
+  ad: Pick<AdResponse, 'receivedAtMs'>,
+  now: number = Date.now(),
+): number | undefined {
+  if (typeof ad.receivedAtMs !== 'number' || !Number.isFinite(ad.receivedAtMs))
+    return undefined
+  return Math.max(0, Math.round(now - ad.receivedAtMs))
+}
+
+/**
+ * Which upstream ad network to query. The server maps each provider onto the
+ * same normalized response shape, so the rest of the hook is provider-agnostic.
+ */
+export type AdProvider = 'gravity' | 'first_party'
+// Product surfaces the ads API maps to Gravity placements. 'waiting_room' is the
+// legacy wire name for the freebuff landing screen; 'cli_chat' is the inline
+// transcript ad in the coding-agent chat. Values must match the server's
+// AD_SURFACES enum, so don't rename them.
+export type AdSurface = 'waiting_room' | 'cli_chat'
+
+export type GravityAdState = {
+  ads: AdResponse[] | null
+  /**
+   * On-demand ad pools keyed by assistant message id. The renderer repeats a
+   * full pool when the response has more eligible slots than distinct ads.
+   */
+  responseAds: Record<string, AdResponse[]>
+  /** Lazily fill the response's bounded ad pool as slots become eligible. */
+  requestResponseAds: (messageId: string, count: number) => void
+  isLoading: boolean
+  recordClick: (ad: AdResponse, dock?: DockClickContext) => void
+  recordImpression: (ad: AdResponse) => void
+}
+
+// Consolidated controller state for the ad rotation logic
+type GravityController = {
+  choiceCache: AdResponse[][] // Cache of ad sets (choice or single-ad units)
+  choiceCacheIndex: number
+  impressionsFired: Set<string>
+  adsShownSinceActivity: number
+  tickInFlight: boolean
+  inlineQueue: ReturnType<typeof createLazyResponseAdQueue<AdResponse>>
+  eligibleSlotCounts: Map<string, number>
+}
+
+// Pure helper: add an ad set to the cache
+function addToChoiceCache(ctrl: GravityController, ads: AdResponse[]): void {
+  // Deduplicate by checking if any set has the same first impUrl
+  const key = ads[0]?.impUrl
+  if (key && ctrl.choiceCache.some((set) => set[0]?.impUrl === key)) return
+  if (ctrl.choiceCache.length >= MAX_AD_CACHE_SIZE) ctrl.choiceCache.shift()
+  ctrl.choiceCache.push(ads)
+}
+
+// Pure helper: get the next cached ad set
+function nextFromChoiceCache(ctrl: GravityController): AdResponse[] | null {
+  if (ctrl.choiceCache.length === 0) return null
+  const set = ctrl.choiceCache[ctrl.choiceCacheIndex % ctrl.choiceCache.length]!
+  ctrl.choiceCacheIndex = (ctrl.choiceCacheIndex + 1) % ctrl.choiceCache.length
+  return set
+}
+
+/**
+ * A streamed LLM answer (possibly still in flight). Other top-level
+ * 'ai'-variant messages (bash echoes, system notices, mode dividers) are
+ * excluded via the `ai-` id prefix.
+ */
+export function isAnswerMessage(m: ChatMessage): boolean {
+  return (
+    !m.parentId && m.variant === 'ai' && m.id.startsWith(AI_MESSAGE_ID_PREFIX)
+  )
+}
+
+export function isInlineAdEligibleAnswer(m: ChatMessage): boolean {
+  return isAnswerMessage(m) && m.metadata?.allowInlineAds === true
+}
+
+export function claimAdImpression(
+  impressionsFired: Set<string>,
+  impUrl: string,
+): boolean {
+  if (impressionsFired.has(impUrl)) return false
+  impressionsFired.add(impUrl)
+  return true
+}
+
+/**
+ * Narrow testable boundary: only our own inventory uses the resilient view
+ * acknowledgement transport. Third-party providers retain their legacy pixel
+ * acknowledgement path below.
+ */
+export function dispatchFirstPartyViewAcknowledgement(
+  provider: AdProvider | undefined,
+  request: Omit<FirstPartyViewAckRequest, 'onAttempt'>,
+  onAttempt: NonNullable<FirstPartyViewAckRequest['onAttempt']>,
+  acknowledge: typeof acknowledgeFirstPartyView = acknowledgeFirstPartyView,
+): boolean {
+  if (provider !== 'first_party') return false
+  void acknowledge({ ...request, onAttempt })
+  return true
+}
+
+/**
+ * Report a click on any CLI ad.
+ *
+ * Module-level rather than a closure inside the hook because the PARTNER rows
+ * are not the hook's ads and still settle through the same endpoint: one
+ * click path means an advertiser's click is counted the same way wherever it
+ * was drawn. Never awaited by a caller — a click that waited on our own
+ * telemetry before opening the link would be slower than the ad is worth.
+ */
+export function recordAdClick(
+  ad: Pick<AdResponse, 'impUrl'> & { url?: string },
+  options?: { surface?: AdSurface; dock?: DockClickContext },
+): void {
+  const authToken = getAuthToken()
+  if (!authToken) {
+    logger.warn('[ads] No auth token, skipping ad click recording')
+    return
+  }
+
+  // COD-694: watch for the user's next prompt, the CLI's "came back" signal.
+  watchAdClickReturn(ad.impUrl)
+  noteAdClicked()
+  // COD-757: watch for the agent installing the clicked vendor's package.
+  armAdAdoptionWatch(ad.impUrl, ad.url)
+
+  // One id per logical click (COD-365); a repeat POST of the same ad is a
+  // new gesture and a new id, and the server answers `alreadyRecorded`.
+  const clientEventId = crypto.randomUUID()
+  const dock = options?.dock
+  const ack = timedApiCall(() =>
+    fetch(`${WEBSITE_URL}/api/v1/ads/click`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${authToken}`,
+        'User-Agent': getCliAdRequestUserAgent(),
+        ...clientEnvironmentHeaders(),
+        [FREEBUFF_EVENT_ID_HEADER]: clientEventId,
+      },
+      body: JSON.stringify({
+        impUrl: ad.impUrl,
+        clientEventId,
+        ...(options?.surface ? { surface: options.surface } : {}),
+        // The dock's own fields ride the ACK (COD-457), so the canonical
+        // server-side `ads.clicked` carries them and one click stays one
+        // event. Emitting a second client-side click here double-counted.
+        ...(dock
+          ? {
+              dockFrom: dock.from,
+              dockDwellMs: dock.dwellMs,
+              dockAccidentalClick: dock.accidental,
+            }
+          : {}),
+      }),
+    }),
+  )
+    .then((res) => {
+      if (!res.ok) {
+        logger.debug({ status: res.status }, '[ads] Failed to record ad click')
+      }
+    })
+    .catch((err) => {
+      logger.debug({ err }, '[ads] Failed to record ad click')
+    })
+  // The return report for this click waits for it to be recorded (COD-694).
+  trackAdClickAck(ad.impUrl, ack)
+}
+
+function trackInlineAdEvent(
+  event: AnalyticsEvent,
+  properties: Record<string, unknown>,
+): void {
+  try {
+    trackEvent(event, properties)
+  } catch (error) {
+    // Telemetry must never interfere with fetching or rendering an ad.
+    logger.debug({ error, event }, '[ads] Failed to track inline ad event')
+  }
+}
+
+type GravityAdOptionsBase = {
+  enabled?: boolean
+  /** Skip the "wait for first user message" gate. Used by the freebuff
+   *  landing screen, which has no conversation but still needs ads. */
+  forceStart?: boolean
+  /** Ad network to request first. The server owns fallback ordering. */
+  provider?: AdProvider
+  /** Product surface requesting the ad. The server maps this to placements. */
+  surface?: AdSurface
+  /** Explicit provider placement id for the rotating `ads[0]` slot. */
+  slotPlacementId?: string
+  /**
+   * Stop rotating `ads[0]` while something else holds its slot (the sponsor
+   * dock). An ad fetched then would be served and never rendered; ads are
+   * fetched only when they can be rendered. Inline ads are unaffected.
+   */
+  slotPaused?: boolean
+  placementIds?: string[]
+}
+
+type GravityAdOptions = GravityAdOptionsBase &
+  (
+    | {
+        /** Lazily fetch interspersed ads as the assistant response grows. */
+        inline: true
+        /** Reusable provider placement id for every lazy inline auction. */
+        inlinePlacementId: string
+      }
+    | {
+        inline?: false
+        inlinePlacementId?: never
+      }
+  )
+
+/**
+ * Fetches the rotating ad slot and, with `inline`, one reusable placement each
+ * time another interspersed response slot becomes eligible. Short answers make
+ * no unnecessary inline requests; long answers repeat a pool of four ads.
+ */
+export const useGravityAd = (options?: GravityAdOptions): GravityAdState => {
+  const enabled = options?.enabled ?? true
+  const forceStart = options?.forceStart ?? false
+  const provider: AdProvider = options?.provider ?? 'gravity'
+  const surface = options?.surface
+  const inline = options?.inline ?? false
+  const inlinePlacementId = options?.inlinePlacementId
+  const slotPlacementId = options?.slotPlacementId
+  // Read by the tick through a ref, so pausing needs no timer restart.
+  const slotPausedRef = useRef(false)
+  slotPausedRef.current = options?.slotPaused ?? false
+  const placementIds = options?.placementIds
+  const [ads, setAdsState] = useState<AdResponse[] | null>(null)
+  // The rotating slot's creatives as last set, so a swap can be told to the
+  // engagement registry (COD-757) before React unmounts the old cards: their
+  // records then end as `rotation`, not `unmount`.
+  const adsRef = useRef<AdResponse[] | null>(null)
+  const setAds = (
+    next:
+      | AdResponse[]
+      | null
+      | ((cur: AdResponse[] | null) => AdResponse[] | null),
+  ): void => {
+    const resolved = typeof next === 'function' ? next(adsRef.current) : next
+    try {
+      adEngagementRegistry().noteSlotSwap(
+        (adsRef.current ?? []).map((ad) => ad.impUrl),
+        (resolved ?? []).map((ad) => ad.impUrl),
+      )
+    } catch {
+      // engagement must never break rotation
+    }
+    adsRef.current = resolved
+    setAdsState(resolved)
+  }
+  const [responseAds, setResponseAds] = useState<Record<string, AdResponse[]>>(
+    {},
+  )
+  const [isLoading, setIsLoading] = useState(false)
+
+  const { terminalHeight } = useTerminalLayout()
+
+  // The live facts the ad client context reads (COD-757).
+  const renderer = useRenderer()
+  useEffect(() => {
+    if (!renderer) return
+    return registerAdRenderer(() => ({
+      useMouse: renderer.useMouse,
+      width: renderer.width,
+      height: renderer.height,
+    }))
+  }, [renderer])
+  useEffect(
+    () =>
+      useChatStore.subscribe((state, prev) =>
+        noteAdTurnState(state.isChainInProgress, prev.isChainInProgress),
+      ),
+    [],
+  )
+  const shouldHideAds = shouldHideGravityAds({
+    enabled,
+    terminalHeight,
+    isFreeMode: IS_FREEBUFF,
+  })
+
+  // Use Zustand selector instead of manual subscription - only rerenders when value changes
+  const hasUserMessagedStore = useChatStore((s) =>
+    s.messages.some((m) => m.variant === 'user'),
+  )
+  // forceStart lets callers (e.g. the landing screen) opt out of the
+  // "wait for the first user message" gate.
+  const shouldStart = forceStart || hasUserMessagedStore
+
+  // Single consolidated controller ref
+  const ctrlRef = useRef<GravityController>({
+    choiceCache: [],
+    choiceCacheIndex: 0,
+    impressionsFired: new Set(),
+    adsShownSinceActivity: 0,
+    tickInFlight: false,
+    inlineQueue: createLazyResponseAdQueue<AdResponse>(),
+    eligibleSlotCounts: new Map(),
+  })
+
+  // Ref for the tick function (avoids useCallback dependency issues)
+  const tickRef = useRef<() => void>(() => {})
+
+  // Ref to track whether ads should be hidden for use in async code
+  const shouldHideAdsRef = useRef(shouldHideAds)
+  shouldHideAdsRef.current = shouldHideAds
+
+  // Fire impression and update credits (called when showing an ad)
+  const recordImpressionOnce = (ad: AdResponse): void => {
+    // Don't record impressions when ads should be hidden
+    if (shouldHideAdsRef.current) return
+
+    const ctrl = ctrlRef.current
+    const { impUrl } = ad
+    if (!claimAdImpression(ctrl.impressionsFired, impUrl)) return
+
+    const recordLocalImpression = async (): Promise<void> => {
+      const authToken = getAuthToken()
+      if (!authToken) {
+        logger.warn('[ads] No auth token, skipping local impression recording')
+        return
+      }
+
+      // Include mode in request - Freebuff should not grant credits (no balance concept).
+      const agentMode = useChatStore.getState().agentMode
+      // Measured HERE, at the moment the card is shown, against the receipt
+      // stamp `fetchAd` put on the ad (COD-365). The first-party transport
+      // sends it as a header; the third-party body carries it too.
+      const renderDelayMs = renderDelaySinceReceipt(ad)
+
+      const dispatchedFirstPartyAck = dispatchFirstPartyViewAcknowledgement(
+        ad.provider,
+        {
+          token: impUrl,
+          url: `${WEBSITE_URL}/api/v1/ads/impression`,
+          init: {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: `Bearer ${authToken}`,
+              'User-Agent': getCliAdRequestUserAgent(),
+              ...clientEnvironmentHeaders(),
+            },
+            body: JSON.stringify({
+              impUrl,
+              mode: agentMode,
+              userAgent: getAdUserAgent(),
+              os: getAdDeviceInfo().os,
+            }),
+          },
+          surface: surface ?? 'cli_chat',
+          placementId: ad.placementId ?? slotPlacementId ?? 'unknown',
+          clientFamily: 'cli',
+          ...(renderDelayMs !== undefined ? { renderDelayMs } : {}),
+        },
+        (observation) => {
+          const telemetry = createFirstPartyViewAckTelemetry(observation)
+          if (telemetry) {
+            enqueueClientLog({
+              level: 'info',
+              event: AnalyticsEvent.ADS_FIRST_PARTY_VIEW_ACK,
+              message: 'First-party view acknowledgement',
+              data: telemetry,
+            })
+          }
+        },
+      )
+      if (dispatchedFirstPartyAck) {
+        return
+      }
+
+      // One id per logical event (COD-365). This path has no retry, so one
+      // mint per call is one per event; the header is what the server reads.
+      const clientEventId = crypto.randomUUID()
+      const res = await timedApiCall(() =>
+        fetch(`${WEBSITE_URL}/api/v1/ads/impression`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${authToken}`,
+            'User-Agent': getCliAdRequestUserAgent(),
+            ...clientEnvironmentHeaders(),
+            [FREEBUFF_EVENT_ID_HEADER]: clientEventId,
+          },
+          body: JSON.stringify({
+            impUrl,
+            mode: agentMode,
+            // The same shared ad user agent (getAdUserAgent) and OS this ad was
+            // auctioned with, so the impression the server records for us
+            // matches the auction request.
+            userAgent: getAdUserAgent(),
+            os: getAdDeviceInfo().os,
+            clientEventId,
+            ...(renderDelayMs !== undefined ? { renderDelayMs } : {}),
+          }),
+        }),
+      )
+
+      if (!res.ok) {
+        logger.debug(
+          { status: res.status },
+          '[ads] Failed to record local ad impression',
+        )
+        return
+      }
+
+      const data = await res.json()
+      if (data.creditsGranted > 0) {
+        logger.info(
+          { creditsGranted: data.creditsGranted },
+          '[ads] Ad impression credits granted',
+        )
+        // Also update credits in visible ads
+        setAds((cur) => {
+          if (!cur) return cur
+          return cur.map((a) =>
+            a.impUrl === impUrl ? { ...a, credits: data.creditsGranted } : a,
+          )
+        })
+      }
+    }
+
+    recordLocalImpression().catch((err) => {
+      logger.debug({ err }, '[ads] Failed to record ad impression')
+    })
+  }
+
+  const recordClick = (ad: AdResponse, dock?: DockClickContext): void => {
+    recordAdClick(ad, {
+      ...(surface ? { surface } : {}),
+      ...(dock ? { dock } : {}),
+    })
+  }
+
+  type FetchAdResult = { ads: AdResponse[] } | null
+
+  // Fetch an ad via web API
+  const fetchAd = async (params?: {
+    placementId?: string
+    placementIds?: string[]
+  }): Promise<FetchAdResult> => {
+    // Don't fetch ads when they should be hidden
+    if (shouldHideAdsRef.current) return null
+    if (!getAdsEnabled()) return null
+
+    const request = await buildAdAuctionRequest({
+      provider,
+      ...(surface ? { surface } : {}),
+      ...(params?.placementId ? { placementId: params.placementId } : {}),
+      ...(params?.placementIds?.length
+        ? { placementIds: params.placementIds }
+        : {}),
+      allowSponsoredRoute: true,
+    })
+    if (!request) return null
+
+    try {
+      const response = await timedAdFetch(() =>
+        fetch(request.url, request.init),
+      )
+
+      if (!response.ok) {
+        let responseBody: unknown
+        try {
+          const contentType = response.headers.get('content-type') ?? ''
+          responseBody = contentType.includes('application/json')
+            ? await response.json()
+            : await response.text()
+        } catch {
+          responseBody = 'Unable to parse error response'
+        }
+        logger.warn(
+          { provider, status: response.status, response: responseBody },
+          '[ads] Web API returned error',
+        )
+        return null
+      }
+
+      const data = await response.json()
+
+      if (Array.isArray(data.ads) && data.ads.length > 0) {
+        // Receipt stamp for `renderDelayMs` (COD-365): the response is in
+        // hand, the card is not yet on screen.
+        const receivedAtMs = Date.now()
+        noteAdsServed(data.ads.length, receivedAtMs)
+        return {
+          // Every string an ad network or advertiser wrote is drawn in the
+          // terminal: strip escape sequences and controls here, once, so an
+          // OSC 52 / OSC 8 / CSI in a title or body never reaches the screen.
+          ads: sanitizeTerminalStrings(data.ads as AdResponse[]).map((ad) => ({
+            ...ad,
+            provider: data.provider ?? provider,
+            receivedAtMs,
+          })),
+        }
+      }
+    } catch (err) {
+      // `url` names which of the two ad routes threw. Only Bun's own network
+      // errors carry the request as `path`, so without it a parse failure or
+      // any other throw is unattributable to a host -- and the two routes do
+      // not fail alike (2026-10-14: every connection failure in six hours was
+      // against freebuff.com's `/api/ads`, none against `/api/v1/ads`).
+      logger.error(
+        { err, provider, url: request.url },
+        '[ads] Failed to fetch ad',
+      )
+    }
+
+    return null
+  }
+
+  // Update tick function (uses ref to avoid useCallback dependency issues)
+  tickRef.current = () => {
+    void (async () => {
+      const ctrl = ctrlRef.current
+      if (ctrl.tickInFlight) return
+      ctrl.tickInFlight = true
+
+      try {
+        if (!getAdsEnabled() || slotPausedRef.current) return
+
+        // Derive "can fetch new ads" from counter and activity (no separate paused ref needed)
+        const canFetchNew =
+          ctrl.adsShownSinceActivity < MAX_ADS_AFTER_ACTIVITY &&
+          isUserActive(ACTIVITY_THRESHOLD_MS)
+
+        const result = canFetchNew
+          ? await fetchAd({ placementId: slotPlacementId, placementIds })
+          : null
+
+        if (result) {
+          addToChoiceCache(ctrl, result.ads)
+          ctrl.adsShownSinceActivity += 1
+          setAds(result.ads)
+        } else {
+          // Fall back to cached ads
+          const cachedSet = nextFromChoiceCache(ctrl)
+          if (cachedSet) {
+            ctrl.adsShownSinceActivity += 1
+            setAds(cachedSet)
+          }
+        }
+      } finally {
+        ctrl.tickInFlight = false
+      }
+    })()
+  }
+
+  // Reset ads shown counter on user activity
+  useEffect(() => {
+    if (!getAdsEnabled()) return
+    return subscribeToActivity(() => {
+      ctrlRef.current.adsShownSinceActivity = 0
+    })
+  }, [])
+
+  // Start rotation when user sends first message (or immediately if forced).
+  useEffect(() => {
+    if (!shouldStart || !getAdsEnabled() || shouldHideAds) return
+
+    setIsLoading(true)
+
+    // Fetch first ad immediately, unless the dock already holds the slot.
+    void (async () => {
+      if (slotPausedRef.current) {
+        setIsLoading(false)
+        return
+      }
+      const result = await fetchAd({
+        placementId: slotPlacementId,
+        placementIds,
+      })
+      if (result) {
+        const ctrl = ctrlRef.current
+        addToChoiceCache(ctrl, result.ads)
+        setAds(result.ads)
+        ctrl.adsShownSinceActivity = 1
+      }
+      setIsLoading(false)
+    })()
+
+    // Start interval for rotation (consistent 60s intervals)
+    const id = setInterval(() => tickRef.current(), AD_ROTATION_INTERVAL_MS)
+
+    return () => {
+      clearInterval(id)
+    }
+  }, [shouldStart, shouldHideAds, provider, surface, placementIds?.join(',')])
+
+  // Called by BlocksRenderer only when its streamed node count makes another
+  // between-node slot eligible, until the four-ad pool is full. Requests use
+  // the same placement id and are serialized per answer so higher-value early
+  // results retain their order. The renderer cycles that exact pool for later
+  // slots without additional auctions or impression events.
+  const requestResponseAds = (messageId: string, count: number): void => {
+    if (
+      !inline ||
+      !inlinePlacementId ||
+      count <= 0 ||
+      shouldHideAdsRef.current ||
+      !getAdsEnabled()
+    ) {
+      return
+    }
+
+    const messages = useChatStore.getState().messages
+    const answer = messages.find((m) => m.id === messageId)
+    if (!answer || !isInlineAdEligibleAnswer(answer)) {
+      return
+    }
+
+    const ctrl = ctrlRef.current
+    const previousEligibleCount = ctrl.eligibleSlotCounts.get(messageId) ?? 0
+    if (count > previousEligibleCount) {
+      ctrl.eligibleSlotCounts.set(messageId, count)
+      const telemetryProperties = {
+        response_id: messageId,
+        chat_session_id: useChatStore.getState().chatSessionId,
+        eligible_slot_count: count,
+        pool_size: MAX_RESPONSE_AD_POOL_SIZE,
+        provider,
+        surface,
+        placement_id: inlinePlacementId,
+        is_freebuff: IS_FREEBUFF,
+      }
+      trackInlineAdEvent(
+        AnalyticsEvent.CLI_INLINE_AD_SLOT_ELIGIBLE,
+        telemetryProperties,
+      )
+
+      if (
+        count > MAX_RESPONSE_AD_POOL_SIZE &&
+        previousEligibleCount <= MAX_RESPONSE_AD_POOL_SIZE
+      ) {
+        enqueueClientLog({
+          level: 'info',
+          event: 'cli.inline_ad_pool_reused',
+          message: 'CLI inline-ad pool reused',
+          client_session_id: telemetryProperties.chat_session_id,
+          data: telemetryProperties,
+        })
+      }
+    }
+
+    void requestLazyResponseAds({
+      queue: ctrl.inlineQueue,
+      messageId,
+      count,
+      fetchOne: async () => {
+        const result = await fetchAd({ placementId: inlinePlacementId })
+        return result?.ads[0] ?? null
+      },
+      onAd: (ad) => {
+        setResponseAds((prev) => ({
+          ...prev,
+          [messageId]: [...(prev[messageId] ?? []), ad],
+        }))
+      },
+    })
+  }
+
+  // Don't return ads when ads should be hidden
+  const visible = shouldStart && !shouldHideAds
+  return {
+    ads: visible ? ads : null,
+    responseAds: visibleResponseAds(visible, responseAds),
+    requestResponseAds,
+    isLoading,
+    recordClick,
+    recordImpression: recordImpressionOnce,
+  }
+}
+```
+- File `cli/src/utils/log-shipper.ts` (150 lines):
+```
+import { IS_DEV, IS_TEST, IS_CI } from '@codebuff/common/env'
+import { toJsonSafeLogData } from '@codebuff/common/util/log-data'
+
+import { getApiClient } from './codebuff-api'
+import { getCliEnv } from './env'
+
+import type { LogRecordInput } from '@codebuff/common/schemas/logs'
+
+/**
+ * Client-side shipper that mirrors CLI logs/events into the server's Axiom
+ * logs sink via POST /api/logs. Runs alongside PostHog (it does not replace
+ * it). Fully best-effort: batched, fire-and-forget, never throws, never logs
+ * through the app logger (which would recurse).
+ *
+ * Tuning via env:
+ *  - CODEBUFF_SHIP_LOGS 'true' | 'false'  (default: on outside dev/test)
+ */
+
+const MAX_BATCH = 50
+const FLUSH_INTERVAL_MS = 10_000
+const MAX_BUFFER = 1_000
+
+let buffer: LogRecordInput[] = []
+let timer: ReturnType<typeof setInterval> | null = null
+let naturalExitFlushRegistered = false
+
+export function createClientLogFlusher(deps: {
+  takeBatch: () => LogRecordInput[]
+  hasPending: () => boolean
+  sendBatch: (batch: LogRecordInput[]) => Promise<void>
+}) {
+  let activeFlush: Promise<void> | null = null
+
+  const flush = (): Promise<void> => {
+    if (activeFlush) return activeFlush
+    const batch = deps.takeBatch()
+    if (batch.length === 0) return Promise.resolve()
+
+    activeFlush = deps
+      .sendBatch(batch)
+      .catch(() => {
+        // Best-effort: drop on error rather than risk unbounded growth.
+      })
+      .finally(() => {
+        activeFlush = null
+      })
+    return activeFlush
+  }
+
+  const drain = async (): Promise<void> => {
+    while (activeFlush || deps.hasPending()) {
+      await (activeFlush ?? flush())
+    }
+  }
+
+  return { flush, drain }
+}
+
+const clientLogFlusher = createClientLogFlusher({
+  takeBatch: () => buffer.splice(0, MAX_BATCH),
+  hasPending: () => buffer.length > 0,
+  sendBatch: async (batch) => {
+    const client = getApiClient()
+    // Ship whether or not we're logged in. With a token the server stamps the
+    // authenticated user_id; without one it accepts the batch anonymously
+    // (rate-limited, user_id=null) so pre-auth events like app_launched still
+    // reach Axiom. Records carry client_session_id for correlation. See
+    // /api/logs and docs/logging.md.
+    await client.post(
+      '/api/logs',
+      { records: batch },
+      {
+        includeAuth: Boolean(client.authToken),
+        retry: false,
+        timeoutMs: 5_000,
+      },
+    )
+  },
+})
+
+function enabled(): boolean {
+  const flag = getCliEnv().CODEBUFF_SHIP_LOGS
+  if (flag === 'true') return true
+  if (flag === 'false') return false
+  return !IS_DEV && !IS_TEST && !IS_CI
+}
+
+function ensureTimer(): void {
+  if (timer) return
+  timer = setInterval(() => {
+    void flushClientLogs()
+  }, FLUSH_INTERVAL_MS)
+  ;(timer as { unref?: () => void }).unref?.()
+}
+
+function registerNaturalExitFlush(): void {
+  if (naturalExitFlushRegistered) return
+  naturalExitFlushRegistered = true
+  const onExit = () => {
+    void drainClientLogs()
+  }
+  process.once('beforeExit', onExit)
+}
+
+/**
+ * One record ready for the wire: every `Error` in `data` replaced by its JSON
+ * form.
+ *
+ * `/api/logs` is a second process, so the record goes through a
+ * `JSON.stringify` before the Axiom sink's own serializer ever sees it, and
+ * that hop is where an error's reason is lost: `name`, `message` and `stack`
+ * are non-enumerable, so a thrown `Error` arrives as `{}` and a Bun network
+ * error as bare `{ code, errno, path }`. Unwrapping before the record is
+ * buffered also keeps the buffer's memory bounded by the same cap the sink
+ * uses, instead of holding live error objects (and their stacks) in it.
+ */
+export function toShippableRecord(record: LogRecordInput): LogRecordInput {
+  if (record.data == null) return record
+  try {
+    return { ...record, data: toJsonSafeLogData(record.data) }
+  } catch {
+    // Shipping a summary-less row beats dropping the row.
+    return record
+  }
+}
+
+/** Buffer one record for shipping. Cheap, synchronous, never throws. */
+export function enqueueClientLog(record: LogRecordInput): void {
+  if (!enabled()) return
+  if (buffer.length >= MAX_BUFFER) {
+    buffer.shift()
+  }
+  buffer.push(toShippableRecord(record))
+  ensureTimer()
+  registerNaturalExitFlush()
+  if (buffer.length >= MAX_BATCH) {
+    void flushClientLogs()
+  }
+}
+
+/** Flush one batch to /api/logs. Concurrent callers share the active request. */
+export function flushClientLogs(): Promise<void> {
+  return clientLogFlusher.flush()
+}
+
+/** Wait for any active request, then flush every batch buffered before exit. */
+export async function drainClientLogs(): Promise<void> {
+  await clientLogFlusher.drain()
+}
+```
+- File `common/src/util/log-data.ts` (244 lines):
+```
+import { MAX_LOG_DATA_BYTES } from '../schemas/logs'
+import { redactErrorFieldForLog } from './log-redaction'
+
+import type { LogLevel } from '../types/contracts/logs'
+
+/**
+ * Shared pieces of the Axiom log-row pipeline used by every producer that
+ * ingests rows — the long-lived sink (packages/logging/src/sink.ts) and the
+ * Convex direct-ingest helper (freebuff/web/convex/lib/axiom_log.ts). Living
+ * here keeps the serialized `data` contract and level ordering identical
+ * across producers, so APL queries behave the same regardless of which
+ * service emitted a row. Deliberately light on imports (the schemas module
+ * pulls only zod) so it stays safe for the Convex bundle.
+ */
+
+/** Numeric severity order for LogLevel, used for min-level gating. */
+export const LOG_LEVEL_ORDER: Record<LogLevel, number> = {
+  debug: 10,
+  info: 20,
+  warn: 30,
+  error: 40,
+  fatal: 50,
+}
+
+/** Stack traces cost ingest on every error row; the top frames carry it. */
+const MAX_ERROR_STACK_CHARS = 2_000
+/** An error message or SQL statement longer than this is a payload, not a reason. */
+const MAX_ERROR_MESSAGE_CHARS = 2_000
+const MAX_ERROR_QUERY_CHARS = 500
+
+function safeLength(value: unknown): number {
+  try {
+    return JSON.stringify(value)?.length ?? 0
+  } catch {
+    return Number.POSITIVE_INFINITY
+  }
+}
+
+function clip(text: string, max: number): string {
+  return text.length > max
+    ? `${text.slice(0, max)}… [${text.length - max} chars omitted]`
+    : text
+}
+
+/**
+ * An Error as plain JSON. `name`, `message` and `stack` are non-enumerable, so
+ * `JSON.stringify(error)` is `{}`: every `logger.error({ error }, ...)` whose
+ * error reached this serializer arrived in Axiom with no reason attached (on
+ * 2026-09-27, 119 error/warn rows a day on freebuff-web alone, and the
+ * Imprezia ingest's refusals for nine days). Enumerable fields a library adds
+ * (`code`, `status`, a driver's `query`) are kept, and `cause` is walked by the
+ * same replacer.
+ */
+function errorToJson(error: Error): Record<string, unknown> {
+  const fields: Record<string, unknown> = { ...error }
+  // A drizzle `DrizzleQueryError` carries the whole statement as `query`, every
+  // bound value as `params`, and both again in `message`. For a bulk insert
+  // that is hundreds of KB: the ad-revenue rollup's 2026-10-02 failure logged
+  // 522 KB, the row was cut at MAX_LOG_DATA_BYTES, and the `cause` holding the
+  // Postgres reason came after the cut, so it never reached Axiom. Keep the
+  // head of the statement, replace a long param list with its count, and keep
+  // the cause.
+  if (typeof fields.query === 'string') {
+    fields.query = clip(fields.query, MAX_ERROR_QUERY_CHARS)
+  }
+  if (
+    Array.isArray(fields.params) &&
+    safeLength(fields.params) > MAX_ERROR_QUERY_CHARS
+  ) {
+    fields.params = `[${fields.params.length} params omitted]`
+  }
+  // An AI SDK `APICallError` carries the whole LLM request (every message),
+  // both header sets and the URL, and Bun's fetch errors the URL as `path`:
+  // keep their shape, never the prompt or a key. The same function redacts
+  // `getErrorObject`'s raw dump, so the two paths cannot drift apart.
+  for (const key of Object.keys(fields)) {
+    fields[key] = redactErrorFieldForLog(key, fields[key])
+  }
+  return {
+    ...fields,
+    name: error.name,
+    message: clip(error.message, MAX_ERROR_MESSAGE_CHARS),
+    ...(error.stack
+      ? { stack: error.stack.slice(0, MAX_ERROR_STACK_CHARS) }
+      : {}),
+    ...(error.cause !== undefined ? { cause: error.cause } : {}),
+  }
+}
+
+/** Stringify a log payload, tolerating circular refs and unwrapping Errors. */
+export function stringifyLogData(data: unknown): string | undefined {
+  try {
+    const seen = new WeakSet()
+    return JSON.stringify(data, (_k, v) => {
+      if (typeof v === 'object' && v !== null) {
+        if (seen.has(v)) return '[Circular]'
+        seen.add(v)
+        if (v instanceof Error) return errorToJson(v)
+      }
+      return v
+    })
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Fit an oversized log payload inside MAX_LOG_DATA_BYTES **without losing the
+ * fields that identify it.**
+ *
+ * The whole payload used to be replaced by one `preview` string, so a single
+ * oversized field took every small field beside it down with it. Measured on
+ * 2026-10-14 against one hour of production: **171 of 281 `Agent execution
+ * failed` rows (61%, 149 distinct users) carried no queryable `error`,
+ * `agentType`, `agentId` or `runId`** — the CLI's failure line logs
+ * `messageHistory` and `systemPrompt`, which alone run past the cap (121 KB in
+ * the sampled row), so every row of the busiest error line in the dataset was
+ * unattributable. `errorToJson`'s comment above records the same accident
+ * happening to a drizzle `cause` on 2026-10-02 and fixes it for that one
+ * shape; this fixes it for every shape.
+ *
+ * Keeps fields smallest-first until the budget is spent, so the scalars that
+ * identify a row (ids, counts, status codes) survive by construction and only
+ * the payloads are dropped. `_omitted` names each dropped field and its size,
+ * because "this row had no error" and "this row's error did not fit" are
+ * different facts and the old shape could not tell them apart. The byte cap is
+ * unchanged, so ingest cost is unchanged.
+ */
+function fitLogDataToCap(data: unknown, originalBytes: number): string {
+  const wholePayloadPreview = (serialized: string) =>
+    JSON.stringify({
+      _truncated: true,
+      original_bytes: originalBytes,
+      preview: serialized.slice(0, MAX_LOG_DATA_BYTES),
+    })
+
+  if (!data || typeof data !== 'object' || Array.isArray(data)) {
+    return wholePayloadPreview(stringifyLogData(data) ?? '')
+  }
+
+  const sized: { key: string; value: unknown; bytes: number }[] = []
+  for (const [key, value] of Object.entries(data)) {
+    if (value === undefined) continue
+    const serialized = stringifyLogData(value)
+    if (serialized === undefined) continue
+    // `"key":` plus a separator, so the budget counts what the row will cost.
+    sized.push({ key, value, bytes: serialized.length + key.length + 4 })
+  }
+  sized.sort((a, b) => a.bytes - b.bytes)
+
+  const kept: Record<string, unknown> = {}
+  const omitted: Record<string, number> = {}
+  // Headroom for the `_truncated` / `original_bytes` / `_omitted` markers.
+  let budget = MAX_LOG_DATA_BYTES - 256
+  for (const field of sized) {
+    if (field.bytes <= budget) {
+      kept[field.key] = field.value
+      budget -= field.bytes
+    } else {
+      omitted[field.key] = field.bytes
+      // A dropped field still costs its name in `_omitted`.
+      budget -= field.key.length + 12
+    }
+  }
+
+  // Nothing fit: fall back to a preview, so a single enormous field still
+  // leaves a readable head rather than only its byte count.
+  if (Object.keys(kept).length === 0) {
+    return wholePayloadPreview(stringifyLogData(data) ?? '')
+  }
+
+  const fitted = stringifyLogData({
+    ...kept,
+    _truncated: true,
+    original_bytes: originalBytes,
+    _omitted: omitted,
+  })
+  // The budget arithmetic should make this unreachable; a payload whose
+  // serialization grew anyway falls back rather than breaking the cap.
+  if (fitted === undefined || fitted.length > MAX_LOG_DATA_BYTES) {
+    return wholePayloadPreview(stringifyLogData(data) ?? '')
+  }
+  return fitted
+}
+
+/**
+ * Serialize a log payload to a single string field, tolerating circular refs
+ * and capping size. The cap applies to ALL sources so a large `data` payload
+ * can't inflate Axiom ingest cost. The truncated form is still valid JSON so
+ * query scripts can `parse_json(data)`.
+ *
+ * An oversized object keeps the fields that fit (see {@link fitLogDataToCap});
+ * only an oversized string or array collapses to a `preview`.
+ */
+export function serializeLogData(data: unknown): string | null {
+  if (data == null) return null
+  let serialized: string
+  if (typeof data === 'string') {
+    serialized = data
+  } else {
+    const stringified = stringifyLogData(data)
+    if (stringified === undefined) return null
+    serialized = stringified
+  }
+  if (serialized.length > MAX_LOG_DATA_BYTES) {
+    return typeof data === 'string'
+      ? JSON.stringify({
+          _truncated: true,
+          original_bytes: serialized.length,
+          preview: serialized.slice(0, MAX_LOG_DATA_BYTES),
+        })
+      : fitLogDataToCap(data, serialized.length)
+  }
+  return serialized
+}
+
+/**
+ * The same payload with every `Error` replaced by its JSON form, as plain
+ * JSON values rather than a string.
+ *
+ * For producers that hand their payload to ANOTHER process before it reaches
+ * {@link serializeLogData}: the CLI POSTs each log row to `/api/logs`, and
+ * that hop's `JSON.stringify` drops `name`, `message` and `stack` (they are
+ * non-enumerable), so the sink on the far side receives an error that has
+ * already lost its reason and cannot restore it. Measured on 2026-10-14, one
+ * hour of production CLI rows for `[ads] Failed to fetch ad`: 49 of 205
+ * carried `err: {}` — nothing at all — and the other 156 carried only Bun's
+ * enumerable `code`/`errno`/`path`, never the message.
+ *
+ * Unwrapping here also applies the redaction in `redactErrorFieldForLog` on
+ * the client, so a URL, header set or request body hanging off an error is
+ * trimmed before it leaves the machine instead of after.
+ */
+export function toJsonSafeLogData(data: unknown): unknown {
+  if (data == null || typeof data !== 'object') return data
+  const serialized = stringifyLogData(data)
+  if (serialized === undefined) return data
+  try {
+    return JSON.parse(serialized)
+  } catch {
+    return data
+  }
+}
+```
+Where the symbols this change introduces are used elsewhere, at this same revision (the code that reads them; this is evidence for the WHAT and the WHY, and it is the only source for who consumes this change):
+- File `common/src/util/__tests__/log-data.test.ts` (9 matching lines):
+```
+import { describe, expect, test } from 'bun:test'
+
+import { serializeLogData, toJsonSafeLogData } from '../log-data'
+
+const parse = (data: unknown) => JSON.parse(serializeLogData(data)!)
+
+describe('serializeLogData', () => {
+  // JSON.stringify(new Error('x')) is '{}': the reason never reached Axiom.
+  test('an error keeps its name and message', () => {
+    const row = parse({ error: new TypeError('fetch failed') })
+    expect(row.error.name).toBe('TypeError')
+    expect(row.error.message).toBe('fetch failed')
+    expect(typeof row.error.stack).toBe('string')
+  })
+…
+})
+
+  test('an oversized string or array still collapses to a preview', () => {
+    const fromString = JSON.parse(serializeLogData('x'.repeat(100_000))!)
+    expect(fromString._truncated).toBe(true)
+    expect(typeof fromString.preview).toBe('string')
+    const fromArray = parse(Array.from({ length: 20_000 }, (_, i) => i))
+    expect(fromArray._truncated).toBe(true)
+    expect(typeof fromArray.preview).toBe('string')
+  })
+})
+
+describe('toJsonSafeLogData', () => {
+  // The CLI ships this payload to `/api/logs`, so it is stringified once
+  // before the sink's serializer ever runs. Measured 2026-10-14: 49 of 205
+  // `[ads] Failed to fetch ad` rows in one hour arrived as `err: {}`.
+  test('an error survives a JSON round trip to another process', () => {
+    const wire = JSON.parse(
+      JSON.stringify(toJsonSafeLogData({ err: new TypeError('fetch failed') })),
+    )
+    expect(wire.err.name).toBe('TypeError')
+    expect(wire.err.message).toBe('fetch failed')
+  })
+
+  // Bun's fetch errors: `code`/`errno`/`path` are enumerable and already
+  // reached Axiom, the reason did not.
+  test('a bun network error keeps its code and gains its message', () => {
+    const err = Object.assign(
+      new Error('Unable to connect. Is the computer able to access the url?'),
+      { code: 'ECONNRESET', errno: 0, path: 'https://freebuff.com/api/ads' },
+    )
+    const wire = JSON.parse(JSON.stringify(toJsonSafeLogData({ err })))
+    expect(wire.err.code).toBe('ECONNRESET')
+    expect(wire.err.path).toBe('https://freebuff.com/api/ads')
+    expect(wire.err.message).toContain('Unable to connect')
+  })
+
+  test('redacts on the client, before the payload leaves the machine', () => {
+    const err = Object.assign(new Error('refused'), {
+      url: 'https://freebuff.com/api/ads?auth_code=secret',
+      headers: { authorization: 'Bearer abc' },
+```
+- File `cli/src/utils/__tests__/log-shipper.test.ts` (5 matching lines):
+```
+import { describe, expect, test } from 'bun:test'
+
+import { ensureCliTestEnv } from '../../__tests__/test-utils'
+
+import type { LogRecordInput } from '@codebuff/common/schemas/logs'
+
+ensureCliTestEnv()
+
+const { createClientLogFlusher, toShippableRecord } =
+  await import('../log-shipper')
+
+describe('client log draining', () => {
+  test('waits for an active request and drains every buffered batch', async () => {
+    let releaseFirstRequest: (() => void) | undefined
+    let markFirstRequestStarted: (() => void) | undefined
+    const firstRequestStarted = new Promise<void>((resolve) => {
+      markFirstRequestStarted = resolve
+    })
+    const firstRequestGate = new Promise<void>((resolve) => {
+      releaseFirstRequest = resolve
+    })
+…
+releaseFirstRequest?.()
+    await drainPromise
+
+    expect(batchSizes).toEqual([50, 50, 1])
+  })
+})
+
+describe('shipping an error', () => {
+  // `/api/logs` is another process: the record is stringified on the way out,
+  // and `name`/`message`/`stack` are non-enumerable, so an error buffered as
+  // itself arrives with no reason attached.
+  test('keeps the reason across the hop to /api/logs', () => {
+    const record = toShippableRecord({
+      level: 'error',
+      message: '[ads] Failed to fetch ad',
+      data: {
+        provider: 'gravity',
+        err: Object.assign(new Error('Unable to connect.'), {
+          code: 'ECONNRESET',
+          path: 'https://freebuff.com/api/ads',
+        }),
+      },
+    })
+
+    const wire = JSON.parse(JSON.stringify(record)) as {
+      data: { err: Record<string, unknown> }
+    }
+    expect(wire.data.err.message).toBe('Unable to connect.')
+    expect(wire.data.err.name).toBe('Error')
+    expect(wire.data.err.code).toBe('ECONNRESET')
+    expect(wire.data.err.path).toBe('https://freebuff.com/api/ads')
+  })
+
+  test('leaves a record without a payload alone', () => {
+    const record = { level: 'info' as const, message: 'app_launched' }
+    expect(toShippableRecord(record)).toBe(record)
+  })
+})
+```
+- File `common/src/util/__tests__/error-api-details.test.ts` (3 matching lines):
+```
+it('detects the Bun socket-close message', () => {
+    expect(
+      isTransientNetworkError(
+        new Error(
+          'The socket connection was closed unexpectedly. For more information, pass `verbose: true` in the second argument to fetch()',
+        ),
+      ),
+    ).toBe(true)
+  })
+
+  it('detects transient network error codes', () => {
+    const error = new Error('request failed') as Error & { code: string }
+    error.code = 'ECONNRESET'
+    expect(isTransientNetworkError(error)).toBe(true)
+
+    const bunError = new Error('request failed') as Error & { code: string }
+    bunError.code = 'ConnectionClosed'
+    expect(isTransientNetworkError(bunError)).toBe(true)
+  })
+
+  it("detects Bun's error for a compressed body cut mid-stream", () => {
+    // The exact shapes Bun 1.3.14's fetch throws (see the sdk test
+    // compressed-stream-cut.test.ts for the live reproduction).
+    for (const code of ['ZlibError', 'BrotliDecompressionError']) {
+      const error = Object.assign(
+…
+expect(isTransientNetworkError(error)).toBe(true)
+    }
+  })
+
+  it('detects the undici "fetch failed" TypeError', () => {
+    expect(isTransientNetworkError(new TypeError('fetch failed'))).toBe(true)
+  })
+
+  it('detects a socket error nested inside an AI SDK RetryError wrapper', () => {
+    const socketError = new Error(
+      'The socket connection was closed unexpectedly. For more information, pass `verbose: true` in the second argument to fetch()',
+    ) as Error & { code: string }
+    socketError.code = 'ECONNRESET'
+    const retryError = new Error('Failed after 3 attempts.') as Error & {
+      errors: unknown[]
+    }
+    retryError.errors = [socketError]
+    expect(isTransientNetworkError(retryError)).toBe(true)
+  })
+
+  it('detects a socket error in a cause chain', () => {
+    const inner = new Error('read ECONNRESET') as Error & { code: string }
+    inner.code = 'ECONNRESET'
+    const outer = new Error('Cannot connect to API')
+    ;(outer as Error & { cause: unknown }).cause = inner
+    expect(isTransientNetworkError(outer)).toBe(true)
+  })
+
+  it("detects undici's body-read failure on a closed socket", () => {
+    // The exact shape Node's fetch throws when the peer closes the socket
+    // mid-body (reproduced against node:http + socket.destroy()).
+    const socketError = Object.assign(new Error('other side closed'), {
+      name: 'SocketError',
+      code: 'UND_ERR_SOCKET',
+    })
+```
+- File `common/src/util/error.ts` (3 matching lines):
+```
+* start produced exactly this error with nothing wrong on the user's end, and
+ * sent them chasing their own VPN. See grace-flush.ts on the server.
+ */
+export const FETCH_IDLE_TIMEOUT_USER_MESSAGE =
+  'Connection timed out: no data was received from the server for 5 minutes, so the request was aborted.\n\n' +
+  'This can be a slow model start on our side, or a connection dropped in transit (VPN, proxy, firewall, or flaky network).\n\n' +
+  'Retrying your message usually works. If it keeps happening, try a different model, or check your network/VPN/proxy.'
+
+/**
+ * Substrings of error messages that indicate the TCP connection died in
+ * transit (as opposed to the server returning an error response). Bun's fetch
+ * throws a plain Error with "The socket connection was closed unexpectedly..."
+ * and code ECONNRESET/ConnectionClosed; undici throws TypeError "fetch failed".
+ */
+const TRANSIENT_NETWORK_ERROR_MESSAGE_PATTERNS = [
+  'socket connection was closed unexpectedly',
+  'fetch failed',
+  'failed to fetch',
+  'network connection was lost',
+]
+
+const TRANSIENT_NETWORK_ERROR_CODES = new Set([
+  'ECONNRESET',
+  'ECONNREFUSED',
+  'EPIPE',
+  'ETIMEDOUT',
+  // Bun-specific fetch error codes
+  'ConnectionClosed',
+  'ConnectionRefused',
+  'FailedToOpenSocket',
+  // Bun's fetch, when a compressed body ends before its compressed stream
+  // does: the same cut connection as above, on a gzip/br response (the
+  // chat-completions SSE body is gzipped, COD-764). Reproduced on Bun 1.3.14:
+  // a gzip SSE body whose HTTP framing ends cleanly mid-stream throws
+  // "ZlibError fetching <url>", code ZlibError; br gives
+…
+(key, raw) => {
+        const val = redact ? redact(key, raw) : raw
+        if (typeof val === 'object' && val !== null) {
+          if (seen.has(val)) return '[Circular]'
+          seen.add(val)
+        }
+        return val
+      },
+      2,
+    )
+    return str?.slice(0, maxLength)
+  } catch {
+    return '[Unable to stringify]'
+  }
+}
+
+export function getErrorObject(
+  error: unknown,
+  options: { includeRawError?: boolean } = {},
+): ErrorObject {
+  if (error instanceof Error) {
+    const extError = error as Error & Partial<ExtendedErrorProperties>
+
+    // Extract responseBody - could be string or object
+    let responseBody: string | undefined
+```
+- File `packages/agent-runtime/src/__tests__/loop-agent-steps.test.ts` (2 matching lines):
+```
+it('should explain dropped socket connections instead of showing the raw runtime message', async () => {
+      const llmOnlyTemplate = {
+        ...mockTemplate,
+        handleSteps: undefined,
+      }
+
+      const localAgentTemplates = {
+        'test-agent': llmOnlyTemplate,
+      }
+
+      // Bun's fetch throws a plain Error with this message (and code
+      // ECONNRESET/ConnectionClosed) when the TCP connection is dropped.
+      loopAgentStepsBaseParams.promptAiSdkStream = async function* () {
+        const socketError = new Error(
+          'The socket connection was closed unexpectedly. For more information, pass `verbose: true` in the second argument to fetch()',
+        ) as Error & { code: string }
+        socketError.code = 'ECONNRESET'
+        throw socketError
+      }
+
+      const result = await loopAgentSteps({
+        ...loopAgentStepsBaseParams,
+        agentType: 'test-agent',
+        localAgentTemplates,
+      })
+
+      expect(result.output.type).toBe('error')
+      if (result.output.type === 'error') {
+        expect(result.output.message).toContain('Connection interrupted')
+```
+- File `sdk/src/__tests__/stream-interruption.test.ts` (2 matching lines):
+```
+})
+    const recovery = classifyThrownStreamRecovery({ aborted: false, error })
+    expect(recovery?.message).toContain('connection-level error')
+    expect(recovery?.detail).toContain('connection-level error')
+    expect(JSON.stringify(recovery)).not.toContain('secret-key')
+    expect(JSON.stringify(recovery)).not.toContain('private.example')
+  })
+
+  it('classifies Bun socket-close exceptions as interrupted streams', () => {
+    const error = new Error(
+      'The socket connection was closed unexpectedly. For more information, pass `verbose: true` in the second argument to fetch()',
+    ) as Error & { code: string }
+    error.code = 'ECONNRESET'
+
+    expect(
+      classifyThrownStreamRecovery({ aborted: false, error })?.source,
+    ).toBe('stream-interrupted')
+  })
+
+  it('walks wrapped transport errors', () => {
+    const cause = Object.assign(new Error('read failed'), {
+      code: 'ConnectionClosed',
+    })
+    const error = new Error('Failed after 4 attempts', { cause })
+
+    expect(
+      classifyThrownStreamRecovery({ aborted: false, error })?.source,
+    ).toBe('stream-interrupted')
+  })
+
+  it('does not recover cancellation or unrelated exceptions', () => {
+    const networkError = Object.assign(new Error('read ECONNRESET'), {
+      code: 'ECONNRESET',
+    })
+    expect(
+      classifyThrownStreamRecovery({ aborted: true, error: networkError }),
+    ).toBeNull()
+    expect(
+      classifyThrownStreamRecovery({
+        aborted: false,
+        error: new TypeError('Headers must be an object'),
+      }),
+    ).toBeNull()
+  })
+```
+Tests this commit changed (added lines only; the assertions are what the change is expected to do, not a description of the feature):
+- File `cli/src/utils/__tests__/log-shipper.test.ts`: "shipping an error"; "keeps the reason across the hop to /api/logs"; "leaves a record without a payload alone"
+```
+const { createClientLogFlusher, toShippableRecord } =
+  await import('../log-shipper')
+describe('shipping an error', () => {
+  // `/api/logs` is another process: the record is stringified on the way out,
+  // and `name`/`message`/`stack` are non-enumerable, so an error buffered as
+  // itself arrives with no reason attached.
+  test('keeps the reason across the hop to /api/logs', () => {
+    const record = toShippableRecord({
+      level: 'error',
+      message: '[ads] Failed to fetch ad',
+      data: {
+        provider: 'gravity',
+        err: Object.assign(new Error('Unable to connect.'), {
+          code: 'ECONNRESET',
+          path: 'https://freebuff.com/api/ads',
+        }),
+      },
+    })
+    const wire = JSON.parse(JSON.stringify(record)) as {
+      data: { err: Record<string, unknown> }
+    }
+    expect(wire.data.err.message).toBe('Unable to connect.')
+    expect(wire.data.err.name).toBe('Error')
+    expect(wire.data.err.code).toBe('ECONNRESET')
+    expect(wire.data.err.path).toBe('https://freebuff.com/api/ads')
+  })
+  test('leaves a record without a payload alone', () => {
+    const record = { level: 'info' as const, message: 'app_launched' }
+    expect(toShippableRecord(record)).toBe(record)
+  })
+})
+```
+- File `common/src/util/__tests__/log-data.test.ts`: "toJsonSafeLogData"; "an error survives a JSON round trip to another process"; "a bun network error keeps its code and gains its message"; "redacts on the client, before the payload leaves the machine"; "tolerates a circular payload and passes scalars through"
+```
+import { serializeLogData, toJsonSafeLogData } from '../log-data'
+describe('toJsonSafeLogData', () => {
+  // The CLI ships this payload to `/api/logs`, so it is stringified once
+  // before the sink's serializer ever runs. Measured 2026-10-14: 49 of 205
+  // `[ads] Failed to fetch ad` rows in one hour arrived as `err: {}`.
+  test('an error survives a JSON round trip to another process', () => {
+    const wire = JSON.parse(
+      JSON.stringify(toJsonSafeLogData({ err: new TypeError('fetch failed') })),
+    )
+    expect(wire.err.name).toBe('TypeError')
+    expect(wire.err.message).toBe('fetch failed')
+  })
+  // Bun's fetch errors: `code`/`errno`/`path` are enumerable and already
+  // reached Axiom, the reason did not.
+  test('a bun network error keeps its code and gains its message', () => {
+    const err = Object.assign(
+      new Error('Unable to connect. Is the computer able to access the url?'),
+      { code: 'ECONNRESET', errno: 0, path: 'https://freebuff.com/api/ads' },
+    )
+    const wire = JSON.parse(JSON.stringify(toJsonSafeLogData({ err })))
+    expect(wire.err.code).toBe('ECONNRESET')
+    expect(wire.err.path).toBe('https://freebuff.com/api/ads')
+    expect(wire.err.message).toContain('Unable to connect')
+  })
+  test('redacts on the client, before the payload leaves the machine', () => {
+    const err = Object.assign(new Error('refused'), {
+      url: 'https://freebuff.com/api/ads?auth_code=secret',
+      headers: { authorization: 'Bearer abc' },
+    })
+    const wire = JSON.parse(JSON.stringify(toJsonSafeLogData({ err })))
+    expect(wire.err.url).toBe('https://freebuff.com/api/ads')
+    expect(wire.err.headers.authorization).toBe('[redacted]')
+  })
+  test('tolerates a circular payload and passes scalars through', () => {
+    const data: Record<string, unknown> = { a: 1 }
+    data.self = data
+    expect(toJsonSafeLogData(data)).toEqual({ a: 1, self: '[Circular]' })
+    expect(toJsonSafeLogData('plain')).toBe('plain')
+    expect(toJsonSafeLogData(undefine
+```
+Diff (source hunks; lockfiles and pure test hunks omitted, except in a lockfile-only commit):
+```diff
+diff --git a/cli/src/hooks/use-gravity-ad.ts b/cli/src/hooks/use-gravity-ad.ts
+index b71551dcc..3cbef7b51 100644
+--- a/cli/src/hooks/use-gravity-ad.ts
++++ b/cli/src/hooks/use-gravity-ad.ts
+@@ -616,51 +616,59 @@ export const useGravityAd = (options?: GravityAdOptions): GravityAdState => {
+           { provider, status: response.status, response: responseBody },
+           '[ads] Web API returned error',
+         )
+         return null
+       }
+ 
+       const data = await response.json()
+ 
+       if (Array.isArray(data.ads) && data.ads.length > 0) {
+         // Receipt stamp for `renderDelayMs` (COD-365): the response is in
+         // hand, the card is not yet on screen.
+         const receivedAtMs = Date.now()
+         noteAdsServed(data.ads.length, receivedAtMs)
+         return {
+           // Every string an ad network or advertiser wrote is drawn in the
+           // terminal: strip escape sequences and controls here, once, so an
+           // OSC 52 / OSC 8 / CSI in a title or body never reaches the screen.
+           ads: sanitizeTerminalStrings(data.ads as AdResponse[]).map((ad) => ({
+             ...ad,
+             provider: data.provider ?? provider,
+             receivedAtMs,
+           })),
+         }
+       }
+     } catch (err) {
+-      logger.error({ err, provider }, '[ads] Failed to fetch ad')
++      // `url` names which of the two ad routes threw. Only Bun's own network
++      // errors carry the request as `path`, so without it a parse failure or
++      // any other throw is unattributable to a host -- and the two routes do
++      // not fail alike (2026-10-14: every connection failure in six hours was
++      // against freebuff.com's `/api/ads`, none against `/api/v1/ads`).
++      logger.error(
++        { err, provider, url: request.url },
++        '[ads] Failed to fetch ad',
++      )
+     }
+ 
+     return null
+   }
+ 
+   // Update tick function (uses ref to avoid useCallback dependency issues)
+   tickRef.current = () => {
+     void (async () => {
+       const ctrl = ctrlRef.current
+       if (ctrl.tickInFlight) return
+       ctrl.tickInFlight = true
+ 
+       try {
+         if (!getAdsEnabled() || slotPausedRef.current) return
+ 
+         // Derive "can fetch new ads" from counter and activity (no separate paused ref needed)
+         const canFetchNew =
+           ctrl.adsShownSinceActivity < MAX_ADS_AFTER_ACTIVITY &&
+           isUserActive(ACTIVITY_THRESHOLD_MS)
+ 
+         const result = canFetchNew
+           ? await fetchAd({ placementId: slotPlacementId, placementIds })
+           : null
+ 
+         if (result) {
+diff --git a/cli/src/utils/log-shipper.ts b/cli/src/utils/log-shipper.ts
+index 678bc2172..b67ee1074 100644
+--- a/cli/src/utils/log-shipper.ts
++++ b/cli/src/utils/log-shipper.ts
+@@ -1,26 +1,27 @@
+ import { IS_DEV, IS_TEST, IS_CI } from '@codebuff/common/env'
++import { toJsonSafeLogData } from '@codebuff/common/util/log-data'
+ 
+ import { getApiClient } from './codebuff-api'
+ import { getCliEnv } from './env'
+ 
+ import type { LogRecordInput } from '@codebuff/common/schemas/logs'
+ 
+ /**
+  * Client-side shipper that mirrors CLI logs/events into the server's Axiom
+  * logs sink via POST /api/logs. Runs alongside PostHog (it does not replace
+  * it). Fully best-effort: batched, fire-and-forget, never throws, never logs
+  * through the app logger (which would recurse).
+  *
+  * Tuning via env:
+  *  - CODEBUFF_SHIP_LOGS 'true' | 'false'  (default: on outside dev/test)
+  */
+ 
+ const MAX_BATCH = 50
+ const FLUSH_INTERVAL_MS = 10_000
+ const MAX_BUFFER = 1_000
+ 
+ let buffer: LogRecordInput[] = []
+ let timer: ReturnType<typeof setInterval> | null = null
+ let naturalExitFlushRegistered = false
+ 
+ export function createClientLogFlusher(deps: {
+@@ -79,48 +80,70 @@ const clientLogFlusher = createClientLogFlusher({
+ 
+ function enabled(): boolean {
+   const flag = getCliEnv().CODEBUFF_SHIP_LOGS
+   if (flag === 'true') return true
+   if (flag === 'false') return false
+   return !IS_DEV && !IS_TEST && !IS_CI
+ }
+ 
+ function ensureTimer(): void {
+   if (timer) return
+   timer = setInterval(() => {
+     void flushClientLogs()
+   }, FLUSH_INTERVAL_MS)
+   ;(timer as { unref?: () => void }).unref?.()
+ }
+ 
+ function registerNaturalExitFlush(): void {
+   if (naturalExitFlushRegistered) return
+   naturalExitFlushRegistered = true
+   const onExit = () => {
+     void drainClientLogs()
+   }
+   process.once('beforeExit', onExit)
+ }
+ 
++/**
++ * One record ready for the wire: every `Error` in `data` replaced by its JSON
++ * form.
++ *
++ * `/api/logs` is a second process, so the record goes through a
++ * `JSON.stringify` before the Axiom sink's own serializer ever sees it, and
++ * that hop is where an error's reason is lost: `name`, `message` and `stack`
++ * are non-enumerable, so a thrown `Error` arrives as `{}` and a Bun network
++ * error as bare `{ code, errno, path }`. Unwrapping before the record is
++ * buffered also keeps the buffer's memory bounded by the same cap the sink
++ * uses, instead of holding live error objects (and their stacks) in it.
++ */
++export function toShippableRecord(record: LogRecordInput): LogRecordInput {
++  if (record.data == null) return record
++  try {
++    return { ...record, data: toJsonSafeLogData(record.data) }
++  } catch {
++    // Shipping a summary-less row beats dropping the row.
++    return record
++  }
++}
++
+ /** Buffer one record for shipping. Cheap, synchronous, never throws. */
+ export function enqueueClientLog(record: LogRecordInput): void {
+   if (!enabled()) return
+   if (buffer.length >= MAX_BUFFER) {
+     buffer.shift()
+   }
+-  buffer.push(record)
++  buffer.push(toShippableRecord(record))
+   ensureTimer()
+   registerNaturalExitFlush()
+   if (buffer.length >= MAX_BATCH) {
+     void flushClientLogs()
+   }
+ }
+ 
+ /** Flush one batch to /api/logs. Concurrent callers share the active request. */
+ export function flushClientLogs(): Promise<void> {
+   return clientLogFlusher.flush()
+ }
+ 
+ /** Wait for any active request, then flush every batch buffered before exit. */
+ export async function drainClientLogs(): Promise<void> {
+   await clientLogFlusher.drain()
+ }
+diff --git a/common/src/util/log-data.ts b/common/src/util/log-data.ts
+index 75186ace9..059381b10 100644
+--- a/common/src/util/log-data.ts
++++ b/common/src/util/log-data.ts
+@@ -191,25 +191,53 @@ function fitLogDataToCap(data: unknown, originalBytes: number): string {
+  *
+  * An oversized object keeps the fields that fit (see {@link fitLogDataToCap});
+  * only an oversized string or array collapses to a `preview`.
+  */
+ export function serializeLogData(data: unknown): string | null {
+   if (data == null) return null
+   let serialized: string
+   if (typeof data === 'string') {
+     serialized = data
+   } else {
+     const stringified = stringifyLogData(data)
+     if (stringified === undefined) return null
+     serialized = stringified
+   }
+   if (serialized.length > MAX_LOG_DATA_BYTES) {
+     return typeof data === 'string'
+       ? JSON.stringify({
+           _truncated: true,
+           original_bytes: serialized.length,
+           preview: serialized.slice(0, MAX_LOG_DATA_BYTES),
+         })
+       : fitLogDataToCap(data, serialized.length)
+   }
+   return serialized
+ }
++
++/**
++ * The same payload with every `Error` replaced by its JSON form, as plain
++ * JSON values rather than a string.
++ *
++ * For producers that hand their payload to ANOTHER process before it reaches
++ * {@link serializeLogData}: the CLI POSTs each log row to `/api/logs`, and
++ * that hop's `JSON.stringify` drops `name`, `message` and `stack` (they are
++ * non-enumerable), so the sink on the far side receives an error that has
++ * already lost its reason and cannot restore it. Measured on 2026-10-14, one
++ * hour of production CLI rows for `[ads] Failed to fetch ad`: 49 of 205
++ * carried `err: {}` — nothing at all — and the other 156 carried only Bun's
++ * enumerable `code`/`errno`/`path`, never the message.
++ *
++ * Unwrapping here also applies the redaction in `redactErrorFieldForLog` on
++ * the client, so a URL, header set or request body hanging off an error is
++ * trimmed before it leaves the machine instead of after.
++ */
++export function toJsonSafeLogData(data: unknown): unknown {
++  if (data == null || typeof data !== 'object') return data
++  const serialized = stringifyLogData(data)
++  if (serialized === undefined) return data
++  try {
++    return JSON.parse(serialized)
++  } catch {
++    return data
++  }
++}
+
+```
