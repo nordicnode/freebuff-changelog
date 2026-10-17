@@ -1,0 +1,1671 @@
+diff --git a/sdk/README.md b/sdk/README.md
+index e9a26e214f..9842e8ab78 100644
+--- a/sdk/README.md
++++ b/sdk/README.md
+@@ -134,6 +134,22 @@ async function main() {
+ main()
+ ```
+ 
++### Execution permissions
++
++`client.run()` accepts `noShell`, `askShell`, `projectOnly`, and `readOnly` to
++enforce tool restrictions in the SDK runtime. `noShell` disables shell commands;
++`askShell` requires a host-provided approval callback and denies commands when
++that callback is absent. `readOnly` denies writes, and `projectOnly` confines
++filesystem access to the project directory.
++
++The SDK does not yet apply an operating-system sandbox to shell commands.
++Because an unrestricted shell can write outside the SDK filesystem adapter or
++access paths outside the project, both `readOnly` and `projectOnly` also disable
++shell commands. This means commands such as `git status`, `git diff`, `ls`, and
++`cat` are unavailable in those modes. External MCP, custom, and host-provided
++tools are denied while any restriction is active unless the host explicitly
++sets `allowExternalTools: true`.
++
+ ## API Reference
+ 
+ ### Knowledge Files
+diff --git a/sdk/src/__tests__/run-file-filter.test.ts b/sdk/src/__tests__/run-file-filter.test.ts
+index 99385b7ad9..e613166137 100644
+--- a/sdk/src/__tests__/run-file-filter.test.ts
++++ b/sdk/src/__tests__/run-file-filter.test.ts
+@@ -204,6 +204,82 @@ describe('CodebuffClientOptions fileFilter', () => {
+     expect(optionalFileResult.current).toBe('contents:.ENV')
+   })
+ 
++  it('requires external trust before either direct read_files override path', async () => {
++    spyOn(databaseModule, 'getUserInfoFromApiKey').mockResolvedValue({
++      id: 'user-123',
++      email: 'test@example.com',
++      discord_id: null,
++      stripe_customer_id: null,
++      banned: false,
++      created_at: new Date('2024-01-01T00:00:00Z'),
++    })
++    spyOn(databaseModule, 'fetchAgentFromDatabase').mockResolvedValue(null)
++    spyOn(databaseModule, 'startAgentRun').mockResolvedValue('run-1')
++    spyOn(databaseModule, 'finishAgentRun').mockResolvedValue(undefined)
++    spyOn(databaseModule, 'addAgentStep').mockResolvedValue('step-1')
++
++    const mockFs = createMockFs({
++      files: {
++        '/project/src/index.ts': { content: 'export const value = 1\n' },
++      },
++    })
++    const override = mock(async ({ filePaths }: { filePaths: string[] }) =>
++      Object.fromEntries(
++        filePaths.map((filePath) => [filePath, 'remote data']),
++      ),
++    )
++    const failures: unknown[] = []
++
++    spyOn(mainPromptModule, 'callMainPrompt').mockImplementation(
++      async (params: Parameters<typeof mainPromptModule.callMainPrompt>[0]) => {
++        const { sendAction, promptId, requestFiles, requestOptionalFile } =
++          params
++        const sessionState = getInitialSessionState(getStubProjectFileContext())
++        for (const request of [
++          () => requestFiles({ filePaths: ['src/index.ts'] }),
++          () => requestOptionalFile({ filePath: 'src/index.ts' }),
++        ]) {
++          try {
++            await request()
++          } catch (error) {
++            failures.push(error)
++          }
++        }
++
++        await sendAction({
++          action: {
++            type: 'prompt-response',
++            promptId,
++            sessionState,
++            output: { type: 'lastMessage', value: [] },
++          },
++        })
++
++        return {
++          sessionState,
++          output: { type: 'lastMessage' as const, value: [] },
++        }
++      },
++    )
++
++    const client = new CodebuffClient({
++      apiKey: 'test-key',
++      cwd: '/project',
++      fsSource: mockFs,
++      overrideTools: { read_files: override },
++    })
++    const result = await client.run({
++      agent: 'base2',
++      prompt: 'read files',
++      noShell: true,
++    })
++
++    expect(result.output.type).toBe('lastMessage')
++    expect(failures).toHaveLength(2)
++    expect(failures.map(String).join('\n')).toContain('external capability')
++    expect(override).not.toHaveBeenCalled()
++  })
++
+   it('should keep env templates subject to gitignore with allow-example', async () => {
+     spyOn(databaseModule, 'getUserInfoFromApiKey').mockResolvedValue({
+       id: 'user-123',
+diff --git a/sdk/src/__tests__/subagent-execution-policy.test.ts b/sdk/src/__tests__/subagent-execution-policy.test.ts
+new file mode 100644
+index 0000000000..3c7318855d
+--- /dev/null
++++ b/sdk/src/__tests__/subagent-execution-policy.test.ts
+@@ -0,0 +1,368 @@
++import * as runAgentStep from '@codebuff/agent-runtime/run-agent-step'
++import { handleSpawnAgentInline } from '@codebuff/agent-runtime/tools/handlers/tool/spawn-agent-inline'
++import { handleSpawnAgents } from '@codebuff/agent-runtime/tools/handlers/tool/spawn-agents'
++import { extractSubagentContextParams } from '@codebuff/agent-runtime/tools/handlers/tool/spawn-agent-utils'
++import * as mcpClientModule from '@codebuff/common/mcp/client'
++import {
++  mockFileContext,
++  TEST_AGENT_RUNTIME_IMPL,
++} from '@codebuff/common/testing/impl/agent-runtime'
++import { createMockFs } from '@codebuff/common/testing/mocks/filesystem'
++import { getInitialSessionState } from '@codebuff/common/types/session-state'
++import { assistantMessage } from '@codebuff/common/util/messages'
++import { afterEach, describe, expect, mock, spyOn, test } from 'bun:test'
++import { z } from 'zod/v4'
++
++import {
++  createExecutionPolicy,
++  guardFileSystem,
++} from '../permissions/execution-policy'
++import { handleToolCall } from '../run'
++
++import type { SubagentContextParams } from '@codebuff/agent-runtime/tools/handlers/tool/spawn-agent-utils'
++import type { MCPConfig } from '@codebuff/common/types/mcp'
++import type { CustomToolDefinition } from '../custom-tool'
++import type { AgentTemplate } from '@codebuff/common/types/agent-template'
++import type { ToolResultOutput } from '@codebuff/common/types/messages/content-part'
++
++type SpawnMode = 'spawn_agents' | 'spawn_agent_inline'
++
++function createMockAgent(
++  id: string,
++  spawnableAgents: string[] = [],
++): AgentTemplate {
++  return {
++    id,
++    displayName: `Mock ${id}`,
++    outputMode: 'last_message',
++    inputSchema: {
++      prompt: {
++        safeParse: () => ({ success: true }),
++      } as unknown as AgentTemplate['inputSchema']['prompt'],
++    },
++    spawnerPrompt: '',
++    model: '',
++    includeMessageHistory: true,
++    inheritParentSystemPrompt: false,
++    mcpServers: {},
++    toolNames: [],
++    spawnableAgents,
++    systemPrompt: '',
++    instructionsPrompt: '',
++    stepPrompt: '',
++  }
++}
++
++async function runSpawnCase(mode: SpawnMode) {
++  const policy = createExecutionPolicy({
++    projectRoot: '/project',
++    noShell: true,
++    projectOnly: true,
++    readOnly: true,
++  })
++  const rawFs = createMockFs()
++  const fs = guardFileSystem(rawFs, policy)
++  const attempts: Array<{ toolName: string; output: ToolResultOutput[] }> = []
++  const signal = new AbortController().signal
++  const shellOverride = mock(async () => [
++    { type: 'json' as const, value: { message: 'override should not run' } },
++  ])
++  const customToolExecute = mock(async () => [
++    { type: 'json' as const, value: { message: 'custom tool should not run' } },
++  ])
++  const customToolDefinitions: Record<string, CustomToolDefinition> = {
++    custom_external: {
++      toolName: 'custom_external',
++      inputSchema: z.object({}),
++      description: 'Custom tool used to verify the external-tool gate.',
++      endsAgentStep: true,
++      exampleInputs: [{}],
++      execute: customToolExecute,
++    },
++  }
++
++  const requestToolCall: SubagentContextParams['requestToolCall'] = async ({
++    userInputId,
++    toolName,
++    input,
++    mcpConfig,
++  }) => {
++    const result = await handleToolCall({
++      action: {
++        type: 'tool-call-request',
++        requestId: crypto.randomUUID(),
++        userInputId,
++        toolName,
++        input,
++        timeout: undefined,
++        mcpConfig,
++      },
++      overrides: { run_terminal_command: shellOverride },
++      customToolDefinitions,
++      cwd: '/project',
++      fs,
++      signal,
++      policy,
++    })
++    attempts.push({ toolName, output: result.output })
++    return result
++  }
++
++  const childAgent = createMockAgent('child', ['nested'])
++  const nestedAgent = createMockAgent('nested')
++  const rootAgent = createMockAgent('root', ['child'])
++  const localAgentTemplates = { child: childAgent, nested: nestedAgent }
++  const rootState = getInitialSessionState(mockFileContext).mainAgentState
++
++  const tryRestrictedCalls = async (
++    inheritedRequestToolCall: SubagentContextParams['requestToolCall'],
++    userInputId: string,
++  ) => {
++    await Promise.all([
++      inheritedRequestToolCall({
++        userInputId,
++        toolName: 'run_terminal_command',
++        input: {
++          command: 'touch /outside/should-not-run',
++          process_type: 'SYNC',
++        },
++      }),
++      inheritedRequestToolCall({
++        userInputId,
++        toolName: 'list_directory',
++        input: { path: '../outside' },
++      }),
++      inheritedRequestToolCall({
++        userInputId,
++        toolName: 'write_file',
++        input: { path: 'new-file.txt', content: 'must not be written' },
++      }),
++      inheritedRequestToolCall({
++        userInputId,
++        toolName: 'custom_external',
++        input: {},
++      }),
++      inheritedRequestToolCall({
++        userInputId,
++        toolName: 'mcp__test__ping',
++        input: {},
++        mcpConfig: {
++          type: 'http',
++          url: 'http://127.0.0.1:1',
++          params: {},
++          headers: {},
++        },
++      }),
++    ])
++  }
++
++  const loopSpy = spyOn(runAgentStep, 'loopAgentSteps').mockImplementation(
++    async (options) => {
++      await tryRestrictedCalls(options.requestToolCall, options.userInputId)
++
++      const currentAgentTemplate = options.agentTemplate
++      if (currentAgentTemplate?.id === 'child') {
++        // Spawn one more level through the real inline handler. It must receive
++        // the same requestToolCall closure as the root and direct child.
++        const nestedContext = extractSubagentContextParams(
++          options as SubagentContextParams,
++        )
++        await handleSpawnAgentInline({
++          ...nestedContext,
++          agentState: options.agentState,
++          agentTemplate: currentAgentTemplate,
++          fileContext: options.fileContext,
++          fingerprintId: 'test-fingerprint',
++          localAgentTemplates,
++          logger: options.logger,
++          ancestorRunIds: options.ancestorRunIds,
++          system: 'Test system prompt',
++          tools: {},
++          userInputId: 'nested-spawn',
++          writeToClient: () => {},
++          previousToolCallFinished: Promise.resolve(),
++          toolCall: {
++            toolName: 'spawn_agent_inline',
++            toolCallId: 'nested-tool-call',
++            input: { agent_type: 'nested', prompt: 'try restricted actions' },
++          },
++        })
++      }
++
++      const response = assistantMessage('Mock agent response')
++      return {
++        agentState: {
++          ...options.agentState,
++          messageHistory: [response],
++        },
++        output: { type: 'lastMessage', value: [response] },
++      }
++    },
++  )
++
++  const commonParams = {
++    ...TEST_AGENT_RUNTIME_IMPL,
++    requestToolCall,
++    ancestorRunIds: [],
++    clientSessionId: 'test-session',
++    fileContext: mockFileContext,
++    fingerprintId: 'test-fingerprint',
++    localAgentTemplates,
++    previousToolCallFinished: Promise.resolve(),
++    repoId: undefined,
++    repoUrl: undefined,
++    sendSubagentChunk: () => {},
++    signal,
++    system: 'Test system prompt',
++    tools: {},
++    userId: 'test-user',
++    userInputId: 'root-input',
++    writeToClient: () => {},
++  }
++
++  if (mode === 'spawn_agents') {
++    await handleSpawnAgents({
++      ...commonParams,
++      agentState: rootState,
++      agentTemplate: rootAgent,
++      toolCall: {
++        toolName: 'spawn_agents',
++        toolCallId: 'root-tool-call',
++        input: {
++          agents: [{ agent_type: 'child', prompt: 'try restricted actions' }],
++        },
++      },
++    })
++  } else {
++    await handleSpawnAgentInline({
++      ...commonParams,
++      agentState: rootState,
++      agentTemplate: rootAgent,
++      toolCall: {
++        toolName: 'spawn_agent_inline',
++        toolCallId: 'root-tool-call',
++        input: { agent_type: 'child', prompt: 'try restricted actions' },
++      },
++    })
++  }
++
++  loopSpy.mockRestore()
++
++  expect(attempts).toHaveLength(10)
++  for (const attempt of attempts) {
++    const output = JSON.stringify(attempt.output)
++    if (attempt.toolName === 'run_terminal_command') {
++      expect(output).toContain('external capability')
++    } else if (attempt.toolName === 'list_directory') {
++      expect(output).toContain('outside project root')
++    } else if (attempt.toolName === 'write_file') {
++      expect(output).toContain('--read-only')
++    } else {
++      expect(output).toContain('external capability')
++    }
++  }
++  expect(rawFs.writeFile).not.toHaveBeenCalled()
++  expect(shellOverride).not.toHaveBeenCalled()
++  expect(customToolExecute).not.toHaveBeenCalled()
++}
++
++describe('subagent execution policy inheritance', () => {
++  afterEach(() => mock.restore())
++
++  test('spawn_agents and nested agents retain the parent policy callback', async () => {
++    await runSpawnCase('spawn_agents')
++  })
++
++  test('spawn_agent_inline and nested agents retain the parent policy callback', async () => {
++    await runSpawnCase('spawn_agent_inline')
++  })
++})
++
++describe('dispatch-origin execution policy', () => {
++  afterEach(() => mock.restore())
++
++  const action = (toolName: string, mcpConfig?: MCPConfig) => ({
++    type: 'tool-call-request' as const,
++    requestId: crypto.randomUUID(),
++    userInputId: 'test-input',
++    toolName,
++    input: {
++      path: 'src/output.ts',
++      instructions: 'Create a file for the test',
++      content: 'export {}\n',
++    },
++    timeout: undefined,
++    mcpConfig,
++  })
++
++  test('MCP tools with built-in names are classified as external', async () => {
++    const getMCPClient = spyOn(
++      mcpClientModule,
++      'getMCPClient',
++    ).mockResolvedValue('mcp-client')
++    const policy = createExecutionPolicy({
++      projectRoot: '/project',
++      noShell: true,
++    })
++    const result = await handleToolCall({
++      action: action('write_file', {
++        type: 'http',
++        url: 'http://127.0.0.1:1',
++        params: {},
++        headers: {},
++      }),
++      overrides: {},
++      customToolDefinitions: {},
++      cwd: '/project',
++      fs: guardFileSystem(createMockFs(), policy),
++      policy,
++    })
++
++    expect(JSON.stringify(result.output)).toContain('external capability')
++    expect(getMCPClient).not.toHaveBeenCalled()
++  })
++
++  test('built-in host overrides require external trust under restrictions', async () => {
++    const hostOverride = mock(async () => [
++      { type: 'json' as const, value: { message: 'host override ran' } },
++    ])
++    const policy = createExecutionPolicy({
++      projectRoot: '/project',
++      noShell: true,
++    })
++    const result = await handleToolCall({
++      action: action('write_file'),
++      overrides: { write_file: hostOverride },
++      customToolDefinitions: {},
++      cwd: '/project',
++      fs: guardFileSystem(createMockFs(), policy),
++      policy,
++    })
++
++    expect(JSON.stringify(result.output)).toContain('external capability')
++    expect(hostOverride).not.toHaveBeenCalled()
++  })
++
++  test('trusted built-in overrides still follow built-in filesystem policy', async () => {
++    const hostOverride = mock(async () => [
++      { type: 'json' as const, value: { message: 'host override ran' } },
++    ])
++    const policy = createExecutionPolicy({
++      projectRoot: '/project',
++      noShell: true,
++      readOnly: true,
++      allowExternalTools: true,
++    })
++    const result = await handleToolCall({
++      action: action('write_file'),
++      overrides: { write_file: hostOverride },
++      customToolDefinitions: {},
++      cwd: '/project',
++      fs: guardFileSystem(createMockFs(), policy),
++      policy,
++    })
++
++    expect(JSON.stringify(result.output)).toContain('read-only mode')
++    expect(hostOverride).not.toHaveBeenCalled()
++  })
++})
+diff --git a/sdk/src/index.ts b/sdk/src/index.ts
+index b96e3e4114..8b094f418c 100644
+--- a/sdk/src/index.ts
++++ b/sdk/src/index.ts
+@@ -149,6 +149,24 @@ export type {
+   TerminalCommandProcess,
+   TerminalCommandSpawnRequest,
+ } from './tools/run-terminal-command'
++export {
++  createExecutionPolicy,
++  authorizeToolCall,
++  classifyTool,
++  guardFileSystem,
++  canonicalizePath,
++  isPathWithinRoot,
++  isLexicallyWithinRoot,
++} from './permissions/execution-policy'
++export type {
++  ExecutionPolicy,
++  ShellApprovalCallback,
++  ShellApprovalRequest,
++  ShellApprovalVerdict,
++  ToolCapability,
++  ToolAuthorizationRequest,
++  PolicyDecision,
++} from './permissions/execution-policy'
+ // Containment for a sponsored run on the user's own machine (COD-336). Exported
+ // from the SDK rather than kept in Desktop because the CLI needs the same
+ // boundary, and a second copy of a seatbelt profile is a second thing to be
+diff --git a/sdk/src/permissions/__tests__/apply-patch-target.test.ts b/sdk/src/permissions/__tests__/apply-patch-target.test.ts
+new file mode 100644
+index 0000000000..27b95c46a1
+--- /dev/null
++++ b/sdk/src/permissions/__tests__/apply-patch-target.test.ts
+@@ -0,0 +1,53 @@
++import { createMockFs } from '@codebuff/common/testing/mocks/filesystem'
++import { describe, expect, mock, test } from 'bun:test'
++
++import { createExecutionPolicy } from '../execution-policy'
++import { handleToolCall } from '../../run'
++
++async function dispatchApplyPatch(path: string) {
++  const writeOverride = mock(async () => [
++    { type: 'json' as const, value: { message: 'patch dispatched' } },
++  ])
++  const result = await handleToolCall({
++    action: {
++      type: 'tool-call-request',
++      requestId: crypto.randomUUID(),
++      userInputId: 'test-input',
++      toolName: 'apply_patch',
++      input: {
++        operation: {
++          type: 'create_file',
++          path,
++          diff: '@@\n+content\n',
++        },
++      },
++      timeout: undefined,
++    },
++    overrides: { write_file: writeOverride },
++    customToolDefinitions: {},
++    cwd: '/project',
++    fs: createMockFs(),
++    policy: createExecutionPolicy({
++      projectRoot: '/project',
++      projectOnly: true,
++      allowExternalTools: true,
++    }),
++  })
++  return { result, writeOverride }
++}
++
++describe('apply_patch project-only target resolution', () => {
++  test('dispatches a patch targeting a file inside the project', async () => {
++    const { result, writeOverride } = await dispatchApplyPatch('src/new.ts')
++
++    expect(writeOverride).toHaveBeenCalledTimes(1)
++    expect(JSON.stringify(result.output)).toContain('patch dispatched')
++  })
++
++  test('rejects a patch targeting a file outside the project', async () => {
++    const { result, writeOverride } = await dispatchApplyPatch('../outside.txt')
++
++    expect(writeOverride).not.toHaveBeenCalled()
++    expect(JSON.stringify(result.output)).toContain('outside project root')
++  })
++})
+diff --git a/sdk/src/permissions/__tests__/execution-policy.test.ts b/sdk/src/permissions/__tests__/execution-policy.test.ts
+new file mode 100644
+index 0000000000..229d3ee3a2
+--- /dev/null
++++ b/sdk/src/permissions/__tests__/execution-policy.test.ts
+@@ -0,0 +1,329 @@
++/**
++ * Adversarial regression tests for the execution-permission policy (issue #1450).
++ *
++ * These encode the security properties the policy must hold. They test the
++ * policy module directly (no network, no real processes), including the
++ * cross-run isolation property that a process-global policy would violate.
++ */
++
++import { describe, test, expect } from 'bun:test'
++import { mkdtempSync, mkdirSync, symlinkSync, writeFileSync, rmSync } from 'fs'
++import { tmpdir } from 'os'
++import { join } from 'path'
++
++import { toolNames } from '@codebuff/common/tools/constants'
++import { toolParams } from '@codebuff/common/tools/list'
++
++import {
++  BUILT_IN_TOOL_CAPABILITIES,
++  createExecutionPolicy,
++  authorizeToolCall,
++  classifyTool,
++  guardFileSystem,
++  canonicalizePath,
++  isPathWithinRoot,
++  isContainedPath,
++} from '../execution-policy'
++
++import type { CodebuffFileSystem } from '@codebuff/common/types/filesystem'
++
++function policy(overrides: Partial<Parameters<typeof createExecutionPolicy>[0]> = {}) {
++  return createExecutionPolicy({ projectRoot: '/tmp/project', ...overrides })
++}
++
++describe('classifyTool', () => {
++  test('has a policy classification for every registered built-in', () => {
++    const registeredNames = [...toolNames].sort()
++
++    expect(Object.keys(toolParams).sort()).toEqual(registeredNames)
++    expect(Object.keys(BUILT_IN_TOOL_CAPABILITIES).sort()).toEqual(
++      registeredNames,
++    )
++  })
++
++  test('classifies shell, fs, network, and unknown tools', () => {
++    expect(classifyTool('run_terminal_command')).toBe('shell')
++    expect(classifyTool('write_file')).toBe('fs-write')
++    expect(classifyTool('apply_patch')).toBe('fs-write')
++    expect(classifyTool('read_files')).toBe('fs-read')
++    expect(classifyTool('read_url')).toBe('network')
++    expect(classifyTool('browser_logs')).toBe('network')
++    expect(classifyTool('run_file_change_hooks')).toBe('external')
++    // Unknown names (MCP, custom tools) are external, never assumed safe.
++    expect(classifyTool('mcp__github__create_issue')).toBe('external')
++    expect(classifyTool('my_custom_tool')).toBe('external')
++    expect(classifyTool('__proto__')).toBe('external')
++    expect(classifyTool('constructor')).toBe('external')
++  })
++})
++
++describe('per-run isolation (no process-global policy)', () => {
++  test('a permissive run does not leak permissions into a restricted run', () => {
++    const restricted = createExecutionPolicy({
++      projectRoot: '/tmp/a',
++      readOnly: true,
++      noShell: true,
++    })
++    const permissive = createExecutionPolicy({ projectRoot: '/tmp/b' })
++
++    // Building the permissive policy must not affect the restricted one.
++    expect(
++      authorizeToolCall(restricted, {
++        toolName: 'run_terminal_command',
++        capability: 'shell',
++        command: 'rm -rf /',
++        cwd: '/tmp/a',
++      }).allowed,
++    ).toBe(false)
++    expect(
++      authorizeToolCall(restricted, {
++        toolName: 'write_file',
++        capability: 'fs-write',
++        targetPath: '/tmp/a/x.ts',
++      }).allowed,
++    ).toBe(false)
++    // The permissive policy is independent.
++    expect(
++      authorizeToolCall(permissive, {
++        toolName: 'write_file',
++        capability: 'fs-write',
++        targetPath: '/tmp/b/x.ts',
++      }).allowed,
++    ).toBe(true)
++  })
++})
++
++describe('shell policy', () => {
++  test('--no-shell denies unconditionally', () => {
++    const p = policy({ noShell: true })
++    const d = authorizeToolCall(p, { toolName: 'run_terminal_command', capability: 'shell', command: 'echo hi', cwd: '/tmp/project' })
++    expect(d.allowed).toBe(false)
++  })
++
++  test('--read-only denies shell (unrestricted shell can write)', () => {
++    const p = policy({ readOnly: true })
++    const d = authorizeToolCall(p, { toolName: 'run_terminal_command', capability: 'shell', command: 'echo hi > /etc/passwd', cwd: '/tmp/project' })
++    expect(d.allowed).toBe(false)
++  })
++
++  test('--project-only denies shell (unrestricted shell can escape)', () => {
++    const p = policy({ projectOnly: true })
++    const d = authorizeToolCall(p, { toolName: 'run_terminal_command', capability: 'shell', command: 'cat ~/.ssh/id_rsa', cwd: '/tmp/project' })
++    expect(d.allowed).toBe(false)
++  })
++
++  test('--ask-shell with no handler is denied', () => {
++    const p = policy({ askShell: true })
++    const d = authorizeToolCall(p, { toolName: 'run_terminal_command', capability: 'shell', command: 'echo hi', cwd: '/tmp/project' })
++    expect(d.allowed).toBe(false)
++    expect(d.approvalRequired).toBe(true)
++  })
++
++  test('--ask-shell with handler requires approval (not auto-allow)', () => {
++    const p = policy({ askShell: true, shellApproval: async () => 'deny' })
++    const d = authorizeToolCall(p, { toolName: 'run_terminal_command', capability: 'shell', command: 'echo hi', cwd: '/tmp/project' })
++    expect(d.allowed).toBe(false)
++    expect(d.approvalRequired).toBe(true)
++  })
++
++  test('background commands are gated identically to sync (approval before spawn)', () => {
++    const p = policy({ askShell: true, shellApproval: async () => 'deny' })
++    const d = authorizeToolCall(p, {
++      toolName: 'run_terminal_command',
++      capability: 'shell',
++      command: 'npm run dev',
++      cwd: '/tmp/project',
++      processType: 'BACKGROUND',
++    })
++    expect(d.allowed).toBe(false)
++    expect(d.approvalRequired).toBe(true)
++  })
++
++  test('background commands denied under read-only/no-shell', () => {
++    for (const flag of [{ readOnly: true }, { noShell: true }, { projectOnly: true }] as const) {
++      const p = policy(flag)
++      const d = authorizeToolCall(p, {
++        toolName: 'run_terminal_command',
++        capability: 'shell',
++        command: 'npm run dev',
++        cwd: '/tmp/project',
++        processType: 'BACKGROUND',
++      })
++      expect(d.allowed).toBe(false)
++    }
++  })
++})
++
++describe('filesystem write policy', () => {
++  test('--read-only denies writes regardless of target', () => {
++    const p = policy({ readOnly: true })
++    expect(authorizeToolCall(p, { toolName: 'write_file', capability: 'fs-write', targetPath: '/tmp/project/a.ts' }).allowed).toBe(false)
++    expect(authorizeToolCall(p, { toolName: 'apply_patch', capability: 'fs-write', targetPath: '/tmp/project/b.ts' }).allowed).toBe(false)
++  })
++
++  test('--project-only denies writes outside the root', () => {
++    const p = policy({ projectOnly: true })
++    expect(authorizeToolCall(p, { toolName: 'write_file', capability: 'fs-write', targetPath: '/tmp/project/a.ts' }).allowed).toBe(true)
++    expect(authorizeToolCall(p, { toolName: 'write_file', capability: 'fs-write', targetPath: '/tmp/elsewhere/a.ts' }).allowed).toBe(false)
++    // Prefix that merely starts with the root string is not containment.
++    expect(authorizeToolCall(p, { toolName: 'write_file', capability: 'fs-write', targetPath: '/tmp/project-evil/a.ts' }).allowed).toBe(false)
++  })
++
++  test('--project-only denies reads outside the root', () => {
++    const p = policy({ projectOnly: true })
++    expect(authorizeToolCall(p, { toolName: 'read_files', capability: 'fs-read', targetPath: '/tmp/project/a.ts' }).allowed).toBe(true)
++    expect(authorizeToolCall(p, { toolName: 'read_files', capability: 'fs-read', targetPath: '/etc/passwd' }).allowed).toBe(false)
++  })
++})
++
++describe('platform-correct containment (Windows branch)', () => {
++  const win = { caseInsensitive: true, sep: '\\' }
++  test('case-insensitive match on Windows accepts a same-path different-case child', () => {
++    expect(isContainedPath('C:\\Proj\\a.ts', 'C:\\proj', win)).toBe(true)
++    expect(isContainedPath('C:\\PROJ', 'C:\\proj', win)).toBe(true)
++  })
++  test('a case-variant sibling outside the root is still rejected', () => {
++    expect(isContainedPath('C:\\proj-evil\\a.ts', 'C:\\proj', win)).toBe(false)
++  })
++  test('Windows separator prevents the prefix-sibling false positive', () => {
++    // Without the trailing separator, C:\project would match root C:\proj.
++    expect(isContainedPath('C:\\project\\a.ts', 'C:\\proj', win)).toBe(false)
++  })
++  test('POSIX is case-sensitive', () => {
++    const posix = { caseInsensitive: false, sep: '/' }
++    expect(isContainedPath('/tmp/Proj/a.ts', '/tmp/proj', posix)).toBe(false)
++    expect(isContainedPath('/tmp/proj/a.ts', '/tmp/proj', posix)).toBe(true)
++  })
++})
++
++describe('external tools under strict policies', () => {
++  test('denied when any restriction is active and not trusted', () => {
++    for (const flag of [{ noShell: true }, { askShell: true }, { projectOnly: true }, { readOnly: true }] as const) {
++      const p = policy(flag)
++      expect(authorizeToolCall(p, { toolName: 'mcp__x__y', capability: 'external' }).allowed).toBe(false)
++    }
++  })
++
++  test('allowed when the host explicitly trusts external tools', () => {
++    const p = policy({ readOnly: true, allowExternalTools: true })
++    expect(authorizeToolCall(p, { toolName: 'mcp__x__y', capability: 'external' }).allowed).toBe(true)
++  })
++
++  test('allowed when no restriction is active', () => {
++    const p = policy()
++    expect(authorizeToolCall(p, { toolName: 'mcp__x__y', capability: 'external' }).allowed).toBe(true)
++  })
++})
++
++describe('symlink-aware containment', () => {
++  test('a symlink inside the root that points outside is not contained', async () => {
++    const base = mkdtempSync(join(tmpdir(), 'policy-test-'))
++    try {
++      const root = join(base, 'project')
++      const outside = join(base, 'outside')
++      mkdirSync(root)
++      mkdirSync(outside)
++      writeFileSync(join(outside, 'secret.txt'), 'top secret')
++      // root/link -> outside
++      symlinkSync(outside, join(root, 'link'))
++
++      // Lexically it looks inside the root...
++      const lexicalTarget = join(root, 'link', 'secret.txt')
++      // ...but canonicalization resolves the symlink out of the root.
++      const contained = await isPathWithinRoot(lexicalTarget, root)
++      expect(contained).toBe(false)
++    } finally {
++      rmSync(base, { recursive: true, force: true })
++    }
++  })
++
++  test('a real file inside the root is contained', async () => {
++    const base = mkdtempSync(join(tmpdir(), 'policy-test-'))
++    try {
++      const root = join(base, 'project')
++      mkdirSync(root)
++      writeFileSync(join(root, 'a.ts'), 'x')
++      expect(await isPathWithinRoot(join(root, 'a.ts'), root)).toBe(true)
++      expect(await isPathWithinRoot(root, root)).toBe(true)
++    } finally {
++      rmSync(base, { recursive: true, force: true })
++    }
++  })
++
++  test('canonicalizePath resolves a symlinked ancestor', async () => {
++    const base = mkdtempSync(join(tmpdir(), 'policy-test-'))
++    try {
++      const real = join(base, 'real')
++      mkdirSync(real)
++      const link = join(base, 'link')
++      symlinkSync(real, link)
++      // A not-yet-existing file under the link canonicalizes under `real`.
++      const canonical = await canonicalizePath(join(link, 'new.txt'))
++      expect(canonical.startsWith(real)).toBe(true)
++    } finally {
++      rmSync(base, { recursive: true, force: true })
++    }
++  })
++})
++
++describe('guardFileSystem (defense in depth)', () => {
++  function mockFs(seen: { reads: string[]; writes: string[] }): CodebuffFileSystem {
++    return {
++      readFile: async (p: any) => {
++        seen.reads.push(String(p))
++        return 'data'
++      },
++      writeFile: async (p: any) => {
++        seen.writes.push(String(p))
++        return undefined
++      },
++      readdir: async (p: any) => {
++        seen.reads.push(String(p))
++        return []
++      },
++      stat: async (p: any) => {
++        seen.reads.push(String(p))
++        return {} as any
++      },
++      mkdir: async (p: any) => {
++        seen.writes.push(String(p))
++        return undefined
++      },
++      unlink: async (p: any) => {
++        seen.writes.push(String(p))
++        return undefined
++      },
++    } as unknown as CodebuffFileSystem
++  }
++
++  test('read-only blocks every write through the adapter', async () => {
++    const seen = { reads: [] as string[], writes: [] as string[] }
++    const guarded = guardFileSystem(mockFs(seen), policy({ readOnly: true }))
++    await expect(guarded.writeFile('/tmp/project/a.ts', 'x')).rejects.toThrow()
++    expect(seen.writes.length).toBe(0)
++  })
++
++  test('project-only blocks writes and reads outside the root', async () => {
++    const base = mkdtempSync(join(tmpdir(), 'policy-fs-'))
++    try {
++      const root = join(base, 'project')
++      mkdirSync(root)
++      const seen = { reads: [] as string[], writes: [] as string[] }
++      const guarded = guardFileSystem(mockFs(seen), policy({ projectOnly: true, projectRoot: root }))
++      await expect(guarded.writeFile(join(base, 'outside.ts'), 'x')).rejects.toThrow()
++      await expect(guarded.readFile('/etc/passwd')).rejects.toThrow()
++      // Inside the root is allowed.
++      await guarded.writeFile(join(root, 'a.ts'), 'x')
++      expect(seen.writes).toEqual([join(root, 'a.ts')])
++    } finally {
++      rmSync(base, { recursive: true, force: true })
++    }
++  })
++
++  test('unrestricted policy passes the adapter through untouched', () => {
++    const seen = { reads: [] as string[], writes: [] as string[] }
++    const raw = mockFs(seen)
++    const guarded = guardFileSystem(raw, policy())
++    expect(guarded).toBe(raw)
++  })
++})
+diff --git a/sdk/src/permissions/execution-policy.ts b/sdk/src/permissions/execution-policy.ts
+new file mode 100644
+index 0000000000..03ef0fe617
+--- /dev/null
++++ b/sdk/src/permissions/execution-policy.ts
+@@ -0,0 +1,408 @@
++/**
++ * Execution Policy
++ *
++ * Per-run, immutable authorization for tool execution.
++ *
++ * There is deliberately NO module-global policy state. A global policy is a
++ * security defect in an embeddable SDK: two concurrent runs with different
++ * restrictions would overwrite each other, so a restricted run could inherit a
++ * permissive run's policy. Each run constructs its own policy and captures it
++ * in its tool-dispatch closure.
++ */
++
++import { promises as nodeFs } from 'fs'
++import { resolve, sep as sep_default } from 'path'
++
++import type { CodebuffFileSystem } from '@codebuff/common/types/filesystem'
++import type { ToolName } from '@codebuff/common/tools/constants'
++
++/** What a tool can do, for authorization purposes. */
++export type ToolCapability =
++  | 'shell'
++  | 'fs-read'
++  | 'fs-write'
++  | 'network'
++  | 'agent'
++  | 'external'
++  | 'inert'
++
++export type ShellApprovalVerdict = 'approve' | 'deny'
++
++export interface ShellApprovalRequest {
++  /** Unique id correlating this approval to exactly one command. */
++  id: string
++  command: string
++  cwd: string
++  processType: 'SYNC' | 'BACKGROUND'
++  signal?: AbortSignal
++}
++
++export type ShellApprovalCallback = (
++  request: ShellApprovalRequest,
++) => Promise<ShellApprovalVerdict>
++
++export interface ExecutionPolicy {
++  readonly noShell: boolean
++  readonly askShell: boolean
++  readonly projectOnly: boolean
++  readonly readOnly: boolean
++  /** Absolute, canonicalized project root this run is confined to. */
++  readonly projectRoot: string
++  /**
++   * Whether external tools (MCP servers, custom tool definitions, host
++   * overrides) may run. Default false: they are outside the SDK's enforcement
++   * boundary and must be explicitly trusted by the host.
++   */
++  readonly allowExternalTools: boolean
++  readonly shellApproval?: ShellApprovalCallback
++}
++
++export interface PolicyDecision {
++  allowed: boolean
++  reason?: string
++  approvalRequired?: boolean
++}
++
++export interface ToolAuthorizationRequest {
++  toolName: string
++  capability: ToolCapability
++  /** Resolved absolute target path, for filesystem tools. */
++  targetPath?: string
++  /** Shell command details, for the shell capability. */
++  command?: string
++  cwd?: string
++  processType?: 'SYNC' | 'BACKGROUND'
++  signal?: AbortSignal
++}
++
++/**
++ * Build an immutable policy for one run.
++ */
++export function createExecutionPolicy(input: {
++  projectRoot: string
++  noShell?: boolean
++  askShell?: boolean
++  projectOnly?: boolean
++  readOnly?: boolean
++  allowExternalTools?: boolean
++  shellApproval?: ShellApprovalCallback
++}): ExecutionPolicy {
++  return Object.freeze({
++    noShell: input.noShell ?? false,
++    askShell: input.askShell ?? false,
++    projectOnly: input.projectOnly ?? false,
++    readOnly: input.readOnly ?? false,
++    projectRoot: resolve(input.projectRoot),
++    allowExternalTools: input.allowExternalTools ?? false,
++    ...(input.shellApproval ? { shellApproval: input.shellApproval } : {}),
++  })
++}
++
++/**
++ * Explicit capability for every SDK built-in in common/src/tools/constants.ts.
++ * The ToolName-derived Record makes adding a registered tool without a policy
++ * classification a type error. `toolParams` separately checks the runtime
++ * registry against the same names in execution-policy.test.ts.
++ */
++export const BUILT_IN_TOOL_CAPABILITIES = Object.freeze({
++  add_message: 'inert',
++  add_subgoal: 'inert',
++  apply_patch: 'fs-write',
++  ask_user: 'inert',
++  // This reads the browser session rather than the checkout or shell.
++  browser_logs: 'network',
++  code_search: 'fs-read',
++  cloud_plan_ready: 'inert',
++  create_plan: 'inert',
++  end_turn: 'inert',
++  find_files: 'fs-read',
++  glob: 'fs-read',
++  gravity_index: 'network',
++  list_directory: 'fs-read',
++  lookup_agent_info: 'network',
++  // Proposals carry writes that a host may later apply; enforce both the
++  // read-only and project-root rules before they leave the SDK.
++  propose_str_replace: 'fs-write',
++  propose_write_file: 'fs-write',
++  read_docs: 'network',
++  read_files: 'fs-read',
++  read_subtree: 'fs-read',
++  read_url: 'network',
++  render_ui: 'inert',
++  report_project_profile: 'inert',
++  // Hooks execute client-configured programs outside the SDK's process
++  // boundary, so restrictions require explicit host trust.
++  run_file_change_hooks: 'external',
++  run_terminal_command: 'shell',
++  set_messages: 'inert',
++  set_output: 'inert',
++  skill: 'agent',
++  spawn_agents: 'agent',
++  spawn_agent_inline: 'agent',
++  str_replace: 'fs-write',
++  suggest_followups: 'inert',
++  task_completed: 'inert',
++  think_deeply: 'inert',
++  update_subgoal: 'inert',
++  web_search: 'network',
++  write_file: 'fs-write',
++  write_todos: 'inert',
++} satisfies Record<ToolName, ToolCapability>)
++
++/**
++ * Classify a tool by capability. Unknown names are treated as `external`
++ * (denied under strict policies) rather than assumed safe.
++ */
++export function classifyTool(toolName: string): ToolCapability {
++  if (
++    Object.prototype.hasOwnProperty.call(BUILT_IN_TOOL_CAPABILITIES, toolName)
++  ) {
++    return BUILT_IN_TOOL_CAPABILITIES[toolName as ToolName]
++  }
++  // MCP tools, custom tool definitions, host overrides, and anything
++  // unrecognized stay outside the SDK's enforcement boundary.
++  return 'external'
++}
++
++/**
++ * Canonicalize a path through symlinks by resolving the nearest existing
++ * ancestor with realpath, then re-appending the not-yet-existing tail. This
++ * catches a symlink inside the project that points outside it.
++ */
++export async function canonicalizePath(
++  targetPath: string,
++  realpath: (p: string) => Promise<string> = nodeFs.realpath,
++): Promise<string> {
++  const absolute = resolve(targetPath)
++  const segments: string[] = []
++  let current = absolute
++  for (;;) {
++    try {
++      const real = await realpath(current)
++      return segments.length === 0 ? real : resolve(real, ...segments.reverse())
++    } catch {
++      const parent = resolve(current, '..')
++      if (parent === current) {
++        // Reached the filesystem root without finding an existing ancestor.
++        return absolute
++      }
++      segments.push(current.slice(parent.length + 1))
++      current = parent
++    }
++  }
++}
++
++/**
++ * Symlink-aware containment check: true only when the canonicalized target is
++ * the canonicalized root or a descendant of it.
++ */
++export async function isPathWithinRoot(
++  targetPath: string,
++  root: string,
++  realpath: (p: string) => Promise<string> = nodeFs.realpath,
++): Promise<boolean> {
++  const [realTarget, realRoot] = await Promise.all([
++    canonicalizePath(targetPath, realpath),
++    canonicalizePath(root, realpath),
++  ])
++  return isContainedPath(realTarget, realRoot)
++}
++
++/**
++ * Platform-correct containment over already-normalized paths.
++ *
++ * Windows paths are case-insensitive and use backslash separators, so a
++ * byte-prefix comparison would wrongly reject `C:\Proj\a.ts` against root
++ * `C:\proj` (or wrongly accept a sibling differing only in case). The flags are
++ * explicit so the Windows branch is unit-testable on any host.
++ */
++export function isContainedPath(
++  target: string,
++  root: string,
++  options: { caseInsensitive: boolean; sep: string } = {
++    caseInsensitive: process.platform === 'win32',
++    sep: process.platform === 'win32' ? '\\' : sep_default,
++  },
++): boolean {
++  const eq = (a: string, b: string) =>
++    options.caseInsensitive ? a.toLowerCase() === b.toLowerCase() : a === b
++  const startsWith = (a: string, b: string) =>
++    options.caseInsensitive
++      ? a.toLowerCase().startsWith(b.toLowerCase())
++      : a.startsWith(b)
++  return eq(target, root) || startsWith(target, root + options.sep)
++}
++
++/** Lexical containment check (no filesystem access). Used as a fast pre-filter. */
++export function isLexicallyWithinRoot(targetPath: string, root: string): boolean {
++  return isContainedPath(resolve(targetPath), resolve(root))
++}
++
++/**
++ * Authorize one tool call against one run's policy. Pure with respect to
++ * policy state: everything it needs is passed in. Filesystem containment is
++ * lexical here; callers that have a resolved target should additionally await
++ * {@link isPathWithinRoot} for symlink safety.
++ */
++export function authorizeToolCall(
++  policy: ExecutionPolicy,
++  request: ToolAuthorizationRequest,
++): PolicyDecision {
++  const { capability } = request
++
++  // External tools (MCP, custom definitions, overrides) are outside the SDK's
++  // enforcement boundary. Under any strict policy they are denied unless the
++  // host explicitly trusted them.
++  if (capability === 'external') {
++    const strict =
++      policy.noShell || policy.askShell || policy.projectOnly || policy.readOnly
++    if (strict && !policy.allowExternalTools) {
++      return {
++        allowed: false,
++        reason: `Tool '${request.toolName}' is an external capability and is not permitted while execution restrictions are active`,
++      }
++    }
++    return { allowed: true }
++  }
++
++  if (capability === 'shell') {
++    if (policy.noShell) {
++      return {
++        allowed: false,
++        reason: 'Shell command execution is disabled (--no-shell)',
++      }
++    }
++    // read-only and project-only cannot be guaranteed while an unrestricted
++    // shell can write anywhere or read anywhere. Deny until real OS-level
++    // containment is active.
++    if (policy.readOnly) {
++      return {
++        allowed: false,
++        reason:
++          'Shell execution is not permitted in read-only mode: an unrestricted shell can modify files outside the SDK’s control',
++      }
++    }
++    if (policy.projectOnly) {
++      return {
++        allowed: false,
++        reason:
++          'Shell execution is not permitted in project-only mode: an unrestricted shell can access paths outside the project',
++      }
++    }
++    if (policy.askShell) {
++      if (!policy.shellApproval) {
++        return {
++          allowed: false,
++          reason:
++            'Shell command requires approval but no approval handler is configured',
++          approvalRequired: true,
++        }
++      }
++      return { allowed: false, reason: 'Approval required', approvalRequired: true }
++    }
++    return { allowed: true }
++  }
++
++  if (capability === 'fs-write') {
++    if (policy.readOnly) {
++      return {
++        allowed: false,
++        reason: `Write to '${request.targetPath ?? request.toolName}' denied: read-only mode (--read-only)`,
++      }
++    }
++    if (policy.projectOnly && request.targetPath) {
++      if (!isLexicallyWithinRoot(request.targetPath, policy.projectRoot)) {
++        return {
++          allowed: false,
++          reason: `Write to '${request.targetPath}' blocked: outside project root '${policy.projectRoot}' (--project-only)`,
++        }
++      }
++    }
++    return { allowed: true }
++  }
++
++  if (capability === 'fs-read') {
++    if (policy.projectOnly && request.targetPath) {
++      if (!isLexicallyWithinRoot(request.targetPath, policy.projectRoot)) {
++        return {
++          allowed: false,
++          reason: `Read of '${request.targetPath}' blocked: outside project root '${policy.projectRoot}' (--project-only)`,
++        }
++      }
++    }
++    return { allowed: true }
++  }
++
++  // network, agent, inert
++  return { allowed: true }
++}
++
++/**
++ * Filesystem adapter wrapper enforcing read/write containment for a run.
++ * Defense in depth: even a tool path the dispatcher missed cannot read or
++ * write outside the policy's root, and symlink escapes are caught via realpath.
++ */
++export function guardFileSystem(
++  fs: CodebuffFileSystem,
++  policy: ExecutionPolicy,
++  realpath?: (p: string) => Promise<string>,
++): CodebuffFileSystem {
++  const restricted = policy.projectOnly || policy.readOnly
++  if (!restricted) return fs
++
++  const assertReadable = async (target: string) => {
++    if (!policy.projectOnly) return
++    if (!(await isPathWithinRoot(target, policy.projectRoot, realpath))) {
++      throw new Error(
++        `Read of '${target}' blocked: outside project root '${policy.projectRoot}' (--project-only)`,
++      )
++    }
++  }
++  const assertWritable = async (target: string) => {
++    if (policy.readOnly) {
++      throw new Error(`Write to '${target}' denied: read-only mode (--read-only)`)
++    }
++    if (!policy.projectOnly) return
++    if (!(await isPathWithinRoot(target, policy.projectRoot, realpath))) {
++      throw new Error(
++        `Write to '${target}' blocked: outside project root '${policy.projectRoot}' (--project-only)`,
++      )
++    }
++  }
++
++  const wrapRead = <T extends (...args: any[]) => any>(fn: T): T =>
++    (async (target: string, ...rest: unknown[]) => {
++      await assertReadable(target)
++      return fn(target, ...rest)
++    }) as unknown as T
++  const wrapWrite = <T extends (...args: any[]) => any>(fn: T): T =>
++    (async (target: string, ...rest: unknown[]) => {
++      await assertWritable(target)
++      return fn(target, ...rest)
++    }) as unknown as T
++
++  return new Proxy(fs as object, {
++    get(obj, prop, receiver) {
++      const value = Reflect.get(obj, prop, receiver)
++      if (typeof value !== 'function') return value
++      switch (prop) {
++        case 'readFile':
++        case 'readdir':
++        case 'stat':
++        case 'lstat':
++        case 'access':
++          return wrapRead(value.bind(obj))
++        case 'writeFile':
++        case 'unlink':
++        case 'rm':
++        case 'rmdir':
++        case 'mkdir':
++        case 'appendFile':
++        case 'rename':
++          return wrapWrite(value.bind(obj))
++        default:
++          return value.bind(obj)
++      }
++    },
++  }) as CodebuffFileSystem
++}
+diff --git a/sdk/src/run.ts b/sdk/src/run.ts
+index db7c4d09db..038e1c6611 100644
+--- a/sdk/src/run.ts
++++ b/sdk/src/run.ts
+@@ -56,6 +56,16 @@ import { getFiles, getImageFile } from './tools/read-files'
+ import { readUrl } from './tools/read-url'
+ import { runTerminalCommand } from './tools/run-terminal-command'
+ import type { TerminalCommandBroker } from './tools/run-terminal-command'
++import {
++  createExecutionPolicy,
++  authorizeToolCall,
++  classifyTool,
++  guardFileSystem,
++} from './permissions/execution-policy'
++import type {
++  ExecutionPolicy,
++  ShellApprovalCallback,
++} from './permissions/execution-policy'
+ 
+ import type { CustomToolDefinition } from './custom-tool'
+ import type { CodebuffRequestHeadersProvider } from './impl/model-provider'
+@@ -229,6 +239,15 @@ export type CodebuffClientOptions = {
+   /** Optional filter to classify files before reading (runs before gitignore check) */
+   fileFilter?: FileFilter
+ 
++  /** Disable shell command execution completely. */
++  noShell?: boolean
++  /** Ask for approval before every shell command. */
++  askShell?: boolean
++  /** Restrict filesystem access to the project and deny unrestricted shell. */
++  projectOnly?: boolean
++  /** Deny writes and unrestricted shell commands. */
++  readOnly?: boolean
++
+   overrideTools?: OverrideToolHandlers
+   customToolDefinitions?: CustomToolDefinition[]
+ 
+@@ -343,6 +362,18 @@ export type RunOptions = {
+    * `confineFileToolsToProject`.
+    */
+   refuseNonTextFileReads?: boolean
++  /** Disable shell command execution completely. */
++  noShell?: boolean
++  /** Ask for approval before every shell command. */
++  askShell?: boolean
++  /** Restrict filesystem access to the project and deny unrestricted shell. */
++  projectOnly?: boolean
++  /** Deny writes and unrestricted shell commands. */
++  readOnly?: boolean
++  /** Host approval callback required by `askShell`. */
++  shellApproval?: ShellApprovalCallback
++  /** Permit host-defined external tools under active restrictions. */
++  allowExternalTools?: boolean
+ }
+ 
+ /**
+@@ -610,9 +641,25 @@ async function runOnce({
+   traceSessionId: traceSessionIdOption,
+   confineFileToolsToProject,
+   refuseNonTextFileReads,
++  noShell = false,
++  askShell = false,
++  projectOnly = false,
++  readOnly = false,
++  shellApproval,
++  allowExternalTools = false,
+ }: RunExecutionOptions): Promise<RunState> {
+   const fsSourceValue = typeof fsSource === 'function' ? fsSource() : fsSource
+-  const fs = await fsSourceValue
++  const rawFs = await fsSourceValue
++  const policy = createExecutionPolicy({
++    projectRoot: cwd ?? process.cwd(),
++    noShell,
++    askShell,
++    projectOnly,
++    readOnly,
++    allowExternalTools,
++    ...(shellApproval ? { shellApproval } : {}),
++  })
++  const fs = guardFileSystem(rawFs, policy)
+   let spawn: CodebuffSpawn
+   if (spawnSource) {
+     const spawnSourceValue = await spawnSource
+@@ -819,6 +866,16 @@ async function runOnce({
+       ? createProjectFence({ projectRoot: cwd, fs })
+       : undefined
+   const refuseNonText = refuseNonTextFileReads === true
++  const authorizeReadFileOverride = () => {
++    if (!overrideTools?.read_files) return
++    const decision = authorizeToolCall(policy, {
++      toolName: 'read_files',
++      capability: 'external',
++    })
++    if (!decision.allowed) {
++      throw new Error(decision.reason ?? 'External file-read override denied')
++    }
++  }
+ 
+   const agentRuntimeImpl = getAgentRuntimeImpl({
+     logger,
+@@ -855,6 +912,7 @@ async function runOnce({
+         byok,
+         signal,
+         projectFence,
++        policy,
+       })
+     },
+     requestMcpToolData: async ({ mcpConfig, toolNames }) => {
+@@ -876,6 +934,15 @@ async function runOnce({
+       return filteredTools
+     },
+     requestFiles: async ({ filePaths, fileWindows }) => {
++      authorizeReadFileOverride()
++      for (const filePath of filePaths) {
++        const decision = authorizeToolCall(policy, {
++          toolName: 'read_files',
++          capability: 'fs-read',
++          targetPath: path.resolve(requireCwd(cwd, 'read_files'), filePath),
++        })
++        if (!decision.allowed) throw new Error(decision.reason)
++      }
+       const read = (paths: string[]) =>
+         readFiles({
+           filePaths: paths,
+@@ -915,6 +982,17 @@ async function runOnce({
+         ? undefined
+         : async ({ filePath }) => {
+             const imageCwd = requireCwd(cwd, 'read_files')
++            const decision = authorizeToolCall(policy, {
++              toolName: 'read_files',
++              capability: 'fs-read',
++              targetPath: path.resolve(imageCwd, filePath),
++            })
++            if (!decision.allowed) {
++              return {
++                path: resolveFilePath(imageCwd, filePath).relativePath,
++                error: decision.reason ?? 'Operation blocked by policy',
++              }
++            }
+             if (projectFence && !(await projectFence.resolve(filePath))) {
+               return {
+                 path: resolveFilePath(imageCwd, filePath).relativePath,
+@@ -929,6 +1007,13 @@ async function runOnce({
+             })
+           },
+     requestOptionalFile: async ({ filePath }) => {
++      authorizeReadFileOverride()
++      const decision = authorizeToolCall(policy, {
++        toolName: 'read_files',
++        capability: 'fs-read',
++        targetPath: path.resolve(requireCwd(cwd, 'read_files'), filePath),
++      })
++      if (!decision.allowed) throw new Error(decision.reason)
+       const files = await readFiles({
+         filePaths: [filePath],
+         override: overrideTools?.read_files,
+@@ -1314,7 +1399,10 @@ async function dropMatchesOutsideProject(
+   ) as Promise<ToolResultOutput[]>
+ }
+ 
+-async function handleToolCall({
++/**
++ * @internal Exposed so subagent tests can exercise the real permission boundary.
++ */
++export async function handleToolCall({
+   action,
+   overrides,
+   customToolDefinitions,
+@@ -1325,6 +1413,7 @@ async function handleToolCall({
+   byok,
+   signal,
+   projectFence,
++  policy,
+ }: {
+   action: ServerAction<'tool-call-request'>
+   overrides: NonNullable<CodebuffClientOptions['overrideTools']>
+@@ -1337,6 +1426,7 @@ async function handleToolCall({
+   signal?: AbortSignal
+   /** RunOptions.confineFileToolsToProject: unset for every other run. */
+   projectFence?: ProjectFence
++  policy: ExecutionPolicy
+ }): Promise<{ output: ToolResultOutput[] }> {
+   const toolName = action.toolName
+   const input = action.input
+@@ -1363,6 +1453,133 @@ async function handleToolCall({
+     }
+   }
+ 
++  const denial = (message: string) => ({
++    output: [{ type: 'json' as const, value: { errorMessage: message } }],
++  })
++
++  // Resolve the actual destination before authorizing. Tool names alone do not
++  // identify the trust boundary: MCP calls and host overrides execute outside
++  // the SDK, even when they reuse a registered built-in name.
++  const isBuiltinTool = toolNames.includes(toolName as ToolName)
++  const customToolHandler = isBuiltinTool
++    ? undefined
++    : customToolDefinitions[toolName]
++  const isMcpDispatch = Boolean(action.mcpConfig)
++  let override = overrides[toolName as PublishedClientToolName]
++  if (
++    !override &&
++    (toolName === 'str_replace' || toolName === 'apply_patch')
++  ) {
++    // Reuse the write_file override for file editing tools.
++    override = overrides['write_file']
++  }
++
++  const capability =
++    isMcpDispatch || customToolHandler
++      ? 'external'
++      : classifyTool(toolName)
++  const hasExternalDispatch =
++    isMcpDispatch || Boolean(customToolHandler) || Boolean(override)
++
++  // Require explicit host trust for every external destination. A trusted
++  // host override for a built-in still goes through that built-in's policy
++  // checks below; MCP name collisions use only the external classification.
++  if (hasExternalDispatch || capability === 'external') {
++    const decision = authorizeToolCall(policy, {
++      toolName,
++      capability: 'external',
++    })
++    if (!decision.allowed) {
++      return denial(decision.reason ?? 'External tool blocked by policy')
++    }
++  }
++
++  // Built-in policy is separate from dispatch-origin trust so a registered
++  // host override remains subject to the built-in's own limits when trusted.
++  if (capability === 'external') {
++    // External dispatch was authorized above.
++  } else if (capability === 'shell') {
++    const commandCwd = path.resolve(
++      requireCwd(cwd, 'run_terminal_command'),
++      (input as { cwd?: string }).cwd ?? '.',
++    )
++    const command = (input as { command?: string }).command ?? ''
++    const processType = (input as { process_type?: 'SYNC' | 'BACKGROUND' })
++      .process_type ?? 'SYNC'
++    const decision = authorizeToolCall(policy, {
++      toolName,
++      capability,
++      command,
++      cwd: commandCwd,
++      processType,
++      signal,
++    })
++    if (!decision.allowed) {
++      if (decision.approvalRequired) {
++        if (!policy.shellApproval) {
++          return denial('Shell command requires approval but no approval handler is configured')
++        }
++        let verdict: 'approve' | 'deny' = 'deny'
++        try {
++          verdict = await policy.shellApproval({
++            id: crypto.randomUUID(),
++            command,
++            cwd: commandCwd,
++            processType,
++            signal,
++          })
++        } catch {
++          verdict = 'deny'
++        }
++        if (verdict !== 'approve' || signal?.aborted) {
++          return denial('Shell command denied')
++        }
++      } else {
++        return denial(decision.reason ?? 'Shell command blocked by policy')
++      }
++    }
++  } else if (capability === 'fs-write' || capability === 'fs-read') {
++    if (toolName === 'code_search' && policy.projectOnly) {
++      return denial(
++        'code_search is not available in project-only mode because its flags can access paths outside the project',
++      )
++    }
++    const targets: string[] = []
++    if (toolName === 'apply_patch') {
++      const operation = (input as { operation?: { path?: string } }).operation
++      if (!operation?.path) {
++        return denial('apply_patch target could not be verified')
++      }
++      targets.push(path.resolve(requireCwd(cwd, toolName), operation.path))
++    } else if (Array.isArray((input as { filePaths?: string[] }).filePaths)) {
++      for (const filePath of (input as { filePaths: string[] }).filePaths) {
++        targets.push(path.resolve(requireCwd(cwd, toolName), filePath))
++      }
++    } else if (toolName === 'glob') {
++      const globCwd = (input as { cwd?: string }).cwd ?? '.'
++      targets.push(path.resolve(requireCwd(cwd, toolName), globCwd))
++    } else if (typeof (input as { path?: string }).path === 'string') {
++      targets.push(
++        path.resolve(
++          requireCwd(cwd, toolName),
++          (input as { path: string }).path,
++        ),
++      )
++    } else {
++      targets.push(requireCwd(cwd, toolName))
++    }
++    for (const targetPath of targets) {
++      const decision = authorizeToolCall(policy, {
++        toolName,
++        capability,
++        targetPath,
++      })
++      if (!decision.allowed) {
++        return denial(decision.reason ?? 'Operation blocked by policy')
++      }
++    }
++  }
++
+   // Handle MCP tool calls when mcpConfig is present
+   if (action.mcpConfig) {
+     try {
+@@ -1393,11 +1610,9 @@ async function handleToolCall({
+   }
+ 
+   let result: ToolResultOutput[]
+-  if (toolNames.includes(toolName as ToolName)) {
++  if (isBuiltinTool) {
+     clientToolCallSchema.parse(action)
+   } else {
+-    const customToolHandler = customToolDefinitions[toolName]
+-
+     if (!customToolHandler) {
+       throw new Error(
+         `Custom tool handler not found for user input ID ${action.userInputId}`,
+@@ -1409,14 +1624,6 @@ async function handleToolCall({
+   }
+ 
+   try {
+-    let override = overrides[toolName as PublishedClientToolName]
+-    if (
+-      !override &&
+-      (toolName === 'str_replace' || toolName === 'apply_patch')
+-    ) {
+-      // Reuse the write_file override for file editing tools.
+-      override = overrides['write_file']
+-    }
+     if (override) {
+       // Note: This type assertion is necessary because TypeScript cannot narrow
+       // the union type of all possible tool inputs based on the dynamic toolName.
