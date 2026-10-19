@@ -1,0 +1,481 @@
+diff --git a/cli/src/hooks/__tests__/use-gravity-ad.test.ts b/cli/src/hooks/__tests__/use-gravity-ad.test.ts
+index 39c5286ee..c4104a407 100644
+--- a/cli/src/hooks/__tests__/use-gravity-ad.test.ts
++++ b/cli/src/hooks/__tests__/use-gravity-ad.test.ts
+@@ -1,39 +1,42 @@
+ import { describe, expect, test } from 'bun:test'
+ 
+ import {
+   claimAdImpression,
+   dispatchFirstPartyViewAcknowledgement,
+   isAnswerMessage,
+   isInlineAdEligibleAnswer,
++  isWithheldAdResponse,
+   NO_RESPONSE_ADS,
+   renderDelaySinceReceipt,
++  rotationStep,
+   sendClickAfterView,
+   shouldHideGravityAds,
+   visibleResponseAds,
+ } from '../use-gravity-ad'
+ 
++import type { AdResponse } from '../use-gravity-ad'
+ import type { ChatMessage } from '../../types/chat'
+ import {
+   acknowledgeFirstPartyView,
+   resetFirstPartyViewAckRegistryForTests,
+ } from '@codebuff/common/ads/first-party-view-ack'
+ 
+ import type { FirstPartyViewAckRequest } from '@codebuff/common/ads/first-party-view-ack'
+ 
+ const msg = (over: Partial<ChatMessage>): ChatMessage => ({
+   id: 'user-1',
+   variant: 'user',
+   content: 'hello',
+   timestamp: '',
+   ...over,
+ })
+ 
+ // Only genuine streamed LLM answers (id 'ai-…', top-level) receive
+ // interspersed ads — not bash echoes or system notices.
+ describe('isAnswerMessage', () => {
+   const aiMsg = (over: Partial<ChatMessage>): ChatMessage =>
+     msg({ id: 'ai-1', variant: 'ai', content: '', ...over })
+ 
+   test('accepts a top-level streamed answer (even mid-stream)', () => {
+     expect(isAnswerMessage(aiMsg({}))).toBe(true)
+     expect(isAnswerMessage(aiMsg({ isComplete: false }))).toBe(true)
+@@ -245,25 +248,70 @@ describe('sendClickAfterView', () => {
+           answerView = resolve
+         })
+       },
+     })
+     const click = sendClickAfterView('imp-1', async () => {
+       order.push('click sent')
+       return 'ok'
+     })
+     await new Promise((resolve) => setTimeout(resolve, 5))
+     expect(order).toEqual(['view sent'])
+     answerView(new Response(null, { status: 204 }))
+     expect(await click).toBe('ok')
+     expect(order).toEqual(['view sent', 'click sent'])
+     resetFirstPartyViewAckRegistryForTests()
+   })
+ 
+   test('sends at once when no view is in flight', async () => {
+     resetFirstPartyViewAckRegistryForTests()
+     let sent = false
+     await sendClickAfterView('never-viewed', async () => {
+       sent = true
+     })
+     expect(sent).toBe(true)
+   })
+ })
++
++describe('a withheld ad response (COD-906)', () => {
++  const ad = (impUrl: string) => ({ impUrl }) as unknown as AdResponse
++  const cache = () => ({
++    choiceCache: [[ad('cached-1')]] as AdResponse[][],
++    choiceCacheIndex: 0,
++  })
++
++  test('only an empty ads list flagged withheld counts', () => {
++    expect(isWithheldAdResponse({ ads: [], withheld: true })).toBe(true)
++    expect(isWithheldAdResponse({ ads: [], provider: 'gravity' })).toBe(false)
++    expect(isWithheldAdResponse({ ads: [], withheld: 'true' })).toBe(false)
++    expect(isWithheldAdResponse({ ads: [ad('a')], withheld: true })).toBe(false)
++    expect(isWithheldAdResponse(null)).toBe(false)
++  })
++
++  test('clears the slot instead of re-showing a cached ad', () => {
++    const ctrl = cache()
++    expect(rotationStep(ctrl, { withheld: true })).toEqual({
++      show: null,
++      countsAsShown: false,
++    })
++    expect(ctrl.choiceCacheIndex).toBe(0)
++  })
++
++  test('a failed or empty fetch still falls back to the cache', () => {
++    const ctrl = cache()
++    expect(rotationStep(ctrl, null)).toEqual({
++      show: [ad('cached-1')],
++      countsAsShown: true,
++    })
++    expect(rotationStep({ choiceCache: [], choiceCacheIndex: 0 }, null)).toEqual(
++      { show: undefined, countsAsShown: false },
++    )
++  })
++
++  test('served ads are cached and shown', () => {
++    const ctrl = cache()
++    expect(rotationStep(ctrl, { ads: [ad('new')] })).toEqual({
++      show: [ad('new')],
++      countsAsShown: true,
++    })
++    expect(ctrl.choiceCache).toHaveLength(2)
++  })
++})
+diff --git a/cli/src/hooks/use-gravity-ad.ts b/cli/src/hooks/use-gravity-ad.ts
+index d3c287a44..2ed37dd58 100644
+--- a/cli/src/hooks/use-gravity-ad.ts
++++ b/cli/src/hooks/use-gravity-ad.ts
+@@ -161,67 +161,110 @@ export type AdSurface = 'waiting_room' | 'cli_chat'
+ export type GravityAdState = {
+   ads: AdResponse[] | null
+   /**
+    * On-demand ad pools keyed by assistant message id. The renderer repeats a
+    * full pool when the response has more eligible slots than distinct ads.
+    */
+   responseAds: Record<string, AdResponse[]>
+   /** Lazily fill the response's bounded ad pool as slots become eligible. */
+   requestResponseAds: (messageId: string, count: number) => void
+   isLoading: boolean
+   recordClick: (ad: AdResponse, dock?: DockClickContext) => void
+   recordImpression: (ad: AdResponse) => void
+ }
+ 
+ // Consolidated controller state for the ad rotation logic
+ type GravityController = {
+   choiceCache: AdResponse[][] // Cache of ad sets (choice or single-ad units)
+   choiceCacheIndex: number
+   impressionsFired: Set<string>
+   adsShownSinceActivity: number
+   tickInFlight: boolean
+   inlineQueue: ReturnType<typeof createLazyResponseAdQueue<AdResponse>>
+   eligibleSlotCounts: Map<string, number>
+ }
+ 
++type ChoiceCache = Pick<GravityController, 'choiceCache' | 'choiceCacheIndex'>
++
+ // Pure helper: add an ad set to the cache
+-function addToChoiceCache(ctrl: GravityController, ads: AdResponse[]): void {
++function addToChoiceCache(ctrl: ChoiceCache, ads: AdResponse[]): void {
+   // Deduplicate by checking if any set has the same first impUrl
+   const key = ads[0]?.impUrl
+   if (key && ctrl.choiceCache.some((set) => set[0]?.impUrl === key)) return
+   if (ctrl.choiceCache.length >= MAX_AD_CACHE_SIZE) ctrl.choiceCache.shift()
+   ctrl.choiceCache.push(ads)
+ }
+ 
+ // Pure helper: get the next cached ad set
+-function nextFromChoiceCache(ctrl: GravityController): AdResponse[] | null {
++function nextFromChoiceCache(ctrl: ChoiceCache): AdResponse[] | null {
+   if (ctrl.choiceCache.length === 0) return null
+   const set = ctrl.choiceCache[ctrl.choiceCacheIndex % ctrl.choiceCache.length]!
+   ctrl.choiceCacheIndex = (ctrl.choiceCacheIndex + 1) % ctrl.choiceCache.length
+   return set
+ }
+ 
++/**
++ * COD-906: the server CHOSE no ad for this request (the new-user ad ramp,
++ * docs/experiments.md) -- not a no-fill. Only `{ ads: [], withheld: true }`
++ * counts; any other body is read as before.
++ */
++export function isWithheldAdResponse(data: unknown): boolean {
++  if (typeof data !== 'object' || data === null) return false
++  const body = data as { ads?: unknown; withheld?: unknown }
++  return (
++    body.withheld === true && Array.isArray(body.ads) && body.ads.length === 0
++  )
++}
++
++/** A fetch: served ads, a withheld request, or nothing usable. */
++export type AdFetchResult =
++  | { ads: AdResponse[] }
++  | { withheld: true }
++  | null
++
++/**
++ * What one rotation tick does with its fetch. Served ads are cached and
++ * shown; a withheld request clears the slot (COD-906: re-showing a cached
++ * ad would undo the server's decision); a failed or empty fetch falls back
++ * to the cache as before, and leaves the slot alone when the cache is empty.
++ * `undefined` means "leave the slot as it is".
++ */
++export function rotationStep(
++  ctrl: ChoiceCache,
++  result: AdFetchResult,
++): { show: AdResponse[] | null | undefined; countsAsShown: boolean } {
++  if (result && 'withheld' in result) return { show: null, countsAsShown: false }
++  if (result) {
++    addToChoiceCache(ctrl, result.ads)
++    return { show: result.ads, countsAsShown: true }
++  }
++  const cachedSet = nextFromChoiceCache(ctrl)
++  return cachedSet
++    ? { show: cachedSet, countsAsShown: true }
++    : { show: undefined, countsAsShown: false }
++}
++
+ /**
+  * A streamed LLM answer (possibly still in flight). Other top-level
+  * 'ai'-variant messages (bash echoes, system notices, mode dividers) are
+  * excluded via the `ai-` id prefix.
+  */
+ export function isAnswerMessage(m: ChatMessage): boolean {
+   return (
+     !m.parentId && m.variant === 'ai' && m.id.startsWith(AI_MESSAGE_ID_PREFIX)
+   )
+ }
+ 
+ export function isInlineAdEligibleAnswer(m: ChatMessage): boolean {
+   return isAnswerMessage(m) && m.metadata?.allowInlineAds === true
+ }
+ 
+ export function claimAdImpression(
+   impressionsFired: Set<string>,
+   impUrl: string,
+ ): boolean {
+   if (impressionsFired.has(impUrl)) return false
+   impressionsFired.add(impUrl)
+   return true
+ }
+ 
+ /**
+@@ -578,189 +621,182 @@ export const useGravityAd = (options?: GravityAdOptions): GravityAdState => {
+         setAds((cur) => {
+           if (!cur) return cur
+           return cur.map((a) =>
+             a.impUrl === impUrl ? { ...a, credits: data.creditsGranted } : a,
+           )
+         })
+       }
+     }
+ 
+     recordLocalImpression().catch((err) => {
+       logger.debug({ err }, '[ads] Failed to record ad impression')
+     })
+   }
+ 
+   const recordClick = (ad: AdResponse, dock?: DockClickContext): void => {
+     // A click is proof the ad was on screen. Its view normally went out at
+     // mount; this sends it now if it never did (deduped otherwise), so the
+     // click report below has a view to wait behind.
+     recordImpressionOnce(ad)
+     recordAdClick(ad, {
+       ...(surface ? { surface } : {}),
+       ...(dock ? { dock } : {}),
+     })
+   }
+ 
+-  type FetchAdResult = { ads: AdResponse[] } | null
++  type FetchAdResult = AdFetchResult
+ 
+   // Fetch an ad via web API
+   const fetchAd = async (params?: {
+     placementId?: string
+     placementIds?: string[]
+   }): Promise<FetchAdResult> => {
+     // Don't fetch ads when they should be hidden
+     if (shouldHideAdsRef.current) return null
+     if (!getAdsEnabled()) return null
+ 
+     const request = await buildAdAuctionRequest({
+       provider,
+       ...(surface ? { surface } : {}),
+       ...(params?.placementId ? { placementId: params.placementId } : {}),
+       ...(params?.placementIds?.length
+         ? { placementIds: params.placementIds }
+         : {}),
+       allowSponsoredRoute: true,
+     })
+     if (!request) return null
+ 
+     try {
+       const response = await timedAdFetch(() =>
+         fetch(request.url, request.init),
+       )
+ 
+       if (!response.ok) {
+         let responseBody: unknown
+         try {
+           const contentType = response.headers.get('content-type') ?? ''
+           responseBody = contentType.includes('application/json')
+             ? await response.json()
+             : await response.text()
+         } catch {
+           responseBody = 'Unable to parse error response'
+         }
+         logger.warn(
+           { provider, status: response.status, response: responseBody },
+           '[ads] Web API returned error',
+         )
+         return null
+       }
+ 
+       const data = await response.json()
+ 
++      if (isWithheldAdResponse(data)) return { withheld: true }
++
+       if (Array.isArray(data.ads) && data.ads.length > 0) {
+         // Receipt stamp for `renderDelayMs` (COD-365): the response is in
+         // hand, the card is not yet on screen.
+         const receivedAtMs = Date.now()
+         noteAdsServed(data.ads.length, receivedAtMs)
+         return {
+           // Every string an ad network or advertiser wrote is drawn in the
+           // terminal: strip escape sequences and controls here, once, so an
+           // OSC 52 / OSC 8 / CSI in a title or body never reaches the screen.
+           ads: sanitizeTerminalStrings(data.ads as AdResponse[]).map((ad) => ({
+             ...ad,
+             provider: data.provider ?? provider,
+             receivedAtMs,
+           })),
+         }
+       }
+     } catch (err) {
+       // `url` names which of the two ad routes threw. Only Bun's own network
+       // errors carry the request as `path`, so without it a parse failure or
+       // any other throw is unattributable to a host -- and the two routes do
+       // not fail alike (2026-10-14: every connection failure in six hours was
+       // against freebuff.com's `/api/ads`, none against `/api/v1/ads`).
+       logger.error(
+         { err, provider, url: request.url },
+         '[ads] Failed to fetch ad',
+       )
+     }
+ 
+     return null
+   }
+ 
+   // Update tick function (uses ref to avoid useCallback dependency issues)
+   tickRef.current = () => {
+     void (async () => {
+       const ctrl = ctrlRef.current
+       if (ctrl.tickInFlight) return
+       ctrl.tickInFlight = true
+ 
+       try {
+         if (!getAdsEnabled() || slotPausedRef.current) return
+ 
+         // Derive "can fetch new ads" from counter and activity (no separate paused ref needed)
+         const canFetchNew =
+           ctrl.adsShownSinceActivity < MAX_ADS_AFTER_ACTIVITY &&
+           isUserActive(ACTIVITY_THRESHOLD_MS)
+ 
+         const result = canFetchNew
+           ? await fetchAd({ placementId: slotPlacementId, placementIds })
+           : null
+ 
+-        if (result) {
+-          addToChoiceCache(ctrl, result.ads)
+-          ctrl.adsShownSinceActivity += 1
+-          setAds(result.ads)
+-        } else {
+-          // Fall back to cached ads
+-          const cachedSet = nextFromChoiceCache(ctrl)
+-          if (cachedSet) {
+-            ctrl.adsShownSinceActivity += 1
+-            setAds(cachedSet)
+-          }
+-        }
++        const step = rotationStep(ctrl, result)
++        if (step.countsAsShown) ctrl.adsShownSinceActivity += 1
++        if (step.show !== undefined) setAds(step.show)
+       } finally {
+         ctrl.tickInFlight = false
+       }
+     })()
+   }
+ 
+   // Reset ads shown counter on user activity
+   useEffect(() => {
+     if (!getAdsEnabled()) return
+     return subscribeToActivity(() => {
+       ctrlRef.current.adsShownSinceActivity = 0
+     })
+   }, [])
+ 
+   // Start rotation when user sends first message (or immediately if forced).
+   useEffect(() => {
+     if (!shouldStart || !getAdsEnabled() || shouldHideAds) return
+ 
+     setIsLoading(true)
+ 
+     // Fetch first ad immediately, unless the dock already holds the slot.
+     void (async () => {
+       if (slotPausedRef.current) {
+         setIsLoading(false)
+         return
+       }
+       const result = await fetchAd({
+         placementId: slotPlacementId,
+         placementIds,
+       })
+-      if (result) {
++      if (result && 'ads' in result) {
+         const ctrl = ctrlRef.current
+         addToChoiceCache(ctrl, result.ads)
+         setAds(result.ads)
+         ctrl.adsShownSinceActivity = 1
+       }
+       setIsLoading(false)
+     })()
+ 
+     // Start interval for rotation (consistent 60s intervals)
+     const id = setInterval(() => tickRef.current(), AD_ROTATION_INTERVAL_MS)
+ 
+     return () => {
+       clearInterval(id)
+     }
+   }, [shouldStart, shouldHideAds, provider, surface, placementIds?.join(',')])
+ 
+   // Called by BlocksRenderer only when its streamed node count makes another
+   // between-node slot eligible, until the four-ad pool is full. Requests use
+   // the same placement id and are serialized per answer so higher-value early
+   // results retain their order. The renderer cycles that exact pool for later
+   // slots without additional auctions or impression events.
+   const requestResponseAds = (messageId: string, count: number): void => {
+     if (
+       !inline ||
+       !inlinePlacementId ||
+@@ -794,47 +830,47 @@ export const useGravityAd = (options?: GravityAdOptions): GravityAdState => {
+       trackInlineAdEvent(
+         AnalyticsEvent.CLI_INLINE_AD_SLOT_ELIGIBLE,
+         telemetryProperties,
+       )
+ 
+       if (
+         count > MAX_RESPONSE_AD_POOL_SIZE &&
+         previousEligibleCount <= MAX_RESPONSE_AD_POOL_SIZE
+       ) {
+         enqueueClientLog({
+           level: 'info',
+           event: 'cli.inline_ad_pool_reused',
+           message: 'CLI inline-ad pool reused',
+           client_session_id: telemetryProperties.chat_session_id,
+           data: telemetryProperties,
+         })
+       }
+     }
+ 
+     void requestLazyResponseAds({
+       queue: ctrl.inlineQueue,
+       messageId,
+       count,
+       fetchOne: async () => {
+         const result = await fetchAd({ placementId: inlinePlacementId })
+-        return result?.ads[0] ?? null
++        return result && 'ads' in result ? (result.ads[0] ?? null) : null
+       },
+       onAd: (ad) => {
+         setResponseAds((prev) => ({
+           ...prev,
+           [messageId]: [...(prev[messageId] ?? []), ad],
+         }))
+       },
+     })
+   }
+ 
+   // Don't return ads when ads should be hidden
+   const visible = shouldStart && !shouldHideAds
+   return {
+     ads: visible ? ads : null,
+     responseAds: visibleResponseAds(visible, responseAds),
+     requestResponseAds,
+     isLoading,
+     recordClick,
+     recordImpression: recordImpressionOnce,
+   }
+ }
