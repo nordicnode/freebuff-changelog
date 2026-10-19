@@ -1,0 +1,566 @@
+diff --git a/packages/agent-runtime/src/__tests__/compact-context-loop.test.ts b/packages/agent-runtime/src/__tests__/compact-context-loop.test.ts
+index 5d9caa189..b7e57d1ac 100644
+--- a/packages/agent-runtime/src/__tests__/compact-context-loop.test.ts
++++ b/packages/agent-runtime/src/__tests__/compact-context-loop.test.ts
+@@ -5,52 +5,57 @@
+  */
+ 
+ import * as analytics from '@codebuff/common/analytics'
+ import { BYOK_RUN_ID_PREFIX } from '@codebuff/common/constants/byok'
+ import { TEST_USER_ID } from '@codebuff/common/old-constants'
+ import { createTestAgentRuntimeParams } from '@codebuff/common/testing/fixtures/agent-runtime'
+ import { clearMockedModules } from '@codebuff/common/testing/mock-modules'
+ import {
+   createMockDbOperations,
+   setupDbSpies,
+ } from '@codebuff/common/testing/mocks/database'
+ import { getInitialSessionState } from '@codebuff/common/types/session-state'
+ import { promptSuccess } from '@codebuff/common/util/error'
+ import { assistantMessage, userMessage } from '@codebuff/common/util/messages'
+ import {
+   afterAll,
+   afterEach,
+   beforeEach,
+   describe,
+   expect,
+   it,
+   mock,
+   spyOn,
+ } from 'bun:test'
+ 
+-import { loopAgentSteps } from '../run-agent-step'
++import {
++  loopAgentSteps,
++  TURN_FAILED_NOTE,
++  USER_PROMPT_REFUSED_NOTE,
++} from '../run-agent-step'
+ import { clearAgentGeneratorCache } from '../run-programmatic-step'
++import { countTokensMessages } from '../util/token-counter'
+ import { createToolCallChunk, mockFileContext } from './test-utils'
+ 
+ import type { AgentTemplate } from '../templates/types'
+ import type { Message } from '@codebuff/common/types/messages/codebuff-message'
+ import type { DbSpies } from '@codebuff/common/testing/mocks/database'
+ 
+ const MINUTE = 60 * 1000
+ 
+ const textOf = (message: Message): string =>
+   Array.isArray(message.content)
+     ? message.content
+         .map((part) => ('text' in part ? part.text : ''))
+         .join('\n')
+     : String(message.content ?? '')
+ 
+ describe('compactContext in loopAgentSteps', () => {
+   let dbSpies: DbSpies
+   let seenMessages: Message[][]
+   let runtimeImpl: any
+ 
+   const baseTemplate: AgentTemplate = {
+     id: 'test-agent',
+     displayName: 'Test Agent',
+     spawnerPrompt: 'Testing',
+     model: 'claude-3-5-sonnet-20241022',
+@@ -222,50 +227,110 @@ describe('compactContext in loopAgentSteps', () => {
+         ...userMessage('LIVE REQUEST BODY '.repeat(5_000)),
+         tags: ['USER_PROMPT'],
+         sentAt: 1_000_000,
+       },
+     ]
+ 
+     it('points a hosted run at a larger-context model', async () => {
+       const result = await runLoop(overBudget, unshrinkable())
+       expect(runtimeImpl.promptAiSdkStream).not.toHaveBeenCalled()
+       expect(result.output.type).toBe('error')
+       expect(firstLine(result.output)).toBe(
+         "Agent run error: Compaction could not bring this conversation under the model's 4,096-token context budget. History has been preserved. Start a new thread, or switch to a model with a larger context window.",
+       )
+     })
+ 
+     it('keeps the context window hint for a BYOK run', async () => {
+       const result = await runLoop(overBudget, unshrinkable(), undefined, [], {
+         startAgentRun: async () => `${BYOK_RUN_ID_PREFIX}test-run`,
+       })
+       expect(runtimeImpl.promptAiSdkStream).not.toHaveBeenCalled()
+       expect(result.output.type).toBe('error')
+       expect(firstLine(result.output)).toBe(
+         "Agent run error: Compaction could not bring this conversation under the model's 4,096-token context budget. History has been preserved. Start a new thread, or give a BYOK connection a larger context window if its model supports one.",
+       )
+     })
++
++    it('ends the failed turn in history, so the next turn compacts its prompt', async () => {
++      // Exactly the 4,096-token size guard: accepted, but with the system
++      // prompt and tools the turn is over its budget and cannot compact.
++      const overhead = countTokensMessages([userMessage('')])
++      const prompt = 'X'.repeat((4096 - overhead) * 3)
++      expect(countTokensMessages([userMessage(prompt)])).toBe(4096)
++
++      const first = await runLoop(overBudget, [], prompt)
++      expect(firstLine(first.output)).toStartWith(
++        'Agent run error: Compaction could not bring',
++      )
++      expect(textOf(first.agentState.messageHistory.at(-1)!)).toContain(
++        TURN_FAILED_NOTE,
++      )
++
++      const second = await runLoop(
++        overBudget,
++        first.agentState.messageHistory,
++        'a short follow-up',
++      )
++      expect(second.output.type).not.toBe('error')
++      expect(runtimeImpl.promptAiSdkStream).toHaveBeenCalledTimes(1)
++      const sent = seenMessages[0].map(textOf).join('\n')
++      expect(sent).toContain('<conversation_summary>')
++      expect(sent).toContain('a short follow-up')
++    })
++
++    it('keeps no message the size guard refused', async () => {
++      const first = await runLoop(
++        overBudget,
++        [],
++        'REFUSED PROMPT BODY '.repeat(2_000),
++      )
++      expect(runtimeImpl.promptAiSdkStream).not.toHaveBeenCalled()
++      expect(firstLine(first.output)).toBe(
++        'Agent run error: The new message is too large. Send a smaller excerpt or attach a file instead.',
++      )
++      expect(first.agentState.messageHistory).toHaveLength(1)
++      expect(textOf(first.agentState.messageHistory[0])).toContain(
++        USER_PROMPT_REFUSED_NOTE,
++      )
++
++      await runLoop(overBudget, first.agentState.messageHistory, 'smaller')
++      const sent = seenMessages[0].map(textOf).join('\n')
++      expect(sent).toContain('smaller')
++      expect(sent).not.toContain('REFUSED PROMPT BODY')
++    })
++
++    it('gives a refused mid-turn steering message the refusal note', async () => {
++      const result = await runLoop(overBudget, [], 'hello', undefined, {
++        drainSteeringMessages: async () => ['REFUSED STEERING '.repeat(2_000)],
++      })
++      expect(firstLine(result.output)).toStartWith(
++        'Agent run error: The new message is too large.',
++      )
++      const history = result.agentState.messageHistory
++      expect(textOf(history.at(-1)!)).toContain(USER_PROMPT_REFUSED_NOTE)
++      expect(JSON.stringify(history)).not.toContain('REFUSED STEERING')
++    })
+   })
+ 
+   it('leaves the history alone when the agent has not opted in', async () => {
+     await runLoop(baseTemplate, idleHistory(120))
+ 
+     const sent = seenMessages[0].map(textOf).join('\n')
+     expect(sent).toContain('DISTINCTIVE PRIOR ANSWER')
+     expect(sent).not.toContain('<conversation_summary>')
+   })
+ 
+   it('manual compaction makes no model request and preserves the live request', async () => {
+     const result = await runLoop(baseTemplate, idleHistory(0), '/compact')
+     expect(result.output.type).not.toBe('error')
+     expect(runtimeImpl.promptAiSdkStream).not.toHaveBeenCalled()
+     const history = result.agentState.messageHistory.map(textOf).join('\n')
+     expect(history).toContain('the live question')
+     expect(history).toContain('<conversation_summary>')
+     expect(history).not.toContain('/compact')
+   })
+ 
+   it('compacts on the idle trigger with no model request of its own', async () => {
+     const logged: unknown[] = []
+     const result = await runLoop(
+       { ...baseTemplate, compactContext: { cacheExpiryMinTokens: null } },
+       idleHistory(120),
+diff --git a/packages/agent-runtime/src/run-agent-step.ts b/packages/agent-runtime/src/run-agent-step.ts
+index bfdcfd22d..2478b1213 100644
+--- a/packages/agent-runtime/src/run-agent-step.ts
++++ b/packages/agent-runtime/src/run-agent-step.ts
+@@ -104,51 +104,54 @@ import {
+   isCompactCommandPrompt,
+ } from './system-prompt/prompts'
+ import { getAgentTemplate } from './templates/agent-registry'
+ import { buildAgentToolSet, modelSpawnableAgents } from './templates/prompts'
+ import { getAgentPrompt } from './templates/strings'
+ import { getToolSet } from './tools/prompts'
+ import { processStream } from './tools/stream-parser'
+ import { getAgentOutput, outputForParent } from './util/agent-output'
+ import {
+   createCacheDebugSnapshot,
+   enrichCacheDebugSnapshotWithProviderRequest,
+   enrichCacheDebugSnapshotWithUsage,
+ } from './util/cache-debug'
+ import {
+   withSystemInstructionTags,
+   withSystemTags as withSystemTags,
+   buildUserMessageContent,
+   expireMessages,
+   frameSteeringContent,
+ } from './util/messages'
+ import {
+   estimateContextTokens,
+   recordContextUsage,
+   recountContextTokens,
+ } from './util/context-token-count'
+-import { assertUserContentSize } from './util/context-size-guard'
++import {
++  assertUserContentSize,
++  UserContentTooLargeError,
++} from './util/context-size-guard'
+ import {
+   countTokens,
+   countTokensJson,
+   countTokensMessages,
+ } from './util/token-counter'
+ 
+ import type { AgentTemplate } from '@codebuff/common/types/agent-template'
+ import type { TrackEventFn } from '@codebuff/common/types/contracts/analytics'
+ import type {
+   AddAgentStepFn,
+   FinishAgentRunFn,
+   StartAgentRunFn,
+ } from '@codebuff/common/types/contracts/database'
+ import type {
+   AgentUsageData,
+   CacheDebugUsageData,
+   ContextCompactionData,
+   ModelUsageData,
+   PromptAiSdkFn,
+ } from '@codebuff/common/types/contracts/llm'
+ import type { Logger } from '@codebuff/common/types/contracts/logger'
+ import type { TraceWriter } from '@codebuff/common/types/contracts/trace'
+ import type { ParamsExcluding } from '@codebuff/common/types/function-params'
+ import type {
+   Message,
+@@ -191,50 +194,56 @@ async function additionalToolDefinitions(
+     typeof getMCPToolData,
+     'toolNames' | 'mcpServers' | 'writeTo'
+   >,
+ ): Promise<CustomToolDefinitions> {
+   const { agentTemplate, fileContext } = params
+ 
+   const defs = cloneDeep(
+     Object.fromEntries(
+       Object.entries(fileContext.customToolDefinitions).filter(([toolName]) =>
+         agentTemplate!.toolNames.includes(toolName),
+       ),
+     ),
+   )
+   return getMCPToolData({
+     ...params,
+     toolNames: agentTemplate!.toolNames,
+     mcpServers: agentTemplate!.mcpServers,
+     writeTo: defs,
+   })
+ }
+ 
+ /** Run-id prefix for runs that skip the run-tracking ledger (context-pruner).
+  *  These ids exist only in-process and must never be sent to the web API. */
+ export const UNTRACKED_RUN_ID_PREFIX = 'untracked-'
+ 
++/** What a failed turn leaves at the end of the root's history. */
++export const TURN_FAILED_NOTE =
++  "The response failed with an error. The assistant's previous work has been preserved."
++export const USER_PROMPT_REFUSED_NOTE =
++  "The user's last message was too large to send, so it was not delivered."
++
+ export const runAgentStep = async (
+   params: {
+     userId: string | undefined
+     userInputId: string
+     clientSessionId: string
+     costMode?: string
+     fingerprintId: string
+     repoId: string | undefined
+     onResponseChunk: (chunk: string | PrintModeEvent) => void
+ 
+     agentType: AgentTemplateType
+     agentTemplate: AgentTemplate
+     fileContext: ProjectFileContext
+     agentState: AgentState
+     localAgentTemplates: Record<string, AgentTemplate>
+ 
+     prompt: string | undefined
+     spawnParams: Record<string, any> | undefined
+     system: string
+     n?: number
+ 
+     trackEvent: TrackEventFn
+     promptAiSdk: PromptAiSdkFn
+     traceWriter?: TraceWriter
+     onAgentUsageReceived?: (usage: AgentUsageData) => void
+@@ -1245,64 +1254,69 @@ export async function loopAgentSteps(
+         toolNames: agentTemplate.toolNames,
+         windowedFileReads: agentTemplate.windowedFileReads === true,
+         suppressCommitAttribution:
+           agentTemplate.suppressCommitAttribution === true,
+         additionalToolDefinitions: async () => {
+           if (!cachedAdditionalToolDefinitions) {
+             cachedAdditionalToolDefinitions = await additionalToolDefinitions({
+               ...params,
+               agentTemplate,
+             })
+           }
+           return cachedAdditionalToolDefinitions
+         },
+         agentTools,
+         skills: fileContext.skills ?? {},
+       })
+ 
+   const hasUserMessage =
+     !manualCompaction &&
+     Boolean(
+       prompt ||
+       (spawnParams && Object.keys(spawnParams).length > 0) ||
+       (content && content.length > 0),
+     )
+ 
+-  const initialMessages = buildArray<Message>(
+-    ...initialAgentState.messageHistory,
+-
+-    hasUserMessage && [
+-      {
++  // Named so that a size refusal can take it back out of the history.
++  const userPromptMessage: Message | undefined = hasUserMessage
++    ? {
+         // Actual user message!
+-        role: 'user' as const,
++        role: 'user',
+         content: buildUserMessageContent(prompt, spawnParams, content),
+         tags: ['USER_PROMPT'],
+         sentAt: Date.now(),
+ 
+         // James: Deprecate the below, only use tags, which are not prescriptive.
+         keepDuringTruncation: true,
+-      },
++      }
++    : undefined
++
++  const initialMessages = buildArray<Message>(
++    ...initialAgentState.messageHistory,
++
++    hasUserMessage && [
++      userPromptMessage,
+       prompt &&
+         prompt in additionalSystemPrompts &&
+         userMessage(
+           withSystemInstructionTags(
+             additionalSystemPrompts[
+               prompt as keyof typeof additionalSystemPrompts
+             ],
+           ),
+         ),
+       ,
+     ],
+ 
+     instructionsPrompt &&
+       userMessage({
+         content: instructionsPrompt,
+         tags: ['INSTRUCTIONS_PROMPT'],
+ 
+         // James: Deprecate the below, only use tags, which are not prescriptive.
+         keepLastTags: ['INSTRUCTIONS_PROMPT'],
+       }),
+   )
+ 
+   // Convert tools to a serializable format for context-pruner token counting
+   // Tool definitions live in agent state (persisted, snapshotted, shipped over
+   // the wire), so every inputSchema must be plain JSON Schema: Zod instances
+@@ -1351,59 +1365,52 @@ export async function loopAgentSteps(
+     })
+   }
+ 
+   let shouldEndTurn = false
+   let hasRetriedOutputSchema = false
+   let hasCheckedCompletion = false
+   // Only the first optional check may fall back to a completed answer. Once
+   // it produces text or invokes ANY tool, its findings/effects must be kept.
+   let completionCheckpoint: Message[] | undefined
+   let usedWorkTools = false
+   let deadlineReminderLevel = 0
+   let currentPrompt = prompt
+   let currentParams = spawnParams
+   let totalSteps = 0
+   let llmStepNumber = 0
+   let nResponses: string[] | undefined = undefined
+   let compactionWindow: CompactionWindow | undefined
+ 
+   try {
+     while (true) {
+       totalSteps++
+       if (signal.aborted) {
+         throw new AbortError()
+       }
+ 
+-      if (totalSteps === 1 && hasUserMessage) {
+-        assertUserContentSize(
+-          [
+-            userMessage({
+-              content: buildUserMessageContent(prompt, spawnParams, content),
+-            }),
+-          ],
+-          agentTemplate,
+-        )
++      if (totalSteps === 1 && userPromptMessage) {
++        assertUserContentSize([userPromptMessage], agentTemplate)
+       }
+ 
+       const startTime = new Date()
+ 
+       const stepPrompt = await getAgentPrompt({
+         ...params,
+         agentTemplate,
+         promptType: { type: 'stepPrompt' },
+         fileContext,
+         agentState: currentAgentState,
+         agentTemplates: localAgentTemplates,
+         logger,
+         additionalToolDefinitions: additionalToolDefinitionsWithCache,
+       })
+       const messagesWithStepPrompt = buildArray(
+         ...currentAgentState.messageHistory,
+         stepPrompt &&
+           userMessage({
+             content: stepPrompt,
+           }),
+       )
+ 
+       // Each completed response supplies the baseline. Only content added or
+       // removed since then (tools, steering, step scaffolding) is estimated.
+       currentAgentState.contextTokenCount = estimateContextTokens({
+@@ -1966,50 +1973,67 @@ export async function loopAgentSteps(
+     const apiErrorDetails = extractApiErrorDetails(error)
+     const isIdleTimeout = isFetchIdleTimeoutError(error)
+     const isNetworkError = !isIdleTimeout && isTransientNetworkError(error)
+     const isModelLoop =
+       error instanceof TodoLoopError || error instanceof FileEditLoopError
+     const hasServerMessage = apiErrorDetails.message !== undefined
+     let fallbackMessage: string
+     if (isModelLoop) {
+       fallbackMessage = error.message
+     } else if (isIdleTimeout) {
+       fallbackMessage = FETCH_IDLE_TIMEOUT_USER_MESSAGE
+     } else if (isNetworkError) {
+       fallbackMessage = TRANSIENT_NETWORK_ERROR_USER_MESSAGE
+     } else if (error instanceof Error) {
+       const includeStack =
+         apiErrorDetails.statusCode === undefined && error.stack
+       fallbackMessage =
+         error.message + (includeStack ? `\n\n${error.stack}` : '')
+     } else {
+       fallbackMessage = String(error)
+     }
+     const errorMessage = apiErrorDetails.message ?? fallbackMessage
+     const statusCode = apiErrorDetails.statusCode
+ 
+     const status = signal.aborted ? 'cancelled' : 'failed'
++    // A refused message is not kept: the next turn would send it anyway.
++    const refused =
++      error instanceof UserContentTooLargeError ? error.refused : undefined
++    if (refused)
++      currentAgentState.messageHistory =
++        currentAgentState.messageHistory.filter((m) => !refused.includes(m))
++    // End the failed turn in the root's history, as a cancellation is ended
++    // above: left bare, its prompt joins the next one in the live request
++    // that compaction keeps verbatim. A 402 propagates; the SDK ends it.
++    if (!initialAgentState.parentId && statusCode !== 402) {
++      currentAgentState.messageHistory = [
++        ...currentAgentState.messageHistory,
++        userMessage(
++          withSystemTags(refused ? USER_PROMPT_REFUSED_NOTE : TURN_FAILED_NOTE),
++        ),
++      ]
++    }
+     // A failed turn still leaves history behind, and the host still shows the
+     // user a context reading before their next message.
+     recountContextTokensForTurnEnd()
+     await finishAgentRun({
+       ...params,
+       runId,
+       status,
+       totalSteps,
+       directCredits: currentAgentState.directCreditsUsed,
+       totalCredits: currentAgentState.creditsUsed,
+       errorMessage,
+     })
+ 
+     // Payment required errors (402) should propagate
+     if (statusCode === 402) {
+       throw error
+     }
+ 
+     return {
+       agentState: currentAgentState,
+       output: {
+         type: 'error',
+         message:
+           hasServerMessage || isIdleTimeout || isNetworkError || isModelLoop
+             ? errorMessage
+diff --git a/packages/agent-runtime/src/util/context-size-guard.ts b/packages/agent-runtime/src/util/context-size-guard.ts
+index dcae669c9..17a394d0b 100644
+--- a/packages/agent-runtime/src/util/context-size-guard.ts
++++ b/packages/agent-runtime/src/util/context-size-guard.ts
+@@ -1,47 +1,59 @@
+ import { contextPrunerBudgetForModel } from '@codebuff/common/constants/model-config'
+ 
+ import { fitToolResults } from './fit-tool-results'
+ import { countTokensMessages } from './token-counter'
+ 
+ import type { AgentTemplate } from '@codebuff/common/types/agent-template'
+ import type {
+   Message,
+   ToolMessage,
+ } from '@codebuff/common/types/messages/codebuff-message'
+ 
+ type ContextPolicy = Pick<AgentTemplate, 'model' | 'compactContext'>
+ 
+ function contextBudget(template: ContextPolicy): number {
+   return (
+     (typeof template.compactContext === 'object'
+       ? template.compactContext.maxContextLength
+       : undefined) ?? contextPrunerBudgetForModel(template.model)
+   )
+ }
+ 
++/** The most new user content may hold, in estimated tokens, unless the
++ * model's context budget is smaller. */
++export const MAX_USER_CONTENT_TOKENS = 128_000
++
++/** `refused` is the content, which is never kept in history. */
++export class UserContentTooLargeError extends Error {
++  constructor(readonly refused: Message[]) {
++    super(
++      'The new message is too large. Send a smaller excerpt or attach a file instead.',
++    )
++  }
++}
++
+ /** New input is not covered by the previous receipt. Refuse oversized user
+  * content explicitly rather than silently changing a user's instructions. */
+ export function assertUserContentSize(
+   messages: Message[],
+   template: ContextPolicy,
+ ): void {
+   if (
+-    countTokensMessages(messages) > Math.min(128_000, contextBudget(template))
++    countTokensMessages(messages) >
++    Math.min(MAX_USER_CONTENT_TOKENS, contextBudget(template))
+   ) {
+-    throw new Error(
+-      'The new message is too large. Send a smaller excerpt or attach a file instead.',
+-    )
++    throw new UserContentTooLargeError(messages)
+   }
+ }
+ 
+ /** A tool already ran. Bound what enters context (including nested JSON), with
+  * the existing omission/re-read notices, without repeating its side effects. */
+ export function boundToolResult(
+   result: ToolMessage,
+   template: ContextPolicy,
+ ): ToolMessage {
+   return fitToolResults(
+     [result],
+     Math.min(64_000, Math.floor(contextBudget(template) / 4)),
+   )[0] as ToolMessage
+ }
