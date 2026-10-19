@@ -1,0 +1,447 @@
+diff --git a/common/src/util/__tests__/log-data.test.ts b/common/src/util/__tests__/log-data.test.ts
+index 8e82faf4b..b2d0083e8 100644
+--- a/common/src/util/__tests__/log-data.test.ts
++++ b/common/src/util/__tests__/log-data.test.ts
+@@ -36,56 +36,61 @@ describe('serializeLogData', () => {
+     )
+     const placeholders = Array.from({ length: 25_000 }, (_, i) => `$${i + 1}`)
+     const query = `insert into "ad_revenue_user_daily" values (${placeholders.join(', ')})`
+     const params = Array.from({ length: 25_000 }, (_, i) => `user-${i}`)
+     const error = Object.assign(
+       new Error(`Failed query: ${query}\nparams: ${params.join(',')}`, {
+         cause,
+       }),
+       { query, params },
+     )
+     const serialized = serializeLogData({ error })!
+     expect(serialized.length).toBeLessThan(10_000)
+     const row = JSON.parse(serialized)
+     expect(row._truncated).toBeUndefined()
+     expect(row.error.cause.code).toBe('23503')
+     expect(row.error.cause.constraint_name).toBe(
+       'ad_revenue_user_daily_user_id_fk',
+     )
+     expect(
+       row.error.query.startsWith('insert into "ad_revenue_user_daily"'),
+     ).toBe(true)
+     expect(row.error.params).toBe('[25000 params omitted]')
+     expect(row.error.message.length).toBeLessThan(2_100)
+   })
+ 
+-  test('a short failed query keeps its params', () => {
+-    const error = Object.assign(new Error('Failed query: select $1'), {
+-      query: 'select $1',
+-      params: ['x'],
+-    })
+-    expect(parse({ error }).error.params).toEqual(['x'])
++  // A failed auth insert's params are OAuth tokens (2026-10-19).
++  test('a short failed query drops its params everywhere', () => {
++    const error = Object.assign(
++      new Error(
++        'Failed query: insert into "account" values ($1)\nparams: ya29.secret',
++      ),
++      { query: 'insert into "account" values ($1)', params: ['ya29.secret'] },
++    )
++    const serialized = serializeLogData({ error })!
++    expect(serialized).not.toContain('ya29.secret')
++    expect(JSON.parse(serialized).error.params).toBe('[1 params omitted]')
+   })
+ 
+   test('trims a long stack', () => {
+     const error = new Error('deep')
+     error.stack = `Error: deep\n${'    at frame (file.ts:1:1)\n'.repeat(500)}`
+     expect(parse({ error }).error.stack.length).toBeLessThanOrEqual(2_000)
+   })
+ 
+   test('plain payloads are unchanged', () => {
+     expect(serializeLogData({ a: 1, b: 'two' })).toBe('{"a":1,"b":"two"}')
+     expect(serializeLogData('text')).toBe('text')
+     expect(serializeLogData(null)).toBeNull()
+   })
+ 
+   test('a circular error does not throw', () => {
+     const error = new Error('loop') as Error & { self?: unknown }
+     error.self = error
+     expect(parse({ error }).error.message).toBe('loop')
+   })
+ 
+   // The CLI's `Agent execution failed` line, as production emits it. Measured
+   // 2026-10-14: 171 of 281 rows in one hour (61%, 149 distinct users) reached
+   // Axiom with no queryable error, agent or run id, because `messageHistory`
+   // and `systemPrompt` alone run past the cap and the whole payload collapsed
+   // to one `preview` string.
+diff --git a/common/src/util/__tests__/log-redaction.test.ts b/common/src/util/__tests__/log-redaction.test.ts
+index 14274fb9b..b7738a1d5 100644
+--- a/common/src/util/__tests__/log-redaction.test.ts
++++ b/common/src/util/__tests__/log-redaction.test.ts
+@@ -1,32 +1,33 @@
+ import { APICallError } from 'ai'
+ import { describe, expect, test } from 'bun:test'
+ 
+ import { getErrorObject } from '../error'
+ import { serializeLogData } from '../log-data'
+ import {
+   redactHeadersForLog,
++  redactQueryErrorForLog,
+   redactUrlForLog,
+   summarizeRequestBodyForLog,
+ } from '../log-redaction'
+ 
+ const PROMPT = 'my private prompt about src/secret.ts'
+ 
+ function providerError() {
+   return new APICallError({
+     message: 'Bad Request',
+     url: 'https://user:pass@api.example.com/v1/chat/completions?key=sk-query',
+     requestBodyValues: {
+       model: 'byok-model',
+       messages: [
+         { role: 'system', content: 'system prompt' },
+         { role: 'user', content: PROMPT },
+       ],
+       tools: [],
+     },
+     statusCode: 400,
+     responseHeaders: {
+       'set-cookie': 'session=abc',
+       'x-api-key': 'sk-header',
+       'x-ratelimit-remaining-tokens': '1000',
+       'content-type': 'application/json',
+     },
+@@ -161,25 +162,74 @@ describe('serializeLogData on an AI SDK APICallError', () => {
+     expect(serialized).not.toContain('sk-query')
+     const { error } = JSON.parse(serialized)
+     expect(error.requestBodyValues).toMatchObject({
+       model: 'byok-model',
+       messageCount: 2,
+     })
+     expect(error.responseHeaders['content-type']).toBe('application/json')
+     expect(error.message).toBe('Bad Request')
+   })
+ 
+   // The Axiom / Convex-ingest path used to redact fewer fields than
+   // getErrorObject's raw dump (AB827V0 finding 342, 186 residual).
+   test('redacts request headers and a URL-valued path, like getErrorObject', () => {
+     const error = Object.assign(new Error('fetch failed'), {
+       requestHeaders: { authorization: 'Bearer sk-request-header' },
+       path: 'https://freebuff.com/api/auth/cli/status?fingerprintHash=fp-secret',
+     })
+     const serialized = serializeLogData({ error })!
+     expect(serialized).not.toContain('sk-request-header')
+     expect(serialized).not.toContain('fp-secret')
+     expect(JSON.parse(serialized).error.path).toBe(
+       'https://freebuff.com/api/auth/cli/status',
+     )
+   })
+ })
++
++describe('redactQueryErrorForLog', () => {
++  // freebuff-web's 2026-10-19 `LinkAccountError` line: drizzle's message
++  // carried the Google access token and ID token being inserted.
++  const query =
++    'insert into "account" ("userId", "access_token", "id_token") values ($1, $2, $3)'
++  const params = ['user-1', 'ya29.access-secret', 'eyJ.id-secret']
++  function queryError() {
++    const cause = Object.assign(new Error('duplicate key value'), {
++      code: '23505',
++    })
++    const error = new Error(`Failed query: ${query}\nparams: ${params}`, {
++      cause,
++    })
++    error.name = 'DrizzleQueryError'
++    return Object.assign(error, { query, params })
++  }
++
++  test('keeps the statement and cause, never the params', () => {
++    const redacted = redactQueryErrorForLog(queryError())
++    expect(redacted).toBeInstanceOf(Error)
++    expect(redacted.name).toBe('DrizzleQueryError')
++    expect(redacted.message).toBe(
++      `Failed query: ${query}\nparams: [3 params omitted]`,
++    )
++    expect(redacted.stack).toStartWith(`DrizzleQueryError: ${redacted.message}`)
++    expect(redacted.stack).toContain('    at ')
++    expect(redacted.query).toBe(query)
++    expect(redacted.params).toBe('[3 params omitted]' as never)
++    expect((redacted.cause as { code: string }).code).toBe('23505')
++    for (const out of [
++      JSON.stringify({ ...redacted }),
++      redacted.message,
++      redacted.stack,
++      serializeLogData({ error: queryError() }),
++      JSON.stringify(getErrorObject(queryError(), { includeRawError: true })),
++    ]) {
++      expect(out).not.toContain('ya29.access-secret')
++      expect(out).not.toContain('eyJ.id-secret')
++    }
++  })
++
++  test('returns any other value unchanged', () => {
++    const plain = new Error('boom')
++    expect(redactQueryErrorForLog(plain)).toBe(plain)
++    expect(redactQueryErrorForLog('text')).toBe('text')
++    expect(redactQueryErrorForLog(undefined)).toBeUndefined()
++  })
++})
+diff --git a/common/src/util/error.ts b/common/src/util/error.ts
+index 22c6daaa6..a9372e927 100644
+--- a/common/src/util/error.ts
++++ b/common/src/util/error.ts
+@@ -1,27 +1,28 @@
+ import {
+   redactErrorFieldForLog,
++  redactQueryErrorForLog,
+   redactUrlForLog,
+   summarizeRequestBodyForLog,
+ } from './log-redaction'
+ 
+ import type { RequestBodySummary } from './log-redaction'
+ 
+ export type ErrorOr<T, E extends ErrorObject = ErrorObject> =
+   | Success<T>
+   | Failure<E>
+ 
+ export type Success<T> = {
+   success: true
+   value: T
+ }
+ 
+ export type Failure<E extends ErrorObject = ErrorObject> = {
+   success: false
+   error: E
+ }
+ 
+ /**
+  * Result type for prompt functions that can be aborted.
+  * Provides rich semantics to distinguish between successful completion and user abort.
+  *
+  * ## When to use `PromptResult<T>` vs `ErrorOr<T>`
+@@ -544,53 +545,55 @@ function safeStringify(
+   redact?: (key: string, val: unknown) => unknown,
+ ): string | undefined {
+   if (value === undefined || value === null) return undefined
+   if (typeof value === 'string') return value.slice(0, maxLength)
+   try {
+     const seen = new WeakSet()
+     const str = JSON.stringify(
+       value,
+       (key, raw) => {
+         const val = redact ? redact(key, raw) : raw
+         if (typeof val === 'object' && val !== null) {
+           if (seen.has(val)) return '[Circular]'
+           seen.add(val)
+         }
+         return val
+       },
+       2,
+     )
+     return str?.slice(0, maxLength)
+   } catch {
+     return '[Unable to stringify]'
+   }
+ }
+ 
+ export function getErrorObject(
+-  error: unknown,
++  original: unknown,
+   options: { includeRawError?: boolean } = {},
+ ): ErrorObject {
++  // A drizzle query error's message, stack and `params` carry every bound value.
++  const error = redactQueryErrorForLog(original)
+   if (error instanceof Error) {
+     const extError = error as Error & Partial<ExtendedErrorProperties>
+ 
+     // Extract responseBody - could be string or object
+     let responseBody: string | undefined
+     if (extError.responseBody !== undefined) {
+       responseBody = safeStringify(extError.responseBody)
+     }
+ 
+     // Extract cause - recursively convert to ErrorObject if present
+     let cause: ErrorObject | undefined
+     if (extError.cause !== undefined) {
+       cause = getErrorObject(extError.cause, options)
+     }
+ 
+     return {
+       name: error.name,
+       message: error.message,
+       stack: error.stack,
+       status: typeof extError.status === 'number' ? extError.status : undefined,
+       statusCode:
+         typeof extError.statusCode === 'number'
+           ? extError.statusCode
+           : undefined,
+       code: typeof extError.code === 'string' ? extError.code : undefined,
+diff --git a/common/src/util/log-data.ts b/common/src/util/log-data.ts
+index 059381b10..1f8b129e1 100644
+--- a/common/src/util/log-data.ts
++++ b/common/src/util/log-data.ts
+@@ -1,96 +1,83 @@
+ import { MAX_LOG_DATA_BYTES } from '../schemas/logs'
+-import { redactErrorFieldForLog } from './log-redaction'
++import { redactErrorFieldForLog, redactQueryErrorForLog } from './log-redaction'
+ 
+ import type { LogLevel } from '../types/contracts/logs'
+ 
+ /**
+  * Shared pieces of the Axiom log-row pipeline used by every producer that
+  * ingests rows — the long-lived sink (packages/logging/src/sink.ts) and the
+  * Convex direct-ingest helper (freebuff/web/convex/lib/axiom_log.ts). Living
+  * here keeps the serialized `data` contract and level ordering identical
+  * across producers, so APL queries behave the same regardless of which
+  * service emitted a row. Deliberately light on imports (the schemas module
+  * pulls only zod) so it stays safe for the Convex bundle.
+  */
+ 
+ /** Numeric severity order for LogLevel, used for min-level gating. */
+ export const LOG_LEVEL_ORDER: Record<LogLevel, number> = {
+   debug: 10,
+   info: 20,
+   warn: 30,
+   error: 40,
+   fatal: 50,
+ }
+ 
+ /** Stack traces cost ingest on every error row; the top frames carry it. */
+ const MAX_ERROR_STACK_CHARS = 2_000
+ /** An error message or SQL statement longer than this is a payload, not a reason. */
+ const MAX_ERROR_MESSAGE_CHARS = 2_000
+ const MAX_ERROR_QUERY_CHARS = 500
+ 
+-function safeLength(value: unknown): number {
+-  try {
+-    return JSON.stringify(value)?.length ?? 0
+-  } catch {
+-    return Number.POSITIVE_INFINITY
+-  }
+-}
+-
+ function clip(text: string, max: number): string {
+   return text.length > max
+     ? `${text.slice(0, max)}… [${text.length - max} chars omitted]`
+     : text
+ }
+ 
+ /**
+  * An Error as plain JSON. `name`, `message` and `stack` are non-enumerable, so
+  * `JSON.stringify(error)` is `{}`: every `logger.error({ error }, ...)` whose
+  * error reached this serializer arrived in Axiom with no reason attached (on
+  * 2026-09-27, 119 error/warn rows a day on freebuff-web alone, and the
+  * Imprezia ingest's refusals for nine days). Enumerable fields a library adds
+  * (`code`, `status`, a driver's `query`) are kept, and `cause` is walked by the
+  * same replacer.
+  */
+-function errorToJson(error: Error): Record<string, unknown> {
++function errorToJson(original: Error): Record<string, unknown> {
++  // A drizzle `DrizzleQueryError` carries the whole statement as `query`, and
++  // every bound value as `params` and again in `message` and `stack`. The
++  // values can be credentials (OAuth tokens on an auth insert), so they are
++  // never logged; for a bulk insert they were also hundreds of KB: the
++  // ad-revenue rollup's 2026-10-02 failure logged 522 KB, the row was cut at
++  // MAX_LOG_DATA_BYTES, and the `cause` holding the Postgres reason came after
++  // the cut. Keep the head of the statement and the cause.
++  const error = redactQueryErrorForLog(original)
+   const fields: Record<string, unknown> = { ...error }
+-  // A drizzle `DrizzleQueryError` carries the whole statement as `query`, every
+-  // bound value as `params`, and both again in `message`. For a bulk insert
+-  // that is hundreds of KB: the ad-revenue rollup's 2026-10-02 failure logged
+-  // 522 KB, the row was cut at MAX_LOG_DATA_BYTES, and the `cause` holding the
+-  // Postgres reason came after the cut, so it never reached Axiom. Keep the
+-  // head of the statement, replace a long param list with its count, and keep
+-  // the cause.
+   if (typeof fields.query === 'string') {
+     fields.query = clip(fields.query, MAX_ERROR_QUERY_CHARS)
+   }
+-  if (
+-    Array.isArray(fields.params) &&
+-    safeLength(fields.params) > MAX_ERROR_QUERY_CHARS
+-  ) {
+-    fields.params = `[${fields.params.length} params omitted]`
+-  }
+   // An AI SDK `APICallError` carries the whole LLM request (every message),
+   // both header sets and the URL, and Bun's fetch errors the URL as `path`:
+   // keep their shape, never the prompt or a key. The same function redacts
+   // `getErrorObject`'s raw dump, so the two paths cannot drift apart.
+   for (const key of Object.keys(fields)) {
+     fields[key] = redactErrorFieldForLog(key, fields[key])
+   }
+   return {
+     ...fields,
+     name: error.name,
+     message: clip(error.message, MAX_ERROR_MESSAGE_CHARS),
+     ...(error.stack
+       ? { stack: error.stack.slice(0, MAX_ERROR_STACK_CHARS) }
+       : {}),
+     ...(error.cause !== undefined ? { cause: error.cause } : {}),
+   }
+ }
+ 
+ /** Stringify a log payload, tolerating circular refs and unwrapping Errors. */
+ export function stringifyLogData(data: unknown): string | undefined {
+   try {
+     const seen = new WeakSet()
+     return JSON.stringify(data, (_k, v) => {
+       if (typeof v === 'object' && v !== null) {
+         if (seen.has(v)) return '[Circular]'
+diff --git a/common/src/util/log-redaction.ts b/common/src/util/log-redaction.ts
+index e96369d97..99922375b 100644
+--- a/common/src/util/log-redaction.ts
++++ b/common/src/util/log-redaction.ts
+@@ -99,25 +99,56 @@ const URL_LIKE = /^[a-z][a-z0-9+.-]*:\/\//i
+  * One field of a serialized error, redacted by name: an AI SDK `APICallError`
+  * carries the whole request body and both header sets, and Bun's fetch errors
+  * carry the request URL as `path`. Every error serializer (`getErrorObject`'s
+  * raw dump, the Axiom and Convex-ingest log data) goes through this one
+  * function, so a field redacted on one path cannot leak on another.
+  */
+ export function redactErrorFieldForLog(key: string, val: unknown): unknown {
+   if (key === 'requestBodyValues') return summarizeRequestBodyForLog(val)
+   if (
+     key === 'requestHeaders' ||
+     key === 'responseHeaders' ||
+     key === 'headers'
+   ) {
+     return redactHeadersForLog(val) ?? val
+   }
+   // `url` is always a URL; `path` is also a filesystem path on other errors,
+   // so it is rewritten only when it is one.
+   if (
+     typeof val === 'string' &&
+     (key === 'url' || (key === 'path' && URL_LIKE.test(val)))
+   ) {
+     return redactUrlForLog(val)
+   }
+   return val
+ }
++
++const QUERY_PARAMS_MARKER = '\nparams: '
++
++/**
++ * A drizzle `DrizzleQueryError` without its bound values. Drizzle writes every
++ * param into `message` (and so into `stack`) as well as `params`, and the
++ * values of an auth write are credentials: on 2026-10-19 freebuff-web logged a
++ * Google access token and ID token from a failed `linkAccount` insert. The
++ * statement and the `cause` holding the Postgres reason are kept; the params
++ * become their count. Any other value is returned unchanged.
++ */
++export function redactQueryErrorForLog<T>(error: T): T {
++  if (!(error instanceof Error)) return error
++  const fields = error as Error & { query?: unknown; params?: unknown }
++  if (typeof fields.query !== 'string' || !('params' in fields)) return error
++  const marker = error.message.indexOf(QUERY_PARAMS_MARKER)
++  const count = Array.isArray(fields.params) ? fields.params.length : 0
++  const omitted = `[${count} params omitted]`
++  const message =
++    marker === -1
++      ? error.message
++      : `${error.message.slice(0, marker)}${QUERY_PARAMS_MARKER}${omitted}`
++  const redacted = new Error(message, { cause: error.cause })
++  Object.assign(redacted, error, { params: omitted })
++  redacted.name = error.name
++  redacted.stack =
++    error.stack && error.stack.includes(error.message)
++      ? error.stack.replace(error.message, () => message)
++      : `${error.name}: ${message}`
++  return redacted as T
++}
