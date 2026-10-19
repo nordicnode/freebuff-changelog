@@ -1,0 +1,1762 @@
+Date: 2026-10-19T14:39:28Z
+Category: SDK
+Areas: Shared/Core, Docs, SDK
+Commit nature: production
+Stats: +218 / -56
+Analysis notes: Shared/Core, Docs, SDK changes across 3 file(s) (+218/−56).
+Modified files: common/src/project-file-tree.ts, docs/agents-and-tools.md, sdk/src/tools/read-files.ts
+Key facts (ground the WHY and DETAIL sentences in these): - Explicit reads skip Git/discovery exclusions, but keep agent-owned ignore rules. - Otherwise explicit reads honor agent ignore files, not discovery exclusions. - Explicit reads may name Git-ignored artifacts. Keep the full discovery policy for env templates and the background project-understanding agent. - Allow the env template past built-in rules while strictly applying project rules. - If the caller provides a filter, they own additional filtering decisions.
+Structured facts (extracted mechanically from the diff; copy names and values verbatim, never round or rename):
+- Behavior asserted by new tests (test titles, verbatim; the hunks themselves are omitted): "explicit text and image reads succeed while discovery still excludes ignored artifacts" ; "explicit reads retain agent ignore files, including nested rules" ; "sensitive env files and ignored env templates stay blocked, including image-shaped env names" ; "background project understanding still refuses gitignored text" ; "agent ignore blocking" ; "should return IGNORED for files excluded by agent ignore rules" ; "default agent ignore behavior" ; "should honor agent ignore rules when no fileFilter is provided" ; "applies the agent ignore and filter policy of read_files"
+Module & File Purpose (ground-truth documentation from touched files):
+- File `common/src/project-file-tree.ts`:
+```
+/**
+ * Logs file tree errors in debug mode only.
+ * Errors are logged but not thrown to preserve tree-building behavior.
+ *
+ * File tree operations commonly encounter expected errors (permissions,
+ * deleted files) that are not fatal. We only log in debug mode to avoid
+ * noisy output during normal operation.
+ */
+```
+- File `docs/agents-and-tools.md`:
+```
+# Agents and Tools
+
+## Agents
+
+- Prompt/programmatic agents live in `.agents/` (programmatic agents use `handleSteps` generators).
+- Generator functions are NOT sandboxed: the runtime `eval`s a `handleSteps` source string in the process that runs the agent (`packages/agent-runtime/src/run-programmatic-step.ts`); agent templates define tool access and subagents.
+
+### Registry agents with executable `handleSteps` require publisher trust
+
+A template fetched from the public agent registry (`--agent publisher/agent`, a
+registry id in a local agent's `spawnableAgents`, or a bare id falling back to
+`codebuff/<id>`) is executable code when it carries `handleSteps`: the row's
+`handleSteps` is a source string, validation only checks that it starts with
+`function*`, and the runtime evals it with no isolation on the user's machine.
+The registry GET is public, any account can create a publisher and publish
+without review, and `latest` is unpinned. So the SDK's `fetchAgentFromDatabase`
+refuses a registry template with a string `handleSteps` unless its publisher is
+trusted (`sdk/src/agent-publisher-trust.ts`), and throws an
+`UntrustedAgentPublisherError` whose message names `publisher/agent@version`
+and the knob to set. Trusted publishers are `codebuff` (our own, also bundled)
+plus the comma-separated `CODEBUFF_TRUSTED_AGENT_PUBLISHERS` env var plus the
+`trustedAgentPublishers` option on `CodebuffClient` / `run()`. Data-only
+registry templates (no `handleSteps`) load as before, and local `.agents` files
+and SDK `agentDefinitions` are never gated — they are code the user already
+chose to run. This is a trust floor, not isolation: sandboxing the eval,
+```
+Subsystem Architecture Documentation (from nearby package guides):
+- From `sdk/README.md`:
+```markdown
+# @codebuff/sdk
+
+Official SDK for Codebuff - AI coding agent and framework
+
+## Installation
+
+```bash
+npm install @codebuff/sdk
+```
+
+## Prerequisites
+
+- Create a Codebuff account and get your [Codebuff API key here](https://www.codebuff.com/api-keys).
+
+## Usage
+
+### Basic Example
+
+```typescript
+import { CodebuffClient } from '@codebuff/sdk'
+
+async function main() {
+  const client = new CodebuffClient({
+    //[freebuff product prompt text omitted]
+    // Get one here: https://www.codebuff.com/api-keys
+    apiKey: process.env.CODEBUFF_API_KEY,
+    cwd: process.cwd(),
+  })
+
+  // First run
+  const runState1 = await client.run({
+    // The agent id. Any agent on the store (https://codebuff.com/store)
+    agent: 'codebuff/base@0.0.16',
+    prompt: 'Create a simple calculator class',
+    handleEvent: (event) => {
+      // All events that happen during the run: agent start/finish, tool calls/results, text responses, errors.
+      console.log('Codebuff Event', JSON.stringify(event))
+    },
+  })
+
+  // Continue the same session with a follow-up
+  const runOrError2 = await client.run({
+    agent: 'codebuff/base@0.0.16',
+    prompt: 'Add unit tests for the calculator',
+    previousRun: runState1, // <-- this is where your next run differs from the previous run
+    handleEvent: (event) => {
+      console.log('Codebuff Event', JSON.stringify(event))
+    },
+  })
+}
+
+main()
+```
+
+### Example 2: Custom Agents and Tools
+
+Here, we create a full agent and custom tools that can be reused between runs.
+
+```typescript
+import { z } from 'zod/v4'
+
+import { CodebuffClient, getCustomToolDefinition } from '@codebuff/sdk'
+
+import type { AgentDefinition } from '@codebuff/sdk'
+
+async function main() {
+  const client = new CodebuffClient({
+    //[freebuff product prompt text omitted]
+    // Get it here: https://www.codebuff.com/profile?tab=api-keys
+    apiKey: process.env.CODEBUFF_API_KEY,
+    // Optional directory agent runs from (if applicable).
+    cwd: process.cwd(),
+  })
+
+  // Define your own custom agents!
+  const myCustomAgent: AgentDefinition = {
+    id: 'my-custom-agent',
+    model: 'google/gemini-3.1-flash-lite',
+    displayName: 'Sentiment analyzer',
+    toolNames: ['fetch_api_data'], // Defined below!
+```
+Complete Source of Modified Files (for complete module context):
+- File `common/src/project-file-tree.ts` (371 lines):
+```
+import path from 'path'
+
+import * as ignore from 'ignore'
+import { sortBy } from 'lodash'
+
+import { DEFAULT_IGNORED_PATHS } from './constants/paths'
+import { isEnvTemplateFilePath } from './util/env-file-path'
+import { fileExists, isValidProjectRoot } from './util/file'
+import { isPathInside } from './util/path'
+import {
+  addIgnoreFileContents,
+  isIgnoredByIgnoreChain,
+  PROJECT_IGNORE_FILES,
+} from './util/project-ignore'
+
+import type { CodebuffFileSystem } from './types/filesystem'
+import type { DirectoryNode, FileTreeNode } from './util/file'
+import type { DirIgnore } from './util/project-ignore'
+
+/**
+ * Logs file tree errors in debug mode only.
+ * Errors are logged but not thrown to preserve tree-building behavior.
+ *
+ * File tree operations commonly encounter expected errors (permissions,
+ * deleted files) that are not fatal. We only log in debug mode to avoid
+ * noisy output during normal operation.
+ */
+function logFileTreeError(
+  operation: string,
+  filePath: string,
+  error: unknown,
+): void {
+  // Only log in debug mode to avoid noisy output
+  if (!process.env.DEBUG && !process.env.CODEBUFF_DEBUG) {
+    return
+  }
+
+  const err = error as { code?: string } | undefined
+  const code = err?.code
+  const errorMessage = error instanceof Error ? error.message : String(error)
+
+  console.debug(
+    `[FileTree] ${operation} failed for "${filePath}"${
+      code ? ` (${code})` : ''
+    }: ${errorMessage}`,
+  )
+}
+
+export const DEFAULT_MAX_FILES = 10_000
+
+/**
+ * Everything downstream of the file tree is POSIX-only: `ignore` matches
+ * nothing but forward slashes, and glob patterns come from the model in that
+ * form too. `path.relative` returns backslashes on Windows, and `ignore`
+ * answers `false` for them instead of throwing — so nested rules like `build/`
+ * or `node_modules` silently stop pruning and the crawl burns its file budget
+ * on build output before it ever reaches the source tree.
+ */
+function toPosixPath(p: string): string {
+  return p.replace(/\\/g, '/')
+}
+
+function createDefaultIgnore(allowEnvTemplate = false): ignore.Ignore {
+  const defaultIgnore = ignore.default()
+  for (const pattern of DEFAULT_IGNORED_PATHS) {
+    if (allowEnvTemplate && (pattern === '.env' || pattern === '.env.*')) {
+      continue
+    }
+    defaultIgnore.add(pattern)
+  }
+  return defaultIgnore
+}
+
+// When the project root is the home directory (or an ancestor), a full scan
+// could crawl the user's entire disk. Instead of disabling the file tree
+// entirely, do a shallow capped scan so @ mentions still surface
+// `project/docs/file.md`-style paths.
+export const SHALLOW_SCAN_MAX_DEPTH = 3
+const SHALLOW_SCAN_MAX_FILES = 2_000
+const SHALLOW_SCAN_MAX_DIRS = 500
+
+/** Whether `getProjectFileTree` will shallow-scan this root (see above). */
+export function isShallowScanRoot(
+  projectRoot: string | undefined,
+): projectRoot is string {
+  return !!projectRoot && !isValidProjectRoot(projectRoot)
+}
+
+export async function getProjectFileTree(params: {
+  projectRoot: string
+  maxFiles?: number
+  fs: CodebuffFileSystem
+  /**
+   * Gitignore-style patterns skipped during the walk, on top of the defaults,
+   * so what they hide is never counted against `maxFiles`.
+   */
+  extraIgnore?: readonly string[]
+}): Promise<FileTreeNode[]> {
+  const withDefaults = { maxFiles: DEFAULT_MAX_FILES, ...params }
+  const { projectRoot, fs } = withDefaults
+  let { maxFiles } = withDefaults
+  let maxDepth = Infinity
+  let maxDirs = Infinity
+
+  const _start = Date.now()
+  const defaultIgnore = createDefaultIgnore()
+  for (const pattern of params.extraIgnore ?? []) defaultIgnore.add(pattern)
+
+  if (isShallowScanRoot(projectRoot)) {
+    defaultIgnore.add('.*')
+    maxDepth = SHALLOW_SCAN_MAX_DEPTH
+    maxFiles = Math.min(maxFiles, SHALLOW_SCAN_MAX_FILES)
+    maxDirs = SHALLOW_SCAN_MAX_DIRS
+  }
+
+  const root: DirectoryNode = {
+    name: path.basename(projectRoot),
+    type: 'directory',
+    children: [],
+    filePath: '',
+  }
+  const queue: {
+    node: DirectoryNode
+    fullPath: string
+    ignores: DirIgnore[]
+    depth: number
+  }[] = [
+    {
+      node: root,
+      fullPath: projectRoot,
+      ignores: [{ base: '', ig: defaultIgnore }],
+      depth: 0,
+    },
+  ]
+  let totalFiles = 0
+  let dirsScanned = 0
+
+  while (queue.length > 0 && totalFiles < maxFiles && dirsScanned < maxDirs) {
+    const { node, fullPath, ignores, depth } = queue.shift()!
+    dirsScanned++
+    const dirIgnores = [
+      ...ignores,
+      {
+        base: toPosixPath(path.relative(projectRoot, fullPath)),
+        ig: await parseGitignore({ fullDirPath: fullPath, fs }),
+      },
+    ]
+
+    try {
+      const files = await fs.readdir(fullPath)
+      for (const file of files) {
+        if (totalFiles >= maxFiles) break
+
+        const filePath = path.join(fullPath, file)
+        const relativeFilePath = toPosixPath(path.relative(projectRoot, filePath))
+
+        if (isIgnoredByIgnoreChain(dirIgnores, relativeFilePath)) continue
+
+        try {
+          const stats = await fs.stat(filePath)
+          if (stats.isDirectory()) {
+            const childNode: DirectoryNode = {
+              name: file,
+              type: 'directory',
+              children: [],
+              filePath: relativeFilePath,
+            }
+            node.children.push(childNode)
+            // Past maxDepth the directory still shows up as a node above, but
+            // its contents are not scanned.
+            if (depth + 1 < maxDepth) {
+              queue.push({
+                node: childNode,
+                fullPath: filePath,
+                ignores: dirIgnores,
+                depth: depth + 1,
+              })
+            }
+          } else {
+            const lastReadTime = stats.atimeMs
+            node.children.push({
+              name: file,
+              type: 'file',
+              lastReadTime,
+              filePath: relativeFilePath,
+            })
+            totalFiles++
+          }
+        } catch (error: unknown) {
+          // File may be inaccessible due to permissions or may have been deleted.
+          // Log with context for debugging, but continue building the tree.
+          logFileTreeError('fs.stat', filePath, error)
+        }
+      }
+    } catch (error: unknown) {
+      // Directory may be inaccessible due to permissions.
+      // Log with context for debugging, but continue building the tree.
+      logFileTreeError('fs.readdir', fullPath, error)
+    }
+  }
+  return root.children
+}
+
+async function parseGitignoreWithMode(params: {
+  fullDirPath: string
+  fs: CodebuffFileSystem
+  throwOnReadError: boolean
+  explicitRead?: boolean
+}): Promise<ignore.Ignore> {
+  const { fullDirPath, fs, throwOnReadError, explicitRead = false } = params
+
+  const ig = ignore.default()
+  const directoryEntries = throwOnReadError
+    ? new Set(await fs.readdir(fullDirPath))
+    : undefined
+
+  for (const fileName of PROJECT_IGNORE_FILES) {
+    if (explicitRead && fileName === '.gitignore') continue
+    const ignoreFilePath = path.join(fullDirPath, fileName)
+    if (directoryEntries) {
+      if (!directoryEntries.has(fileName)) continue
+    } else {
+      const ignoreFileExists = await fileExists({ filePath: ignoreFilePath, fs })
+      if (!ignoreFileExists) continue
+    }
+
+    let ignoreContent: string
+    try {
+      ignoreContent = await fs.readFile(ignoreFilePath, 'utf8')
+    } catch (error: unknown) {
+      // Resilient file-tree callers continue without unreadable rules. Access
+      // checks can opt into throwing so their caller can fail closed.
+      logFileTreeError('fs.readFile (ignore file)', ignoreFilePath, error)
+      if (throwOnReadError) throw error
+      continue
+    }
+    addIgnoreFileContents(ig, ignoreContent, (pattern, error) =>
+      logFileTreeError('ignore.add (pattern)', pattern, error),
+    )
+  }
+
+  return ig
+}
+
+export async function parseGitignore(params: {
+  fullDirPath: string
+  fs: CodebuffFileSystem
+}): Promise<ignore.Ignore> {
+  return parseGitignoreWithMode({ ...params, throwOnReadError: false })
+}
+
+export function getAllFilePaths(
+  nodes: FileTreeNode[],
+  basePath: string = '',
+): string[] {
+  return nodes.flatMap((node) => {
+    if (node.type === 'file') {
+      return [path.join(basePath, node.name)]
+    }
+    return getAllFilePaths(node.children || [], path.join(basePath, node.name))
+  })
+}
+
+export interface PathInfo {
+  path: string
+  isDirectory: boolean
+}
+
+export function getAllPathsWithDirectories(
+  nodes: FileTreeNode[],
+  basePath: string = '',
+): PathInfo[] {
+  return nodes.flatMap((node) => {
+    const nodePath = basePath ? path.join(basePath, node.name) : node.name
+    if (node.type === 'file') {
+      return [{ path: nodePath, isDirectory: false }]
+    }
+    // Include the directory itself, plus recurse into children
+    const dirEntry: PathInfo = { path: nodePath, isDirectory: true }
+    const children = getAllPathsWithDirectories(node.children || [], nodePath)
+    return [dirEntry, ...children]
+  })
+}
+
+export function flattenTree(nodes: FileTreeNode[]): FileTreeNode[] {
+  return nodes.flatMap((node) => {
+    if (node.type === 'file') {
+      return [node]
+    }
+    return flattenTree(node.children ?? [])
+  })
+}
+
+export function getLastReadFilePaths(
+  flattenedNodes: FileTreeNode[],
+  count: number,
+) {
+  return sortBy(
+    flattenedNodes.filter((node) => node.lastReadTime),
+    'lastReadTime',
+  )
+    .reverse()
+    .slice(0, count)
+    .map((node) => node.filePath)
+}
+
+export async function isFileIgnored(params: {
+  filePath: string
+  projectRoot: string
+  fs: CodebuffFileSystem
+  /** Allow the env template past built-in rules while strictly applying project rules. */
+  allowEnvTemplate?: boolean
+  /** Explicit reads skip Git/discovery exclusions, but keep agent-owned ignore rules. */
+  explicitRead?: boolean
+}): Promise<boolean> {
+  const {
+    filePath,
+    projectRoot,
+    fs,
+    allowEnvTemplate: allowEnvTemplateRequested = false,
+    explicitRead = false,
+  } = params
+  const allowEnvTemplate =
+    allowEnvTemplateRequested && isEnvTemplateFilePath(filePath)
+
+  const resolvedProjectRoot = path.resolve(projectRoot)
+  const fullFilePath = path.resolve(resolvedProjectRoot, filePath)
+  if (!isPathInside(resolvedProjectRoot, fullFilePath)) return false
+
+  const defaultIgnore =
+    explicitRead && !allowEnvTemplate
+      ? ignore.default()
+      : createDefaultIgnore(allowEnvTemplate)
+
+  const relativeFilePath = toPosixPath(
+    path.relative(resolvedProjectRoot, fullFilePath),
+  )
+
+  // Get ignore patterns from the directory containing the file and all parent directories
+  const dirIgnores: DirIgnore[] = []
+  let currentDir = path.dirname(fullFilePath)
+  while (true) {
+    let ig: ignore.Ignore
+    try {
+      ig = await parseGitignoreWithMode({
+        fullDirPath: currentDir,
+        fs,
+        throwOnReadError: allowEnvTemplate,
+        explicitRead: explicitRead && !allowEnvTemplate,
+      })
+    } catch (error) {
+      if (allowEnvTemplate) return true
+      throw error
+    }
+    dirIgnores.push({
+      base: toPosixPath(path.relative(resolvedProjectRoot, currentDir)),
+      ig,
+    })
+    if (path.relative(resolvedProjectRoot, currentDir) === '') break
+
+    const parentDir = path.dirname(currentDir)
+    if (parentDir === currentDir) break
+    currentDir = parentDir
+  }
+
+  return isIgnoredByIgnoreChain(
+    [{ base: '', ig: defaultIgnore }, ...dirIgnores.reverse()],
+    relativeFilePath,
+  )
+}
+```
+- File `docs/agents-and-tools.md` (161 lines):
+```
+# Agents and Tools
+
+## Agents
+
+- Prompt/programmatic agents live in `.agents/` (programmatic agents use `handleSteps` generators).
+- Generator functions are NOT sandboxed: the runtime `eval`s a `handleSteps` source string in the process that runs the agent (`packages/agent-runtime/src/run-programmatic-step.ts`); agent templates define tool access and subagents.
+
+### Registry agents with executable `handleSteps` require publisher trust
+
+A template fetched from the public agent registry (`--agent publisher/agent`, a
+registry id in a local agent's `spawnableAgents`, or a bare id falling back to
+`codebuff/<id>`) is executable code when it carries `handleSteps`: the row's
+`handleSteps` is a source string, validation only checks that it starts with
+`function*`, and the runtime evals it with no isolation on the user's machine.
+The registry GET is public, any account can create a publisher and publish
+without review, and `latest` is unpinned. So the SDK's `fetchAgentFromDatabase`
+refuses a registry template with a string `handleSteps` unless its publisher is
+trusted (`sdk/src/agent-publisher-trust.ts`), and throws an
+`UntrustedAgentPublisherError` whose message names `publisher/agent@version`
+and the knob to set. Trusted publishers are `codebuff` (our own, also bundled)
+plus the comma-separated `CODEBUFF_TRUSTED_AGENT_PUBLISHERS` env var plus the
+`trustedAgentPublishers` option on `CodebuffClient` / `run()`. Data-only
+registry templates (no `handleSteps`) load as before, and local `.agents` files
+and SDK `agentDefinitions` are never gated — they are code the user already
+chose to run. This is a trust floor, not isolation: sandboxing the eval,
+signing templates and pinning `latest` are separate work.
+
+Clients released before this gate (`codebuff` and `@codebuff/sdk` on npm) eval
+whatever the registry returns, so the registry GET routes refuse (403) a
+non-`codebuff` template with `handleSteps` unless the request carries
+`AGENT_TRUST_GATE_HEADER` (`common/src/constants/agents.ts`), which only the
+gated SDK sends (`untrustedHandleStepsRefusal` in
+`web/src/app/api/agents/_registry-guard.ts`). The server cannot see the
+caller's trusted set, so the header defers that decision to the client.
+`mcpServers` from non-`codebuff` publishers are refused outright, at publish
+and at GET, whatever the client.
+
+### Trust gate for repository `.agents` directories
+
+`loadLocalAgents` dynamically imports every `.ts`/`.tsx`/`.js`/`.mjs`/`.cjs`
+file under `{cwd}/.agents` and `{cwd}/../.agents`, and `loadMCPConfigSync`
+reads an `mcp.json` there whose stdio servers are spawned on the first prompt
+with `$VAR` env values filled from the CLI's own environment. Both execute
+repository-supplied code, so cloning a hostile repo and running the CLI inside
+it must not run anything without consent. The CLI therefore gates those two
+repository-scoped directories (`cli/src/utils/agent-dir-trust.ts`):
+
+- **What needs trust**: a directory containing at least one executable agent
+  file (the loader's extension filter, minus `.d.ts` and tests) or an
+  `mcp.json`. A directory holding only `skills/` markdown does not, and
+  `~/.agents` never does (it is the user's own). Skills still load from an
+  untrusted directory; only agents and `mcp.json` are withheld.
+- **The prompt**: on an interactive launch (stdin and stdout are TTYs) the CLI
+  prints a plain-terminal prompt before the TUI mounts, listing the directory,
+  its agent files (capped at 10) and the commands or URLs its `mcp.json` would
+  start, and asks `Load and run these? [y/N]`. `y` records the directory;
+  anything else skips it for this run and prints how to trust it later.
+- **The store**: `<configDir>/trusted-agent-dirs.json` (next to
+  `credentials.json`, written with mode `0600`), a map of the normalized
+  absolute directory path to `{ "trustedAt": "<ISO>" }`. Delete an entry to
+  be asked again.
+- **Non-interactive runs** (no TTY, CI) never prompt: the directory is skipped
+  with a warning unless `CODEBUFF_TRUST_AGENT_DIRS=1` or `--trust-agents` is
+  passed, which trusts every repository directory for that run only and writes
+  nothing to the store.
+- **SDK semantics are unchanged**: `loadLocalAgents({ agentDirs })` and
+  `loadMCPConfig{,Sync}({ configDirs })` are opt-in options; omitting them
+  keeps the default search, so Desktop and external SDK consumers behave as
+  before. `getDefaultAgentDirs()` and `listLocalAgentFiles()` are exported so a
+  host can build its own gate on the loader's own filter.
+
+Trust is per directory, not per file content: a trusted repository that later
+pulls a malicious agent file is loaded without a new prompt, the same trade-off
+other coding agents make for their project-level config.
+
+### Shell Shims
+
+Direct commands without `codebuff` prefix:
+
+```bash
+codebuff shims install codebuff/base-lite@1.0.0
+eval "$(codebuff shims env)"
+base-lite "fix this bug"
+```
+
+## Tools
+
+- Tool definitions live in `common/src/tools` and are executed via the SDK helpers + agent-runtime.
+
+### Skill resource paths
+
+Both the runtime `skill` tool and CLI `/skill:<name>` prompts use
+`common/src/util/skills.ts` → `formatSkillContent` to include the loaded skill's
+base directory. Bundled `scripts/`, `references/`, and `assets/` paths resolve
+against that directory, not the project cwd. Windows separators are normalized
+to forward slashes for file tools and Git Bash. Keep this context on both entry
+paths: the loader knows `filePath`, but raw SKILL.md content alone loses it and
+leaves the agent searching for resources it already loaded instructions for.
+
+### Explicit file reads versus discovery
+
+The SDK's `read_files` reads explicitly named text and images even when
+`.gitignore` or built-in discovery exclusions hide them (for example,
+`sandbox/` renders or dependency source). File-tree discovery and background
+project-understanding reads still apply those exclusions. Explicit reads honor
+`.codebuffignore` / `.manicodeignore` and caller-provided file filters; sensitive
+`.env` files remain blocked, and env templates still obey all project ignore
+rules. `.freebuffignore` controls workspace transfers, not this read policy.
+
+### Cut-off file edits are refused, never repaired
+
+`packages/agent-runtime/src/util/truncated-write-guard.ts` stops two shapes of
+a file edit that was cut off mid-generation:
+
+- **Arguments that never closed.** When a response hits the output limit (or
+  loses its connection) inside a tool call, the OpenAI-compatible provider
+  still flushes the call with whatever argument text arrived, and OpenRouter
+  reports the step as `finish_reason: "tool_calls"` (the real reason is only in
+  `native_finish_reason: "max_output_tokens"`). `parseRawToolCall` recognises
+  a truncated JSON prefix and answers with an explicit "nothing was written"
+  error instead of the generic re-issue hint, and does not echo the partial
+ [freebuff product prompt text omitted]
+  cut-off `content` string is exactly how a file gets truncated on disk.
+- **A cut-off copy of an existing file.** `processFileBlock` refuses a
+  `write_file` that is under 60% of an existing file of 30+ lines AND leaves
+  brackets open where the current file balances them. Both refusals log
+  `axiomEvent: file_write_guard` (`metric` says which).
+
+The finish reason is deliberately not the signal: complete arguments in a
+length-cut step are a complete call, and the OpenRouter shape above hides the
+length cut anyway.
+
+### Console-free terminal command broker
+
+`run_terminal_command` separates process ownership from terminal UI ownership:
+
+- `sdk/src/tools/run-terminal-command.ts` owns output buffering, timeouts,
+  cancellation escalation, results, and process diagnostics. Headless SDK
+  consumers use its direct process-group runner.
+- Interactive hosts provide `terminalCommandBroker` in `CodebuffClientOptions`
+  (or directly to `runTerminalCommand`). Each call synchronously starts an
+  isolated helper and returns a handle for its complete process tree. A startup
+  failure prevents the shell from running; there is no direct-console fallback.
+- The CLI's tiny `src/entry.ts` handles private broker mode before importing
+  React or OpenTUI. The detached, hidden helper receives one spawn request over
+  stdin, starts the shell without a console or interactive stdin, relays only
+  stdout/stderr pipes, and reports completion through a constrained one-shot
+  file in the OS temp directory. It deliberately uses only the three standard
+  stdio channels: Bun's custom child-process pipes can fail their Windows
+  `node:net` handshake outside the `ChildProcess` error event and terminate the
+  CLI as an unhandled rejection. The broker remains the process-group root and
+  self-reaps the tree if its parent disappears, detected by polling the parent
+  PID rather than holding another pipe open.
+- Mouse and focus protocols stay enabled while commands run. The
+  `TerminalProtocolController` only parses focus events; it has no command
+  lifecycle state to synchronize or restore.
+
+Thread the broker capability through every interactive command entry point.
+Do not bypass it with a direct `spawn`, add command-active terminal state, or
+fall back to the TUI process when broker startup fails.
+```
+- File `sdk/src/tools/read-files.ts` (278 lines):
+```
+import path from 'path'
+
+import { countTokens } from '@codebuff/agent-runtime/util/token-counter'
+import {
+  getImageMimeType,
+  isProviderSupportedImageMediaType,
+  MAX_IMAGE_BASE64_SIZE,
+} from '@codebuff/common/constants/images'
+import { FILE_READ_STATUS } from '@codebuff/common/old-constants'
+import { isFileIgnored } from '@codebuff/common/project-file-tree'
+import {
+  isEnvTemplateFilePath,
+  isSensitiveEnvFilePath,
+} from '@codebuff/common/util/env-file-path'
+import {
+  createFileReadLimiter,
+  windowFileRead,
+} from '@codebuff/common/util/file-read-limits'
+import {
+  PROJECT_UNDERSTANDING_NON_TEXT_MESSAGE,
+  isProjectUnderstandingNonTextPath,
+  looksLikeBinaryContent,
+} from '@codebuff/common/project-understanding/non-text-files'
+import { projectUnderstandingReadRefusal } from '@codebuff/common/project-understanding/skipped-files'
+
+import { resolveFilePath } from './path-utils'
+
+import type {
+  FileReadWindow,
+  RequestImageFileFn,
+} from '@codebuff/common/types/contracts/client'
+import type { CodebuffFileSystem } from '@codebuff/common/types/filesystem'
+
+export type FileFilterResult = {
+  status: 'blocked' | 'allow-example' | 'allow'
+}
+
+export type FileFilter = (filePath: string) => FileFilterResult
+
+export async function getFiles(params: {
+  filePaths: string[]
+  cwd: string
+  fs: CodebuffFileSystem
+  fileWindows?: Record<string, FileReadWindow[]>
+  /**
+   * Apply the user-facing read_files output budget. Internal edit tools need
+   * the complete file so replacements below the display limit can still match.
+   */
+  limitContent?: boolean
+  /** Apply the read_files-only .env restriction. */
+  enforceEnvPolicy?: boolean
+  /**
+   * Filter to classify files before reading.
+   * If provided, the caller takes control of additional filtering. The SDK's
+   * read_files .env policy applies by default, including ordinary gitignore
+   * checks for env templates.
+   */
+  fileFilter?: FileFilter
+  /**
+   * Refuse what the project-understanding agent never reads: non-text files
+   * (by extension before reading, and by a NUL in the first 4 KB after), and
+   * lockfiles, generated files and files over 100 KB (by path, then by the
+   * stat's size, before reading; skipped-files.ts). Off by default; only the
+   * project-understanding agent's run sets it
+   * (`RunOptions.refuseNonTextFileReads`).
+   */
+  refuseNonText?: boolean
+}) {
+  const {
+    filePaths,
+    cwd,
+    fs,
+    fileWindows,
+    fileFilter,
+    limitContent = true,
+    enforceEnvPolicy = true,
+    refuseNonText = false,
+  } = params
+  // If the caller provides a filter, they own additional filtering decisions.
+  // Otherwise explicit reads honor agent ignore files, not discovery exclusions.
+  const hasCustomFilter = fileFilter !== undefined
+
+  const result = Object.create(null) as Record<string, string | null>
+  const seenPaths = new Set<string>()
+  const MAX_FILE_BYTES = 10 * 1024 * 1024 // 10MB - skip reading entirely
+  const limiter = limitContent ? createFileReadLimiter({ countTokens }) : null
+
+  for (const filePath of filePaths) {
+    if (!filePath) {
+      continue
+    }
+
+    const { relativePath, fullPath, isWithinProject } = resolveFilePath(
+      cwd,
+      filePath,
+    )
+    if (seenPaths.has(relativePath)) {
+      continue
+    }
+    seenPaths.add(relativePath)
+
+    if (enforceEnvPolicy && isSensitiveEnvFilePath(relativePath)) {
+      result[relativePath] = FILE_READ_STATUS.IGNORED
+      continue
+    }
+
+    if (refuseNonText && isProjectUnderstandingNonTextPath(relativePath)) {
+      result[relativePath] =
+        `${FILE_READ_STATUS.IGNORED} ${PROJECT_UNDERSTANDING_NON_TEXT_MESSAGE}`
+      continue
+    }
+    const pathRefusal = refuseNonText
+      ? projectUnderstandingReadRefusal(relativePath)
+      : null
+    if (pathRefusal) {
+      result[relativePath] = pathRefusal
+      continue
+    }
+
+    // Apply file filter if provided
+    const filterResult = fileFilter?.(relativePath)
+    if (filterResult?.status === 'blocked') {
+      result[relativePath] = FILE_READ_STATUS.IGNORED
+      continue
+    }
+    const isEnvTemplate =
+      enforceEnvPolicy && isEnvTemplateFilePath(relativePath)
+    const isExampleFile =
+      isEnvTemplate || filterResult?.status === 'allow-example'
+
+    // Explicit reads may name Git-ignored artifacts. Keep the full discovery
+    // policy for env templates and the background project-understanding agent.
+    if ((!hasCustomFilter || isEnvTemplate) && isWithinProject) {
+      const ignored = await isFileIgnored({
+        filePath: relativePath,
+        projectRoot: cwd,
+        fs,
+        ...(isEnvTemplate ? { allowEnvTemplate: true } : {}),
+        ...(!isEnvTemplate && !refuseNonText ? { explicitRead: true } : {}),
+      })
+      if (ignored) {
+        result[relativePath] = FILE_READ_STATUS.IGNORED
+        continue
+      }
+    }
+
+    try {
+      // Safety check: skip reading files over 10MB to avoid OOM
+      const stats = await fs.stat(fullPath)
+      if (stats.size > MAX_FILE_BYTES) {
+        result[relativePath] =
+          FILE_READ_STATUS.TOO_LARGE +
+          ` [${(stats.size / (1024 * 1024)).toFixed(1)}MB exceeds 10MB limit. Use code_search or glob to find specific content.]`
+        continue
+      }
+      const sizeRefusal = refuseNonText
+        ? projectUnderstandingReadRefusal(relativePath, stats.size)
+        : null
+      if (sizeRefusal) {
+        result[relativePath] = sizeRefusal
+        continue
+      }
+
+      const content = await fs.readFile(fullPath, 'utf8')
+      if (refuseNonText && looksLikeBinaryContent(content)) {
+        result[relativePath] =
+          `${FILE_READ_STATUS.IGNORED} ${PROJECT_UNDERSTANDING_NON_TEXT_MESSAGE}`
+        continue
+      }
+
+      const windows = fileWindows?.[filePath]
+      const windowedContent =
+        limitContent && fileWindows !== undefined
+          ? (windows?.length ? windows : [{}])
+              .map((window: FileReadWindow) =>
+                windowFileRead(content, window.offset, window.limit),
+              )
+              .join('\n\n')
+          : content
+      const returnedContent = limiter?.limit(windowedContent) ?? windowedContent
+      result[relativePath] = isExampleFile
+        ? FILE_READ_STATUS.TEMPLATE + '\n' + returnedContent
+        : returnedContent
+    } catch (error) {
+      if (
+        error &&
+        typeof error === 'object' &&
+        'code' in error &&
+        error.code === 'ENOENT'
+      ) {
+        result[relativePath] = FILE_READ_STATUS.DOES_NOT_EXIST
+      } else {
+        result[relativePath] = FILE_READ_STATUS.ERROR
+      }
+    }
+  }
+  return { ...result }
+}
+
+/**
+ * The largest image read_files attaches: the base64 ceiling the CLI enforces on
+ * a pasted image after compressing it. The SDK has no image codec to shrink a
+ * larger file, so the refusal tells the model how to make a smaller copy.
+ */
+const MAX_IMAGE_READ_BYTES = Math.floor((MAX_IMAGE_BASE64_SIZE * 3) / 4)
+
+/** read_files for an image: the same policy as `getFiles`, but the bytes. */
+export async function getImageFile(params: {
+  filePath: string
+  cwd: string
+  fs: CodebuffFileSystem
+  fileFilter?: FileFilter
+}): ReturnType<RequestImageFileFn> {
+  const { filePath, cwd, fs, fileFilter } = params
+  const { relativePath, fullPath, isWithinProject } = resolveFilePath(
+    cwd,
+    filePath,
+  )
+  const ext = path.extname(relativePath)
+  const mediaType = getImageMimeType(ext)
+  if (!mediaType) return { path: relativePath, error: FILE_READ_STATUS.ERROR }
+  // A BMP or TIFF is an image we recognise but no vision provider decodes:
+  // attached anyway, it 400s this turn AND every later turn of the thread
+  // (history is replayed) with "unsupported image ... webp, png, jpeg, and
+  // gif". Refuse here, where the model can still act on it.
+  if (!isProviderSupportedImageMediaType(mediaType)) {
+    return {
+      path: relativePath,
+      error:
+        FILE_READ_STATUS.ERROR +
+        ` [${ext} images cannot be attached; models accept only PNG, JPEG, GIF and WebP. Convert it with a terminal command (for example \`magick ${relativePath} /tmp/preview.png\`) and read that instead.]`,
+    }
+  }
+  if (
+    isSensitiveEnvFilePath(relativePath) ||
+    fileFilter?.(relativePath).status === 'blocked'
+  ) {
+    return { path: relativePath, error: FILE_READ_STATUS.IGNORED }
+  }
+  if (
+    !fileFilter &&
+    isWithinProject &&
+    (await isFileIgnored({
+      filePath: relativePath,
+      projectRoot: cwd,
+      fs,
+      explicitRead: true,
+    }))
+  ) {
+    return { path: relativePath, error: FILE_READ_STATUS.IGNORED }
+  }
+
+  try {
+    const stats = await fs.stat(fullPath)
+    if (stats.size > MAX_IMAGE_READ_BYTES) {
+      const kb = (bytes: number) => Math.round(bytes / 1024)
+      return {
+        path: relativePath,
+        error:
+          FILE_READ_STATUS.TOO_LARGE +
+          ` [Image is ${kb(stats.size)} KB; images over ${kb(MAX_IMAGE_READ_BYTES)} KB cannot be attached. Save a downscaled copy with a terminal command (for example \`magick ${relativePath} -resize 1024x1024 /tmp/preview.png\`) and read that instead.]`,
+      }
+    }
+    const data = Buffer.from(await fs.readFile(fullPath)).toString('base64')
+    return { path: relativePath, data, mediaType, bytes: stats.size }
+  } catch (error) {
+    const missing =
+      !!error &&
+      typeof error === 'object' &&
+      'code' in error &&
+      error.code === 'ENOENT'
+    return {
+      path: relativePath,
+      error: missing ? FILE_READ_STATUS.DOES_NOT_EXIST : FILE_READ_STATUS.ERROR,
+    }
+  }
+}
+```
+Where the symbols this change introduces are used elsewhere, at this same revision (the code that reads them; this is evidence for the WHAT and the WHY, and it is the only source for who consumes this change):
+- File `sdk/src/__tests__/read-files.test.ts` (31 matching lines):
+```
+import { FILE_READ_STATUS } from '@codebuff/common/old-constants'
+import { countTokens } from '@codebuff/agent-runtime/util/token-counter'
+import { MAX_READ_FILES_TOKENS } from '@codebuff/common/util/file-read-limits'
+import * as projectFileTree from '@codebuff/common/project-file-tree'
+import { createNodeError } from '@codebuff/common/testing/errors'
+import {
+  describe,
+  test,
+  expect,
+  beforeEach,
+  afterEach,
+  mock,
+  spyOn,
+…
+describe('file not found', () => {
+    test('should return DOES_NOT_EXIST for missing files', async () => {
+      const mockFs = createMockFs({
+        files: {},
+      })
+
+      const result = await getFiles({
+        filePaths: ['nonexistent.ts'],
+        cwd: '/project',
+        fs: mockFs,
+      })
+
+      expect(result['nonexistent.ts']).toBe(FILE_READ_STATUS.DOES_NOT_EXIST)
+    })
+  })
+
+  describe('file outside project', () => {
+    test('should read absolute paths outside project', async () => {
+      const mockFs = createMockFs({
+        files: {
+          '/etc/hosts': { content: '127.0.0.1 localhost' },
+        },
+      })
+
+      const result = await getFiles({
+…
+content: 'x',
+            size: 15 * 1024 * 1024, // 15MB
+          },
+        },
+      })
+
+      const result = await getFiles({
+        filePaths: ['huge.bin'],
+        cwd: '/project',
+        fs: mockFs,
+      })
+
+      expect(result['huge.bin']).toContain(FILE_READ_STATUS.TOO_LARGE)
+      expect(result['huge.bin']).toContain('15.0MB')
+    })
+
+    test('should read files within both the character and token budgets', async () => {
+      const smallContent = 'x'.repeat(30_000)
+      const mockFs = createMockFs({
+        files: {
+          '/project/underlimit.bin': {
+            content: smallContent,
+            size: smallContent.length,
+          },
+        },
+```
+- File `sdk/src/__tests__/run-file-filter.test.ts` (8 matching lines):
+```
+import * as mainPromptModule from '@codebuff/agent-runtime/main-prompt'
+import { FILE_READ_STATUS } from '@codebuff/common/old-constants'
+import * as projectFileTree from '@codebuff/common/project-file-tree'
+import { getInitialSessionState } from '@codebuff/common/types/session-state'
+import { getStubProjectFileContext } from '@codebuff/common/util/file'
+import { MAX_READ_FILES_CHARS } from '@codebuff/common/util/file-read-limits'
+import { afterEach, describe, expect, it, mock, spyOn } from 'bun:test'
+
+import { CodebuffClient } from '../client'
+import * as databaseModule from '../impl/database'
+
+import type { FileFilter } from '../tools/read-files'
+import type { CodebuffFileSystem } from '@codebuff/common/types/filesystem'
+import type { PathLike } from 'node:fs'
+…
+// Windows are forwarded verbatim, and only when the agent sends them: a
+    // base2 read must reach the override with no fileWindows key at all.
+    expect(overrideInputs[0]?.fileWindows).toBeUndefined()
+    // Only the edit path's read (requestOptionalFile) asks the override for
+    // the whole file; model reads keep the override's read budget.
+    expect(overrideInputs[0]?.fullContent).toBeUndefined()
+    expect(overrideInputs[1]?.fullContent).toBe(true)
+    expect(overrideInputs[2]?.fullContent).toBeUndefined()
+    expect(overrideInputs[2]?.fileWindows).toEqual({
+      'src/index.ts': [{ offset: 5, limit: 2 }],
+    })
+    expect(windowedFiles['src/index.ts']).toBe('contents:src/index.ts')
+    expect(requestedFiles['.ENV']).toBe(FILE_READ_STATUS.IGNORED)
+    expect(Object.hasOwn(requestedFiles, '')).toBe(false)
+    expect(requestedFiles['.env/./']).toBe(FILE_READ_STATUS.IGNORED)
+    expect(requestedFiles['.env ']).toBe(FILE_READ_STATUS.IGNORED)
+    expect(requestedFiles['.env:$DATA']).toBe(FILE_READ_STATUS.IGNORED)
+    expect(requestedFiles['config/.Env.Local']).toBe(FILE_READ_STATUS.IGNORED)
+    expect(requestedFiles['.env.example']).toBe('contents:.env.example')
+    expect(requestedFiles['src/index.ts']).toBe('contents:src/index.ts')
+    expect(requestedFiles['unexpected/.ENV.LOCAL']).toBe(
+      FILE_READ_STATUS.IGNORED,
+    )
+    expect(requestedFiles['unexpected/.env:$DATA']).toBe(
+      FILE_READ_STATUS.IGNORED,
+    )
+    expect(optionalFileResult.current).toBe('contents:.ENV')
+```
+- File `common/src/constants/paths.ts` (6 matching lines):
+```
+]
+
+// Special message content tags indicating specific server states
+export const ASKED_CONFIG = 'asked_config'
+export const SHOULD_ASK_CONFIG = 'should_ask_config'
+export const ONE_TIME_TAGS = [] as const
+export const ONE_TIME_LABELS = [
+  ...ONE_TIME_TAGS,
+  ASKED_CONFIG,
+  SHOULD_ASK_CONFIG,
+] as const
+
+export const FILE_READ_STATUS = {
+  DOES_NOT_EXIST: '[FILE_DOES_NOT_EXIST]',
+  IGNORED: '[BLOCKED]',
+  TEMPLATE: '[TEMPLATE]',
+  OUTSIDE_PROJECT: '[FILE_OUTSIDE_PROJECT]',
+  TOO_LARGE: '[FILE_TOO_LARGE]',
+  ERROR: '[FILE_READ_ERROR]',
+} as const
+
+export const HIDDEN_FILE_READ_STATUS = [
+  FILE_READ_STATUS.DOES_NOT_EXIST,
+  FILE_READ_STATUS.IGNORED,
+  FILE_READ_STATUS.OUTSIDE_PROJECT,
+  FILE_READ_STATUS.TOO_LARGE,
+  FILE_READ_STATUS.ERROR,
+]
+
+export function toOptionalFile(file: string | null) {
+  if (file === null) return null
+  return HIDDEN_FILE_READ_STATUS.some((status) => file.startsWith(status))
+    ? null
+    : file
+}
+```
+- File `sdk/src/__tests__/confine-file-tools.test.ts` (6 matching lines):
+```
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'fs'
+import os from 'os'
+import path from 'path'
+
+import * as mainPromptModule from '@codebuff/agent-runtime/main-prompt'
+import { FILE_READ_STATUS } from '@codebuff/common/old-constants'
+import { getInitialSessionState } from '@codebuff/common/types/session-state'
+import { getStubProjectFileContext } from '@codebuff/common/util/file'
+import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from 'bun:test'
+
+import { CodebuffClient } from '../client'
+import * as databaseModule from '../impl/database'
+
+import type { RunOptions } from '../run'
+import type {
+  RequestFilesFn,
+  RequestImageFileFn,
+  RequestToolCallFn,
+…
+'linked-dir/other.ts',
+          path.join(project, 'src', 'index.ts'),
+        ],
+      })
+      expect(files['package.json']).toBe('{"name":"app"}')
+      expect(files['src/index.ts']).toBe('export const a = 1\n')
+      for (const key of [
+        path.join(outside, 'secret.txt'),
+        path.join(outside, 'other.ts'),
+        'link.txt',
+        'linked-dir/other.ts',
+      ]) {
+        expect(files[key]).toStartWith(FILE_READ_STATUS.OUTSIDE_PROJECT)
+      }
+      expect(JSON.stringify(files)).not.toContain('SECRET')
+    })
+  })
+
+  it('list_directory refuses folders outside the project, including through a symlink', async () => {
+    await withHooks({ confineFileToolsToProject: true }, async (hooks) => {
+      const root = json(await call(hooks, 'list_directory', { path: '.' }))
+      expect(root.files).toContain('package.json')
+      expect(root.path).toBe('.')
+      expect(json(await call(hooks, 'list_directory', { path: 'src' })).files).toEqual([
+        'index.ts',
+…
+expect(result.errorMessage).toContain('code_search is not available')
+    })
+  })
+})
+
+describe('refuseNonTextFileReads', () => {
+  it('refuses non-text extensions and binary content, never attaches an image', async () => {
+    await withHooks({ refuseNonTextFileReads: true }, async (hooks) => {
+      expect(hooks.requestImageFile).toBeUndefined()
+      const files = await hooks.requestFiles({
+        filePaths: ['logo.png', 'blob.dat', 'package.json'],
+      })
+      expect(files['logo.png']).toStartWith(FILE_READ_STATUS.IGNORED)
+      expect(files['logo.png']).toContain('Not a text file')
+      expect(files['blob.dat']).toStartWith(FILE_READ_STATUS.IGNORED)
+      expect(files['package.json']).toBe('{"name":"app"}')
+    })
+  })
+
+  it('refuses lockfiles and files over 100 KB', async () => {
+    await withHooks({ refuseNonTextFileReads: true }, async (hooks) => {
+      const files = await hooks.requestFiles({
+        filePaths: ['uv.lock', 'big.json', 'package.json'],
+      })
+      expect(files['uv.lock']).toStartWith(FILE_READ_STATUS.IGNORED)
+```
+- File `sdk/src/__tests__/read-files-ignore.test.ts` (5 matching lines):
+```
+import { afterEach, beforeEach, expect, test } from 'bun:test'
+import * as fs from 'node:fs/promises'
+import os from 'node:os'
+import path from 'node:path'
+
+import { FILE_READ_STATUS } from '@codebuff/common/old-constants'
+import {
+  getAllFilePaths,
+  getProjectFileTree,
+} from '@codebuff/common/project-file-tree'
+
+import { getFiles, getImageFile } from '../tools/read-files'
+
+let cwd: string
+const png = Buffer.from(
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a5VQAAAAASUVORK5CYII=',
+  'base64',
+)
+…
+'sandbox/note.txt': 'requested artifact',
+      'node_modules/example/index.js': 'dependency source',
+    })
+    expect(
+      await getImageFile({ cwd, fs, filePath: input('artifacts/render.png') }),
+    ).toEqual({
+      path: 'artifacts/render.png',
+      data: png.toString('base64'),
+      mediaType: 'image/png',
+      bytes: png.length,
+    })
+  }
+  const discovered = getAllFilePaths(
+    await getProjectFileTree({ projectRoot: cwd, fs }),
+  )
+  expect(discovered).not.toContain(path.join('sandbox', 'note.txt'))
+  expect(discovered).not.toContain(path.join('artifacts', 'render.png'))
+  expect(discovered).not.toContain(path.join('node_modules', 'example', 'index.js'))
+})
+
+test('explicit reads retain agent ignore files, including nested rules', async () => {
+  await fs.writeFile(path.join(cwd, 'sandbox/.codebuffignore'), 'note.txt\n')
+  expect(
+    await getFiles({
+      cwd,
+      fs,
+      filePaths: ['sandbox/note.txt', 'private/note.txt', 'legacy-private/note.txt'],
+    }),
+```
+- File `common/src/project-understanding/skipped-files.ts` (4 matching lines):
+```
+* Text files the project-understanding agent never reads, because their names
+ * already say what they could: lockfiles, generated files and files too large
+ * to be a manifest or config file. A live run on a six-file Python project
+ * spent most of ~100k input tokens reading `uv.lock`, whose name alone says
+ * the project uses uv (docs/freebuff-project-understanding.md).
+ *
+ * Shared by the SDK's opt-in read guard (`RunOptions.refuseNonTextFileReads`)
+ * and the Cloud project-understanding agent's read_files wrapper, so both
+ * refuse the same files. Project-understanding-only, like non-text-files.ts:
+ * no other read path imports it. No node:path here: this module also runs
+ * where Node's built-ins do not.
+ */
+import { FILE_READ_STATUS } from '../constants/paths'
+
+/** Lockfiles by exact base name, lower-case. The patterns below catch the
+ *  rest of the `*.lock` / `*-lock.*` family. */
+export const PROJECT_UNDERSTANDING_LOCKFILE_NAMES: ReadonlySet<string> =
+  new Set([
+    'package-lock.json',
+    'npm-shrinkwrap.json',
+    'yarn.lock',
+    'pnpm-lock.yaml',
+    'bun.lock',
+    'bun.lockb',
+    'deno.lock',
+…
+* size cap; pass it from a stat so an oversized file is never loaded.
+ */
+export function projectUnderstandingReadRefusal(
+  relativePath: string,
+  sizeBytes?: number,
+): string | null {
+  const segments = relativePath
+    .replace(/\\/g, '/')
+    .split('/')
+    .filter((segment) => segment !== '' && segment !== '.')
+  const base = (segments.pop() ?? '').toLowerCase()
+  if (isProjectUnderstandingLockfile(base)) {
+    return `${FILE_READ_STATUS.IGNORED} ${PROJECT_UNDERSTANDING_LOCKFILE_MESSAGE}`
+  }
+  if (
+    GENERATED_FILE_PATTERN.test(base) ||
+    segments.some((segment) =>
+      PROJECT_UNDERSTANDING_GENERATED_DIRECTORIES.has(segment.toLowerCase()),
+    )
+  ) {
+    return `${FILE_READ_STATUS.IGNORED} ${PROJECT_UNDERSTANDING_GENERATED_MESSAGE}`
+  }
+  if (
+    sizeBytes !== undefined &&
+    sizeBytes > PROJECT_UNDERSTANDING_MAX_READ_BYTES
+  ) {
+    return `${FILE_READ_STATUS.TOO_LARGE} ${PROJECT_UNDERSTANDING_TOO_LARGE_MESSAGE}`
+  }
+  return null
+}
+```
+Tests this commit changed (added lines only; the assertions are what the change is expected to do, not a description of the feature):
+- File `sdk/src/__tests__/read-files-ignore.test.ts`: "explicit text and image reads succeed while discovery still excludes ignored artifacts"; "explicit reads retain agent ignore files, including nested rules"; "sensitive env files and ignored env templates stay blocked, including image-shaped env names"; "background project understanding still refuses gitignored text"
+```
+import { afterEach, beforeEach, expect, test } from 'bun:test'
+import * as fs from 'node:fs/promises'
+import os from 'node:os'
+import path from 'node:path'
+import { FILE_READ_STATUS } from '@codebuff/common/old-constants'
+import {
+  getAllFilePaths,
+  getProjectFileTree,
+} from '@codebuff/common/project-file-tree'
+import { getFiles, getImageFile } from '../tools/read-files'
+let cwd: string
+const png = Buffer.from(
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a5VQAAAAASUVORK5CYII=',
+  'base64',
+)
+beforeEach(async () => {
+  cwd = await fs.mkdtemp(path.join(os.tmpdir(), 'explicit-file-reads-'))
+  const files = {
+    '.gitignore': 'sandbox/\nartifacts/\n.env.example\n',
+    '.codebuffignore': 'private/\n',
+    '.manicodeignore': 'legacy-private/\n',
+    'sandbox/note.txt': 'requested artifact',
+    'artifacts/render.png': png,
+    'node_modules/example/index.js': 'dependency source',
+    'private/note.txt': 'excluded text',
+    'private/render.png': png,
+    'legacy-private/note.txt': 'legacy excluded text',
+    '.env': 'sensitive fixture',
+    '.env.example': 'ignored template fixture',
+    '.env.sample': 'public template fixture',
+    '.env.png': png,
+  }
+  for (const [name, content] of Object.entries(files)) {
+    const file = path.join(cwd, name)
+    await fs.mkdir(path.dirname(file), { recursive: true })
+    await fs.writeFile(file, content)
+  }
+})
+afterEach(async () => {
+  await fs.rm(cwd, { recursive: true, force: true })
+})
+test('explicit text and image reads succeed while discovery still excludes ignored artifacts', async () => {
+  for (const absolute of [false, true]) {
+    const input = (name: string) => (absolute ? path.join(cwd, name) : name)
+    expect(
+      await getFiles({
+        cwd,
+        fs,
+        filePaths: [
+          input('sandbox/note.txt'),
+          input('node_modules/example/index.js'),
+        ],
+      }),
+    ).toEqual({
+      'sandbox/note.txt': 'requested artifact',
+      'node_modules/example/index.js':
+```
+- File `sdk/src/__tests__/read-files.test.ts`: "agent ignore blocking"; "should return IGNORED for files excluded by agent ignore rules"; "default agent ignore behavior"; "should honor agent ignore rules when no fileFilter is provided"; "applies the agent ignore and filter policy of read_files"
+```
+  describe('agent ignore blocking', () => {
+    test('should return IGNORED for files excluded by agent ignore rules', async () => {
+        explicitRead: true,
+  describe('default agent ignore behavior', () => {
+    test('should honor agent ignore rules when no fileFilter is provided', async () => {
+        // No fileFilter provided - SDK applies agent-owned ignore rules
+  test('applies the agent ignore and filter policy of read_files', async () => {
+```
+Diff (source hunks; lockfiles and pure test hunks omitted, except in a lockfile-only commit):
+```diff
+diff --git a/common/src/project-file-tree.ts b/common/src/project-file-tree.ts
+index afdece60a..a694b6978 100644
+--- a/common/src/project-file-tree.ts
++++ b/common/src/project-file-tree.ts
+@@ -183,59 +183,61 @@ export async function getProjectFileTree(params: {
+               type: 'file',
+               lastReadTime,
+               filePath: relativeFilePath,
+             })
+             totalFiles++
+           }
+         } catch (error: unknown) {
+           // File may be inaccessible due to permissions or may have been deleted.
+           // Log with context for debugging, but continue building the tree.
+           logFileTreeError('fs.stat', filePath, error)
+         }
+       }
+     } catch (error: unknown) {
+       // Directory may be inaccessible due to permissions.
+       // Log with context for debugging, but continue building the tree.
+       logFileTreeError('fs.readdir', fullPath, error)
+     }
+   }
+   return root.children
+ }
+ 
+ async function parseGitignoreWithMode(params: {
+   fullDirPath: string
+   fs: CodebuffFileSystem
+   throwOnReadError: boolean
++  explicitRead?: boolean
+ }): Promise<ignore.Ignore> {
+-  const { fullDirPath, fs, throwOnReadError } = params
++  const { fullDirPath, fs, throwOnReadError, explicitRead = false } = params
+ 
+   const ig = ignore.default()
+   const directoryEntries = throwOnReadError
+     ? new Set(await fs.readdir(fullDirPath))
+     : undefined
+ 
+   for (const fileName of PROJECT_IGNORE_FILES) {
++    if (explicitRead && fileName === '.gitignore') continue
+     const ignoreFilePath = path.join(fullDirPath, fileName)
+     if (directoryEntries) {
+       if (!directoryEntries.has(fileName)) continue
+     } else {
+       const ignoreFileExists = await fileExists({ filePath: ignoreFilePath, fs })
+       if (!ignoreFileExists) continue
+     }
+ 
+     let ignoreContent: string
+     try {
+       ignoreContent = await fs.readFile(ignoreFilePath, 'utf8')
+     } catch (error: unknown) {
+       // Resilient file-tree callers continue without unreadable rules. Access
+       // checks can opt into throwing so their caller can fail closed.
+       logFileTreeError('fs.readFile (ignore file)', ignoreFilePath, error)
+       if (throwOnReadError) throw error
+       continue
+     }
+     addIgnoreFileContents(ig, ignoreContent, (pattern, error) =>
+       logFileTreeError('ignore.add (pattern)', pattern, error),
+     )
+   }
+ 
+   return ig
+ }
+@@ -286,76 +288,83 @@ export function flattenTree(nodes: FileTreeNode[]): FileTreeNode[] {
+       return [node]
+     }
+     return flattenTree(node.children ?? [])
+   })
+ }
+ 
+ export function getLastReadFilePaths(
+   flattenedNodes: FileTreeNode[],
+   count: number,
+ ) {
+   return sortBy(
+     flattenedNodes.filter((node) => node.lastReadTime),
+     'lastReadTime',
+   )
+     .reverse()
+     .slice(0, count)
+     .map((node) => node.filePath)
+ }
+ 
+ export async function isFileIgnored(params: {
+   filePath: string
+   projectRoot: string
+   fs: CodebuffFileSystem
+   /** Allow the env template past built-in rules while strictly applying project rules. */
+   allowEnvTemplate?: boolean
++  /** Explicit reads skip Git/discovery exclusions, but keep agent-owned ignore rules. */
++  explicitRead?: boolean
+ }): Promise<boolean> {
+   const {
+     filePath,
+     projectRoot,
+     fs,
+     allowEnvTemplate: allowEnvTemplateRequested = false,
++    explicitRead = false,
+   } = params
+   const allowEnvTemplate =
+     allowEnvTemplateRequested && isEnvTemplateFilePath(filePath)
+ 
+   const resolvedProjectRoot = path.resolve(projectRoot)
+   const fullFilePath = path.resolve(resolvedProjectRoot, filePath)
+   if (!isPathInside(resolvedProjectRoot, fullFilePath)) return false
+ 
+-  const defaultIgnore = createDefaultIgnore(allowEnvTemplate)
++  const defaultIgnore =
++    explicitRead && !allowEnvTemplate
++      ? ignore.default()
++      : createDefaultIgnore(allowEnvTemplate)
+ 
+   const relativeFilePath = toPosixPath(
+     path.relative(resolvedProjectRoot, fullFilePath),
+   )
+ 
+   // Get ignore patterns from the directory containing the file and all parent directories
+   const dirIgnores: DirIgnore[] = []
+   let currentDir = path.dirname(fullFilePath)
+   while (true) {
+     let ig: ignore.Ignore
+     try {
+       ig = await parseGitignoreWithMode({
+         fullDirPath: currentDir,
+         fs,
+         throwOnReadError: allowEnvTemplate,
++        explicitRead: explicitRead && !allowEnvTemplate,
+       })
+     } catch (error) {
+       if (allowEnvTemplate) return true
+       throw error
+     }
+     dirIgnores.push({
+       base: toPosixPath(path.relative(resolvedProjectRoot, currentDir)),
+       ig,
+     })
+     if (path.relative(resolvedProjectRoot, currentDir) === '') break
+ 
+     const parentDir = path.dirname(currentDir)
+     if (parentDir === currentDir) break
+     currentDir = parentDir
+   }
+ 
+   return isIgnoredByIgnoreChain(
+     [{ base: '', ig: defaultIgnore }, ...dirIgnores.reverse()],
+     relativeFilePath,
+   )
+ }
+diff --git a/docs/agents-and-tools.md b/docs/agents-and-tools.md
+index b702b2351..02ecb3db2 100644
+--- a/docs/agents-and-tools.md
++++ b/docs/agents-and-tools.md
+@@ -75,50 +75,60 @@ other coding agents make for their project-level config.
+ 
+ ### Shell Shims
+ 
+ Direct commands without `codebuff` prefix:
+ 
+ ```bash
+ codebuff shims install codebuff/base-lite@1.0.0
+ eval "$(codebuff shims env)"
+ base-lite "fix this bug"
+ ```
+ 
+ ## Tools
+ 
+ - Tool definitions live in `common/src/tools` and are executed via the SDK helpers + agent-runtime.
+ 
+ ### Skill resource paths
+ 
+ Both the runtime `skill` tool and CLI `/skill:<name>` prompts use
+ `common/src/util/skills.ts` → `formatSkillContent` to include the loaded skill's
+ base directory. Bundled `scripts/`, `references/`, and `assets/` paths resolve
+ against that directory, not the project cwd. Windows separators are normalized
+ to forward slashes for file tools and Git Bash. Keep this context on both entry
+ paths: the loader knows `filePath`, but raw SKILL.md content alone loses it and
+ leaves the agent searching for resources it already loaded instructions for.
+ 
++### Explicit file reads versus discovery
++
++The SDK's `read_files` reads explicitly named text and images even when
++`.gitignore` or built-in discovery exclusions hide them (for example,
++`sandbox/` renders or dependency source). File-tree discovery and background
++project-understanding reads still apply those exclusions. Explicit reads honor
++`.codebuffignore` / `.manicodeignore` and caller-provided file filters; sensitive
++`.env` files remain blocked, and env templates still obey all project ignore
++rules. `.freebuffignore` controls workspace transfers, not this read policy.
++
+ ### Cut-off file edits are refused, never repaired
+ 
+ `packages/agent-runtime/src/util/truncated-write-guard.ts` stops two shapes of
+ a file edit that was cut off mid-generation:
+ 
+ - **Arguments that never closed.** When a response hits the output limit (or
+   loses its connection) inside a tool call, the OpenAI-compatible provider
+   still flushes the call with whatever argument text arrived, and OpenRouter
+   reports the step as `finish_reason: "tool_calls"` (the real reason is only in
+   `native_finish_reason: "max_output_tokens"`). `parseRawToolCall` recognises
+   a truncated JSON prefix and answers with an explicit "nothing was written"
+   error instead of the generic re-issue hint, and does not echo the partial
+ [freebuff product prompt text omitted]
+   cut-off `content` string is exactly how a file gets truncated on disk.
+ - **A cut-off copy of an existing file.** `processFileBlock` refuses a
+   `write_file` that is under 60% of an existing file of 30+ lines AND leaves
+   brackets open where the current file balances them. Both refusals log
+   `axiomEvent: file_write_guard` (`metric` says which).
+ 
+ The finish reason is deliberately not the signal: complete arguments in a
+ length-cut step are a complete call, and the OpenRouter shape above hides the
+ length cut anyway.
+ 
+ ### Console-free terminal command broker
+ 
+diff --git a/sdk/src/tools/read-files.ts b/sdk/src/tools/read-files.ts
+index 2d1d83726..93296f709 100644
+--- a/sdk/src/tools/read-files.ts
++++ b/sdk/src/tools/read-files.ts
+@@ -55,109 +55,110 @@ export async function getFiles(params: {
+    * read_files .env policy applies by default, including ordinary gitignore
+    * checks for env templates.
+    */
+   fileFilter?: FileFilter
+   /**
+    * Refuse what the project-understanding agent never reads: non-text files
+    * (by extension before reading, and by a NUL in the first 4 KB after), and
+    * lockfiles, generated files and files over 100 KB (by path, then by the
+    * stat's size, before reading; skipped-files.ts). Off by default; only the
+    * project-understanding agent's run sets it
+    * (`RunOptions.refuseNonTextFileReads`).
+    */
+   refuseNonText?: boolean
+ }) {
+   const {
+     filePaths,
+     cwd,
+     fs,
+     fileWindows,
+     fileFilter,
+     limitContent = true,
+     enforceEnvPolicy = true,
+     refuseNonText = false,
+   } = params
+   // If the caller provides a filter, they own additional filtering decisions.
+-  // Otherwise the SDK also applies default gitignore checking.
++  // Otherwise explicit reads honor agent ignore files, not discovery exclusions.
+   const hasCustomFilter = fileFilter !== undefined
+ 
+   const result = Object.create(null) as Record<string, string | null>
+   const seenPaths = new Set<string>()
+   const MAX_FILE_BYTES = 10 * 1024 * 1024 // 10MB - skip reading entirely
+   const limiter = limitContent ? createFileReadLimiter({ countTokens }) : null
+ 
+   for (const filePath of filePaths) {
+     if (!filePath) {
+       continue
+     }
+ 
+     const { relativePath, fullPath, isWithinProject } = resolveFilePath(
+       cwd,
+       filePath,
+     )
+     if (seenPaths.has(relativePath)) {
+       continue
+     }
+     seenPaths.add(relativePath)
+ 
+     if (enforceEnvPolicy && isSensitiveEnvFilePath(relativePath)) {
+       result[relativePath] = FILE_READ_STATUS.IGNORED
+       continue
+     }
+ 
+     if (refuseNonText && isProjectUnderstandingNonTextPath(relativePath)) {
+       result[relativePath] =
+         `${FILE_READ_STATUS.IGNORED} ${PROJECT_UNDERSTANDING_NON_TEXT_MESSAGE}`
+       continue
+     }
+     const pathRefusal = refuseNonText
+       ? projectUnderstandingReadRefusal(relativePath)
+       : null
+     if (pathRefusal) {
+       result[relativePath] = pathRefusal
+       continue
+     }
+ 
+     // Apply file filter if provided
+     const filterResult = fileFilter?.(relativePath)
+     if (filterResult?.status === 'blocked') {
+       result[relativePath] = FILE_READ_STATUS.IGNORED
+       continue
+     }
+     const isEnvTemplate =
+       enforceEnvPolicy && isEnvTemplateFilePath(relativePath)
+     const isExampleFile =
+       isEnvTemplate || filterResult?.status === 'allow-example'
+ 
+-    // Custom-filter callers own ordinary filtering decisions, except that env
+-    // templates must still obey gitignore when the read_files policy is active.
++    // Explicit reads may name Git-ignored artifacts. Keep the full discovery
++    // policy for env templates and the background project-understanding agent.
+     if ((!hasCustomFilter || isEnvTemplate) && isWithinProject) {
+       const ignored = await isFileIgnored({
+         filePath: relativePath,
+         projectRoot: cwd,
+         fs,
+         ...(isEnvTemplate ? { allowEnvTemplate: true } : {}),
++        ...(!isEnvTemplate && !refuseNonText ? { explicitRead: true } : {}),
+       })
+       if (ignored) {
+         result[relativePath] = FILE_READ_STATUS.IGNORED
+         continue
+       }
+     }
+ 
+     try {
+       // Safety check: skip reading files over 10MB to avoid OOM
+       const stats = await fs.stat(fullPath)
+       if (stats.size > MAX_FILE_BYTES) {
+         result[relativePath] =
+           FILE_READ_STATUS.TOO_LARGE +
+           ` [${(stats.size / (1024 * 1024)).toFixed(1)}MB exceeds 10MB limit. Use code_search or glob to find specific content.]`
+         continue
+       }
+       const sizeRefusal = refuseNonText
+         ? projectUnderstandingReadRefusal(relativePath, stats.size)
+         : null
+       if (sizeRefusal) {
+         result[relativePath] = sizeRefusal
+         continue
+       }
+ 
+       const content = await fs.readFile(fullPath, 'utf8')
+@@ -208,57 +209,65 @@ export async function getImageFile(params: {
+   filePath: string
+   cwd: string
+   fs: CodebuffFileSystem
+   fileFilter?: FileFilter
+ }): ReturnType<RequestImageFileFn> {
+   const { filePath, cwd, fs, fileFilter } = params
+   const { relativePath, fullPath, isWithinProject } = resolveFilePath(
+     cwd,
+     filePath,
+   )
+   const ext = path.extname(relativePath)
+   const mediaType = getImageMimeType(ext)
+   if (!mediaType) return { path: relativePath, error: FILE_READ_STATUS.ERROR }
+   // A BMP or TIFF is an image we recognise but no vision provider decodes:
+   // attached anyway, it 400s this turn AND every later turn of the thread
+   // (history is replayed) with "unsupported image ... webp, png, jpeg, and
+   // gif". Refuse here, where the model can still act on it.
+   if (!isProviderSupportedImageMediaType(mediaType)) {
+     return {
+       path: relativePath,
+       error:
+         FILE_READ_STATUS.ERROR +
+         ` [${ext} images cannot be attached; models accept only PNG, JPEG, GIF and WebP. Convert it with a terminal command (for example \`magick ${relativePath} /tmp/preview.png\`) and read that instead.]`,
+     }
+   }
+-  if (fileFilter?.(relativePath).status === 'blocked') {
++  if (
++    isSensitiveEnvFilePath(relativePath) ||
++    fileFilter?.(relativePath).status === 'blocked'
++  ) {
+     return { path: relativePath, error: FILE_READ_STATUS.IGNORED }
+   }
+   if (
+     !fileFilter &&
+     isWithinProject &&
+-    (await isFileIgnored({ filePath: relativePath, projectRoot: cwd, fs }))
++    (await isFileIgnored({
++      filePath: relativePath,
++      projectRoot: cwd,
++      fs,
++      explicitRead: true,
++    }))
+   ) {
+     return { path: relativePath, error: FILE_READ_STATUS.IGNORED }
+   }
+ 
+   try {
+     const stats = await fs.stat(fullPath)
+     if (stats.size > MAX_IMAGE_READ_BYTES) {
+       const kb = (bytes: number) => Math.round(bytes / 1024)
+       return {
+         path: relativePath,
+         error:
+           FILE_READ_STATUS.TOO_LARGE +
+           ` [Image is ${kb(stats.size)} KB; images over ${kb(MAX_IMAGE_READ_BYTES)} KB cannot be attached. Save a downscaled copy with a terminal command (for example \`magick ${relativePath} -resize 1024x1024 /tmp/preview.png\`) and read that instead.]`,
+       }
+     }
+     const data = Buffer.from(await fs.readFile(fullPath)).toString('base64')
+     return { path: relativePath, data, mediaType, bytes: stats.size }
+   } catch (error) {
+     const missing =
+       !!error &&
+       typeof error === 'object' &&
+       'code' in error &&
+       error.code === 'ENOENT'
+     return {
+       path: relativePath,
+
+```
