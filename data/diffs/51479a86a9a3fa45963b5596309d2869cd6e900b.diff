@@ -1,0 +1,271 @@
+diff --git a/cli/scripts/build-binary.ts b/cli/scripts/build-binary.ts
+index 4b2ef71b7..3f99f6ff0 100644
+--- a/cli/scripts/build-binary.ts
++++ b/cli/scripts/build-binary.ts
+@@ -1,40 +1,41 @@
+ #!/usr/bin/env bun
+ 
+ import { spawnSync, type SpawnSyncOptions } from 'child_process'
+ import { createRequire } from 'module'
+ import {
+   chmodSync,
+   existsSync,
+   mkdirSync,
+   readFileSync,
+   realpathSync,
+   writeFileSync,
+ } from 'fs'
+ import { dirname, join } from 'path'
+ import { fileURLToPath } from 'url'
+ 
++import { freebuffModeDefine } from './freebuff-mode'
+ import {
+   ensureOpenTuiNativeBundle,
+   type OpenTuiNativeTarget,
+ } from './open-tui-native-bundle'
+ 
+ type TargetInfo = {
+   bunTarget: string
+   platform: NodeJS.Platform
+   arch: string
+ }
+ 
+ const VERBOSE = process.env.VERBOSE === 'true'
+ const OVERRIDE_TARGET = process.env.OVERRIDE_TARGET
+ const OVERRIDE_PLATFORM = process.env.OVERRIDE_PLATFORM as
+   NodeJS.Platform | undefined
+ const OVERRIDE_ARCH = process.env.OVERRIDE_ARCH ?? undefined
+ const OVERRIDE_COMPILE_EXECUTABLE_PATH = process.env.BUN_COMPILE_EXECUTABLE_PATH
+ 
+ const __filename = fileURLToPath(import.meta.url)
+ const __dirname = dirname(__filename)
+ const cliRoot = join(__dirname, '..')
+ const cliRequire = createRequire(join(cliRoot, 'package.json'))
+ 
+ function log(message: string) {
+   if (VERBOSE) {
+@@ -105,91 +106,93 @@ function getTargetInfo(): TargetInfo {
+ 
+   const key = `${platform}-${arch}`
+   const target = mappings[key]
+ 
+   if (!target) {
+     throw new Error(`Unsupported build target: ${key}`)
+   }
+ 
+   return target
+ }
+ 
+ function getCliTargetLabel(targetInfo: TargetInfo): string {
+   const baseTarget = `${targetInfo.platform}-${targetInfo.arch}`
+   return targetInfo.bunTarget.endsWith('-baseline')
+     ? `${baseTarget}-baseline`
+     : baseTarget
+ }
+ 
+ async function main() {
+   const [, , binaryNameArg, version] = process.argv
+   const binaryName = binaryNameArg ?? 'codecane'
+ 
+   if (!version) {
+     throw new Error('Version argument is required when building a binary')
+   }
++  // Before the slow prebuild steps, so a mislabelled free build fails at once.
++  const freebuffMode = freebuffModeDefine(binaryName, process.env)
+ 
+   log(`Building ${binaryName} @ ${version}`)
+ 
+   const targetInfo = getTargetInfo()
+   const binDir = join(cliRoot, 'bin')
+ 
+   if (!existsSync(binDir)) {
+     mkdirSync(binDir, { recursive: true })
+   }
+ 
+   // Generate bundled agents file before compiling
+   log('Generating bundled agents...')
+   runCommand('bun', ['run', 'scripts/prebuild-agents.ts'], {
+     cwd: cliRoot,
+     env: process.env,
+   })
+ 
+   // Ensure SDK assets exist before compiling the CLI
+   log('Building SDK dependencies...')
+   runCommand('bun', ['run', '--cwd', '../sdk', 'build'], {
+     cwd: cliRoot,
+     env: process.env,
+   })
+ 
+   prepareOpenTuiNativeBundle(targetInfo)
+ 
+   const outputFilename =
+     targetInfo.platform === 'win32' ? `${binaryName}.exe` : binaryName
+   const outputFile = join(binDir, outputFilename)
+ 
+   // Collect all NEXT_PUBLIC_* environment variables
+   const nextPublicEnvVars = Object.entries(process.env)
+     .filter(([key]) => key.startsWith('NEXT_PUBLIC_'))
+     .map(([key, value]) => [`process.env.${key}`, `"${value ?? ''}"`])
+ 
+   const defineFlags = [
+     ['process.env.NODE_ENV', '"production"'],
+     ['process.env.CODEBUFF_IS_BINARY', '"true"'],
+     ['process.env.CODEBUFF_CLI_VERSION', `"${version}"`],
+     ['process.env.CODEBUFF_CLI_TARGET', `"${getCliTargetLabel(targetInfo)}"`],
+-    ['process.env.FREEBUFF_MODE', `"${process.env.FREEBUFF_MODE ?? 'false'}"`],
++    ['process.env.FREEBUFF_MODE', `"${freebuffMode}"`],
+     ...nextPublicEnvVars,
+   ]
+ 
+   const buildArgs = [
+     'build',
+     'src/entry.ts',
+     '--compile',
+     '--production', // Required so compiled binaries use the production JSX runtime (avoids jsxDEV crashes).
+     '--no-compile-autoload-bunfig', // User project bunfig.toml must not affect the standalone CLI.
+     // Bun's standalone executables load `.env` / `.env.local` from the
+     // working directory by default. The SDK resolves its API base URL from
+     // `NEXT_PUBLIC_CODEBUFF_APP_URL` / `CODEBUFF_APP_URL` at runtime, so a
+     // repository's `.env` could send every bearer-authenticated SDK call
+     // (/api/v1/me, completions, agent runs) to a host of its choosing the
+     // moment the CLI starts in it. A value exported in the user's own shell
+     // is still honoured; only the project file is no longer read.
+     '--no-compile-autoload-dotenv',
+     `--target=${targetInfo.bunTarget}`,
+     ...(OVERRIDE_COMPILE_EXECUTABLE_PATH
+       ? [`--compile-executable-path=${OVERRIDE_COMPILE_EXECUTABLE_PATH}`]
+       : []),
+     `--outfile=${outputFile}`,
+     '--sourcemap=none',
+     ...defineFlags.flatMap(([key, value]) => ['--define', `${key}=${value}`]),
+     '--env "NEXT_PUBLIC_*"', // Copies all current env vars in process.env to the compiled binary that match the pattern.
+diff --git a/cli/scripts/freebuff-mode.ts b/cli/scripts/freebuff-mode.ts
+new file mode 100644
+index 000000000..5099be847
+--- /dev/null
++++ b/cli/scripts/freebuff-mode.ts
+@@ -0,0 +1,23 @@
++/**
++ * The `FREEBUFF_MODE` literal a CLI build compiles in.
++ *
++ * `bun build --compile` freezes `process.env.FREEBUFF_MODE` into the artifact,
++ * and `IS_FREEBUFF` (`cli/src/utils/constants.ts`) is `=== 'true'` on it. The
++ * define used to default to 'false', so a `freebuff` binary built without the
++ * variable (the `workflow_dispatch` path of `cli-release-build.yml` did exactly
++ * that) compiled as the Codebuff client under the free name, and nothing
++ * failed. The free artifact now refuses to build unless it is the free build.
++ */
++export function freebuffModeDefine(
++  binaryName: string,
++  env: Record<string, string | undefined>,
++): 'true' | 'false' {
++  const isFree = env.FREEBUFF_MODE === 'true'
++  if (binaryName === 'freebuff' && !isFree) {
++    throw new Error(
++      `Refusing to build freebuff with FREEBUFF_MODE=${env.FREEBUFF_MODE ?? '(unset)'}: ` +
++        'it would compile as the Codebuff client. Set FREEBUFF_MODE=true.',
++    )
++  }
++  return isFree ? 'true' : 'false'
++}
+diff --git a/cli/src/__tests__/freebuff-mode-define.test.ts b/cli/src/__tests__/freebuff-mode-define.test.ts
+new file mode 100644
+index 000000000..d5690b144
+--- /dev/null
++++ b/cli/src/__tests__/freebuff-mode-define.test.ts
+@@ -0,0 +1,29 @@
++import { describe, expect, test } from 'bun:test'
++
++import { freebuffModeDefine } from '../../scripts/freebuff-mode'
++
++describe('freebuffModeDefine', () => {
++  test('refuses a freebuff artifact that is not the free build', () => {
++    expect(() => freebuffModeDefine('freebuff', {})).toThrow(/FREEBUFF_MODE/)
++    expect(() =>
++      freebuffModeDefine('freebuff', { FREEBUFF_MODE: 'false' }),
++    ).toThrow(/FREEBUFF_MODE/)
++    expect(() =>
++      freebuffModeDefine('freebuff', { FREEBUFF_MODE: '1' }),
++    ).toThrow(/FREEBUFF_MODE/)
++  })
++
++  test('builds freebuff with the flag', () => {
++    expect(freebuffModeDefine('freebuff', { FREEBUFF_MODE: 'true' })).toBe(
++      'true',
++    )
++  })
++
++  test('other artifacts default to the Codebuff client', () => {
++    expect(freebuffModeDefine('codebuff', {})).toBe('false')
++    expect(freebuffModeDefine('codecane', { FREEBUFF_MODE: '1' })).toBe('false')
++    expect(freebuffModeDefine('codecane', { FREEBUFF_MODE: 'true' })).toBe(
++      'true',
++    )
++  })
++})
+diff --git a/cli/src/commands/__tests__/freebuff-command-aliases.test.ts b/cli/src/commands/__tests__/freebuff-command-aliases.test.ts
+index 2d8f9991d..51df54c66 100644
+--- a/cli/src/commands/__tests__/freebuff-command-aliases.test.ts
++++ b/cli/src/commands/__tests__/freebuff-command-aliases.test.ts
+@@ -1,51 +1,60 @@
+ import { describe, expect, test } from 'bun:test'
+ 
+ describe('freebuff command aliases', () => {
+-  test.each(['true', 'false'])('model and reasoning commands respect FREEBUFF_MODE=%s', (freebuffMode) => {
++  test.each(['true', 'false'])('model, reasoning and ads commands respect FREEBUFF_MODE=%s', (freebuffMode) => {
+     const slashCommandsUrl = new URL(
+       '../../data/slash-commands.ts',
+       import.meta.url,
+     ).href
+     const commandRegistryUrl = new URL(
+       '../command-registry.ts',
+       import.meta.url,
+     ).href
+ 
+     const result = Bun.spawnSync({
+       cmd: [
+         'bun',
+         '--eval',
+         `
+           import { SLASH_COMMANDS } from ${JSON.stringify(slashCommandsUrl)}
+           import { findCommand } from ${JSON.stringify(commandRegistryUrl)}
+           import { useFreebuffChatStore, openFreebuffModelPicker } from ${JSON.stringify(new URL('../../state/freebuff-chat-store.ts', import.meta.url).href)}
+           import { useFreebuffModelStore } from ${JSON.stringify(new URL('../../state/freebuff-model-store.ts', import.meta.url).href)}
+           import { useFreebuffSessionStore } from ${JSON.stringify(new URL('../../state/freebuff-session-store.ts', import.meta.url).href)}
+           import { getFreebuffModelDirectory } from ${JSON.stringify(new URL('../../state/freebuff-catalog-store.ts', import.meta.url).href)}
+           import assert from 'node:assert/strict'
+ 
++          // These write adsEnabled to the settings file Codebuff shares
++          // (~/.config/manicode). Freebuff always shows ads, so it must not
++          // offer a switch it ignores and Codebuff would honour.
++          for (const name of ['ads:enable', 'ads:disable']) {
++            const isFree = process.env.FREEBUFF_MODE === 'true'
++            assert.equal(findCommand(name) === undefined, isFree)
++            assert.equal(SLASH_COMMANDS.some(cmd => cmd.id === name), !isFree)
++          }
++
+           if (process.env.FREEBUFF_MODE !== 'true') {
+             for (const name of ['reasoning', 'effort', 'think']) {
+               assert.equal(findCommand(name), undefined)
+               assert.equal(SLASH_COMMANDS.some(cmd => cmd.id === name || cmd.aliases?.includes(name)), false)
+             }
+             process.exit(0)
+           }
+ 
+           const endSession = SLASH_COMMANDS.find((cmd) => cmd.id === 'end-session')
+           if (!endSession) throw new Error('end-session slash command missing')
+           if (endSession.aliases?.includes('model')) {
+             throw new Error('model must not end the session')
+           }
+ 
+           const modelCommand = findCommand('model')
+           if (!modelCommand) throw new Error('model command alias missing')
+           if (modelCommand.name !== 'model') {
+             throw new Error('model must resolve to its own command')
+           }
+ 
+           const model = 'z-ai/glm-5.3-flash'
+           const activeModel = 'mimo/mimo-v2.5'
+           useFreebuffModelStore.setState({ selectedModel: activeModel })
+           useFreebuffChatStore.setState({ nextModel: model })
+           const directory = getFreebuffModelDirectory()
