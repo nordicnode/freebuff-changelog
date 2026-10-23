@@ -1,0 +1,3286 @@
+Date: 2026-10-23T18:57:14.000Z
+Category: CLI
+Areas: CLI
+Commit nature: production
+Stats: +599 / -21
+Analysis notes: perf(cli): render streaming markdown incrementally (#1549)
+Author intent & PR motivation (the WHY lives here; quote it when it explains the change, and say "the reason is not visible" when it does not):
+- PR #1549: perf(cli): render streaming markdown incrementally
+  PR Description: ## Problem
+
+`ContentWithMarkdown` re-renders the live message on every flush (~10/s) while it streams, and each render re-parsed the **entire accumulated answer** with unified + remark-gfm. `renderMarkdown` costs roughly **3 ms per kilobyte**, so:
+
+| Answer size | Cost of one render |
+|---|---|
+| 10 KB | 35 ms |
+| 50 KB | 115 ms |
+| 200 KB | 480 ms |
+| 500 KB | 1.4 s |
+
+That is the stall users feel on long answers: the render thread blocks for hundreds of milliseconds per flush, and the total work for one stream is quadratic. `AgentMessage` did the same thing per subagent, so a fan-out of 8 agents paid 8 full parses per flush.
+
+## Fix
+
+Streaming text is append-only, so the parse of everything before the last complete block boundary is still valid on the next flush. `streaming-markdown.ts` keeps that prefix parsed and re-renders only the tail:
+
+- boundaries are blank lines outside fenced code, and never next to a list or blockquote (a loose list or quote would be split, restarting ordered numbering);
+- the trailing `\n\n` separator is held at the top level rather than inside the memoized segment, so the final trim behaves exactly like a single render;
+- committed segments are wrapped in `memo`, so React stops re-walking the prefix at all - this is what took the worst flush from 38 ms to 3.8 ms;
+- a width/palette change, or content that is not an extension of what was rendered (chat reload, edit), drops the cache and falls back to a full render.
+
+Both the root message
+Added files: cli/src/utils/streaming-markdown.ts
+Modified files: cli/src/components/blocks/content-with-markdown.tsx, cli/src/components/message-with-agents.tsx, cli/src/utils/markdown-renderer.tsx
+Structured facts (extracted mechanically from the diff; copy names and values verbatim, never round or rename):
+- Constants newly defined: LIST_OR_QUOTE_LINE = /^[ \t]*(?:[-*+]|\d+[.)]|>)/ (a definition alone changes nothing at runtime; if the diff shows no reader, say it is in place and does nothing yet)
+- Exports added: renderMarkdownNodes, trimTrailingWhitespace, StreamingMarkdownCache, createStreamingMarkdownCache, renderStreamingMarkdownCached
+- Behavior asserted by new tests (test titles, verbatim; the hunks themselves are omitted): "renderStreamingMarkdownCached" ; "matches a full render at every streaming step" ; "matches a full render inside an unterminated code fence" ; "a paragraph directly followed by a list keeps the same spacing" ; "replaced content re-renders from scratch" ; "a width change invalidates the cached prefix" ; "merged styled runs keep block boundaries" ; "a paragraph after a code block starts on its own line" ; "code block lines stay on separate lines"
+Module & File Purpose (ground-truth documentation from touched files):
+- File `cli/src/utils/markdown-renderer.tsx`:
+```
+// Helper component to work around TypeScript's Fragment key typing issue
+```
+- File `cli/src/utils/streaming-markdown.ts`:
+```
+/**
+ * Incremental renderer for the block that is still streaming.
+ *
+ * `renderMarkdown` costs roughly 3ms per kilobyte, and the live message is
+ * re-rendered on every flush while it grows - so a long answer re-parsed its
+ * whole transcript about ten times a second: a 200KB answer cost ~480ms of
+ * parsing per flush, on the render thread.
+ *
+ * Streaming text is append-only, so every complete block before the last
+ * boundary can be parsed once and reused. Only the tail - the block currently
+ * being written - is re-rendered per flush.
+ */
+```
+Subsystem Architecture Documentation (from nearby package guides):
+- From `cli/README.md`:
+```markdown
+# @codebuff/cli
+
+A Terminal User Interface (TUI) package built with OpenTUI and React.
+
+## Installation
+
+```bash
+bun install
+```
+
+## Development
+
+Run the TUI in development mode:
+
+```bash
+bun run dev
+```
+
+## Testing
+
+Run the test suite:
+
+```bash
+bun test
+```
+
+### Interactive E2E Testing
+
+For testing interactive CLI features, install tmux:
+
+```bash
+# macOS
+brew install tmux
+
+# Ubuntu/Debian
+sudo apt-get install tmux
+
+# Windows (via WSL)
+wsl --install
+sudo apt-get install tmux
+```
+
+Then run the proof-of-concept:
+
+```bash
+bun run test:tmux-poc
+```
+
+[freebuff product prompt text omitted]
+
+```bash
+# ❌ Broken: tmux send-keys -t session "hello"
+# ✅ Works:  tmux send-keys -t session $'\e[200~hello\e[201~'
+```
+
+See [tmux.knowledge.md](tmux.knowledge.md) for comprehensive tmux documentation and [src/__tests__/README.md](src/__tests__/README.md) for testing documentation.
+
+## Build
+
+Build the package:
+
+```bash
+bun run build
+```
+
+## Run
+
+Run the built TUI:
+
+```bash
+bun run start
+```
+
+Or use the binary directly:
+
+```bash
+codebuff-tui
+```
+
+## Features
+```
+Complete Source of Modified Files (for complete module context):
+- File `cli/src/components/blocks/content-with-markdown.tsx` (52 lines):
+```
+import { memo, useRef } from 'react'
+
+import {
+  renderMarkdown,
+  hasMarkdown,
+  type MarkdownPalette,
+} from '../../utils/markdown-renderer'
+import {
+  createStreamingMarkdownCache,
+  renderStreamingMarkdownCached,
+} from '../../utils/streaming-markdown'
+
+import type { StreamingMarkdownCache } from '../../utils/streaming-markdown'
+
+interface ContentWithMarkdownProps {
+  content: string
+  isStreaming: boolean
+  codeBlockWidth: number
+  palette: MarkdownPalette
+}
+
+export const ContentWithMarkdown = memo(
+  ({
+    content,
+    isStreaming,
+    codeBlockWidth,
+    palette,
+  }: ContentWithMarkdownProps) => {
+    // Streaming text only ever grows, so the already-rendered blocks can be
+    // kept and the tail re-rendered: parsing the whole message on every flush
+    // is what made long answers stall the render thread.
+    const cache = useRef<StreamingMarkdownCache | null>(null)
+    if (cache.current === null) {
+      cache.current = createStreamingMarkdownCache()
+    }
+
+    if (!hasMarkdown(content)) {
+      return content
+    }
+
+    const options = { codeBlockWidth, palette }
+    if (isStreaming) {
+      return renderStreamingMarkdownCached(content, options, cache.current)
+    }
+
+    // Done streaming: render once from scratch so the final output does not
+    // depend on how the deltas happened to be split.
+    cache.current = createStreamingMarkdownCache()
+    return renderMarkdown(content, options)
+  },
+)
+```
+- File `cli/src/components/message-with-agents.tsx` (528 lines):
+```
+import { TextAttributes } from '@opentui/core'
+import { memo, useCallback, useMemo, useRef, type ReactNode } from 'react'
+import React from 'react'
+import { useShallow } from 'zustand/react/shallow'
+
+import { Button } from './button'
+import { ErrorBoundaryPlaceholder } from './error-boundary'
+import { GridLayout } from './grid-layout'
+import { MessageBlock } from './message-block'
+import { ModeDivider } from './mode-divider'
+import { useChatStore } from '../state/chat-store'
+import { useMessageBlockStore } from '../state/message-block-store'
+import { splitByAgentSize } from '../utils/block-processor'
+import { getCliEnv } from '../utils/env'
+import {
+  AGENT_CONTENT_HORIZONTAL_PADDING,
+  MAX_AGENT_DEPTH,
+} from '../utils/layout-helpers'
+import {
+  renderMarkdown,
+  hasMarkdown,
+  type MarkdownPalette,
+} from '../utils/markdown-renderer'
+import {
+  createStreamingMarkdownCache,
+  renderStreamingMarkdownCached,
+} from '../utils/streaming-markdown'
+
+import type { ChatMessage } from '../types/chat'
+import type { FeedbackCategory } from '@codebuff/common/constants/feedback'
+
+interface AgentChildrenGridProps {
+  agentChildren: ChatMessage[]
+  depth: number
+  availableWidth: number
+}
+
+const AgentChildrenGrid = memo(
+  ({ agentChildren, depth, availableWidth }: AgentChildrenGridProps) => {
+    const theme = useMessageBlockStore((state) => state.context.theme)
+
+    const getItemKey = useCallback((agent: ChatMessage) => agent.id, [])
+
+    const renderAgentChild = useCallback(
+      (agent: ChatMessage, _idx: number, columnWidth: number) => (
+        <MessageWithAgents
+          message={agent}
+          depth={depth + 1}
+          isLastMessage={false}
+          availableWidth={columnWidth}
+        />
+      ),
+      [depth],
+    )
+
+    const subGroups = useMemo(
+      () => splitByAgentSize(agentChildren, (m) => m.agent?.agentType ?? ''),
+      [agentChildren],
+    )
+
+    if (agentChildren.length === 0) return null
+
+    if (depth >= MAX_AGENT_DEPTH) {
+      if (getCliEnv().NODE_ENV === 'development') {
+        console.warn(
+          `[AgentChildrenGrid] Depth limit (${MAX_AGENT_DEPTH}) reached, truncating agent tree`,
+        )
+      }
+      return (
+        <text fg={theme?.muted} attributes={TextAttributes.ITALIC}>
+          {`${agentChildren.length} nested agent${
+            agentChildren.length > 1 ? 's' : ''
+          } not shown (depth limit)`}
+        </text>
+      )
+    }
+
+    const errorFallback = (
+      <text fg={theme?.error}>Error rendering agent children</text>
+    )
+
+    return (
+      <ErrorBoundaryPlaceholder fallback={errorFallback} componentName="AgentChildrenGrid">
+        <box style={{ flexDirection: 'column', gap: 0, width: '100%' }}>
+          {subGroups.map((group) => (
+            <GridLayout
+              key={getItemKey(group[0])}
+              items={group}
+              availableWidth={availableWidth}
+              getItemKey={getItemKey}
+              renderItem={renderAgentChild}
+            />
+          ))}
+        </box>
+      </ErrorBoundaryPlaceholder>
+    )
+  },
+)
+
+interface MessageWithAgentsProps {
+  message: ChatMessage
+  depth: number
+  isLastMessage: boolean
+  availableWidth: number
+}
+
+export const MessageWithAgents = memo(
+  ({ message, depth, isLastMessage, availableWidth }: MessageWithAgentsProps): ReactNode => {
+    const SIDE_GUTTER = 1
+    const isAgent = message.variant === 'agent'
+
+    // Use useShallow for grouped selectors to prevent unnecessary re-renders
+    const { theme, markdownPalette, messageTree, isWaitingForResponse, timerStartTime } =
+      useMessageBlockStore(
+        useShallow((state) => ({
+          theme: state.context.theme,
+          markdownPalette: state.context.markdownPalette,
+          messageTree: state.context.messageTree,
+          isWaitingForResponse: state.context.isWaitingForResponse,
+          timerStartTime: state.context.timerStartTime,
+        })),
+      )
+
+    const { onToggleCollapsed, onBuildFast, onBuildMax, onBuildLite, onFeedback, onCloseFeedback } =
+      useMessageBlockStore(
+        useShallow((state) => ({
+          onToggleCollapsed: state.callbacks.onToggleCollapsed,
+          onBuildFast: state.callbacks.onBuildFast,
+          onBuildMax: state.callbacks.onBuildMax,
+          onBuildLite: state.callbacks.onBuildLite,
+          onFeedback: state.callbacks.onFeedback,
+          onCloseFeedback: state.callbacks.onCloseFeedback,
+        })),
+      )
+
+    // Memoize onOpenFeedback to prevent unnecessary re-renders
+    const onOpenFeedback = useCallback(
+      (options?: {
+        category?: FeedbackCategory
+        footerMessage?: string
+        errors?: Array<{ id: string; message: string }>
+      }) => {
+        onFeedback(message.id, options)
+      },
+      [onFeedback, message.id],
+    )
+
+    const contentBoxStyle = useMemo(
+      () => ({
+        backgroundColor: theme?.background,
+        padding: 0,
+        paddingLeft: SIDE_GUTTER,
+        paddingRight: SIDE_GUTTER,
+        paddingTop: 0,
+        paddingBottom: 0,
+        gap: 0,
+        width: '100%' as const,
+        flexGrow: 1,
+        justifyContent: 'center' as const,
+      }),
+      [theme?.background],
+    )
+
+    if (isAgent) {
+      return <AgentMessage message={message} depth={depth} availableWidth={availableWidth} />
+    }
+
+    const isAi = message.variant === 'ai'
+    const isUser = message.variant === 'user'
+    const isError = message.variant === 'error'
+
+    if (
+      message.blocks &&
+      message.blocks.length === 1 &&
+      message.blocks[0].type === 'mode-divider'
+    ) {
+      const dividerBlock = message.blocks[0]
+      return (
+        <ModeDivider
+          key={message.id}
+          mode={dividerBlock.mode}
+          width={availableWidth}
+        />
+      )
+    }
+
+    const lineColor = isError
+      ? 'red'
+      : isAi
+        ? theme?.aiLine ?? 'white'
+        : theme?.userLine ?? 'white'
+    const textColor = theme?.foreground ?? 'white'
+    const timestampColor = isError
+      ? 'red'
+      : isAi
+        ? theme?.muted ?? 'white'
+        : theme?.muted ?? 'white'
+
+    const estimatedMessageWidth = availableWidth
+    const codeBlockWidth = Math.max(10, estimatedMessageWidth - 8)
+
+    const paletteForMessage: MarkdownPalette | undefined = useMemo(
+      () => markdownPalette ? {
+        ...markdownPalette,
+        codeTextFg: textColor,
+      } : undefined,
+      [markdownPalette, textColor],
+    )
+
+    const markdownOptions = useMemo(
+      () => ({ codeBlockWidth, palette: paletteForMessage! }),
+      [codeBlockWidth, paletteForMessage],
+    )
+
+    const isLoading =
+      isAi && message.content === '' && !message.blocks && isWaitingForResponse
+
+    const agentChildren = messageTree?.get(message.id) ?? []
+    const hasAgentChildren = agentChildren.length > 0
+    // Show vertical line for user messages (including bash commands which are now user messages)
+    const showVerticalLine = isUser
+
+    return (
+      <box
+        key={message.id}
+        style={{
+          width: '100%',
+          flexDirection: 'column',
+          gap: 0,
+          paddingBottom: isLastMessage ? 0 : 1,
+        }}
+      >
+        <box
+          style={{
+            width: '100%',
+            flexDirection: 'row',
+          }}
+        >
+          {showVerticalLine ? (
+            <box
+              style={{
+                flexDirection: 'row',
+                gap: 0,
+                alignItems: 'stretch',
+                width: '100%',
+                flexGrow: 1,
+              }}
+            >
+              <box
+                style={{
+                  width: 1,
+                  backgroundColor: lineColor,
+                  marginTop: 0,
+                  marginBottom: 0,
+                }}
+              />
+              <box style={contentBoxStyle}>
+                <MessageBlock
+                  messageId={message.id}
+                  blocks={message.blocks}
+                  content={message.content}
+                  isUser={isUser}
+                  isAi={isAi}
+                  isLoading={isLoading}
+                  timestamp={message.timestamp}
+                  isComplete={message.isComplete}
+                  completionTime={message.completionTime}
+                  credits={message.credits}
+                  timerStartTime={timerStartTime}
+                  textColor={textColor}
+                  timestampColor={timestampColor}
+                  markdownOptions={markdownOptions}
+                  availableWidth={availableWidth}
+                  markdownPalette={markdownPalette!}
+                  onToggleCollapsed={onToggleCollapsed}
+                  onBuildFast={onBuildFast}
+                  onBuildMax={onBuildMax}
+                  onBuildLite={onBuildLite}
+                  onFeedback={onFeedback}
+                  onCloseFeedback={onCloseFeedback}
+                  validationErrors={message.validationErrors}
+                  userError={message.userError}
+                  onOpenFeedback={onOpenFeedback}
+                  attachments={message.attachments}
+                  textAttachments={message.textAttachments}
+                  fileAttachments={message.fileAttachments}
+                  metadata={message.metadata}
+                  isLastMessage={isLastMessage}
+                />
+              </box>
+            </box>
+          ) : (
+            <box style={contentBoxStyle}>
+              <MessageBlock
+                messageId={message.id}
+                blocks={message.blocks}
+                content={message.content}
+                isUser={isUser}
+                isAi={isAi}
+                isLoading={isLoading}
+                timestamp={message.timestamp}
+                isComplete={message.isComplete}
+                completionTime={message.completionTime}
+                credits={message.credits}
+                timerStartTime={timerStartTime}
+                textColor={textColor}
+                timestampColor={timestampColor}
+                markdownOptions={markdownOptions}
+                availableWidth={availableWidth}
+                markdownPalette={markdownPalette!}
+                onToggleCollapsed={onToggleCollapsed}
+                onBuildFast={onBuildFast}
+                onBuildMax={onBuildMax}
+                onBuildLite={onBuildLite}
+                onFeedback={onFeedback}
+                onCloseFeedback={onCloseFeedback}
+                validationErrors={message.validationErrors}
+                userError={message.userError}
+                onOpenFeedback={onOpenFeedback}
+                attachments={message.attachments}
+                textAttachments={message.textAttachments}
+                fileAttachments={message.fileAttachments}
+                metadata={message.metadata}
+                isLastMessage={isLastMessage}
+              />
+            </box>
+          )}
+        </box>
+
+        {hasAgentChildren && (
+          <AgentChildrenGrid
+            agentChildren={agentChildren}
+            depth={depth}
+            availableWidth={availableWidth}
+          />
+        )}
+      </box>
+    )
+  },
+)
+
+interface AgentMessageProps {
+  message: ChatMessage
+  depth: number
+  availableWidth: number
+}
+
+const AgentMessage = memo(
+  ({ message, depth, availableWidth }: AgentMessageProps): ReactNode => {
+    // Use useShallow for grouped selectors to prevent unnecessary re-renders
+    const { theme, markdownPalette, messageTree, onToggleCollapsed } = useMessageBlockStore(
+      useShallow((state) => ({
+        theme: state.context.theme,
+        markdownPalette: state.context.markdownPalette,
+        messageTree: state.context.messageTree,
+        onToggleCollapsed: state.callbacks.onToggleCollapsed,
+      })),
+    )
+
+    // Derive streaming boolean for this specific message to avoid re-renders when other agents change
+    const isStreaming = useChatStore((state) => state.streamingAgents.has(message.id))
+    const setFocusedAgentId = useChatStore((state) => state.setFocusedAgentId)
+
+    // A streaming agent re-renders on every flush, and a full markdown parse of
+    // its whole body per flush is the same quadratic cost the root message had.
+    const markdownCache = useRef<ReturnType<typeof createStreamingMarkdownCache> | null>(null)
+    if (markdownCache.current === null) {
+      markdownCache.current = createStreamingMarkdownCache()
+    }
+
+    const agentCodeBlockWidth = Math.max(
+      10,
+      availableWidth - AGENT_CONTENT_HORIZONTAL_PADDING,
+    )
+    const agentPalette: MarkdownPalette | undefined = useMemo(
+      () => markdownPalette ? {
+        ...markdownPalette,
+        codeTextFg: theme?.foreground ?? markdownPalette.codeTextFg,
+      } : undefined,
+      [markdownPalette, theme?.foreground],
+    )
+    const agentMarkdownOptions = useMemo(
+      () => ({ codeBlockWidth: agentCodeBlockWidth, palette: agentPalette! }),
+      [agentCodeBlockWidth, agentPalette],
+    )
+
+    // Guard against missing agent info (should not happen for agent variant messages)
+    if (!message.agent) {
+      return (
+        <text fg={theme?.error}>
+          Error: Missing agent info for agent message
+        </text>
+      )
+    }
+    const agentInfo = message.agent
+
+    // Get or initialize collapse state from message metadata
+    const isCollapsed = message.metadata?.isCollapsed ?? false
+
+    const agentChildren = messageTree?.get(message.id) ?? []
+
+    const bulletChar = '• '
+    const fullPrefix = bulletChar
+
+    const lines = message.content.split('\n').filter((line) => line.trim())
+    const firstLine = lines[0] || ''
+    const lastLine = lines[lines.length - 1] || firstLine
+    const rawDisplayContent = isCollapsed ? lastLine : message.content
+
+    const streamingPreview = isStreaming
+      ? firstLine.replace(/[#*_`~\[\]()]/g, '').trim() + '...'
+      : ''
+
+    const finishedPreview =
+      !isStreaming && isCollapsed
+        ? lastLine.replace(/[#*_`~\[\]()]/g, '').trim()
+        : ''
+
+    const displayContent = !hasMarkdown(rawDisplayContent)
+      ? rawDisplayContent
+      : isStreaming
+        ? renderStreamingMarkdownCached(
+            rawDisplayContent,
+            agentMarkdownOptions,
+            markdownCache.current,
+          )
+        : renderMarkdown(rawDisplayContent, agentMarkdownOptions)
+
+    const handleTitleClick = (): void => {
+      onToggleCollapsed(message.id)
+      setFocusedAgentId(message.id)
+    }
+
+    const handleContentClick = (): void => {
+      if (!isCollapsed) {
+        return
+      }
+
+      onToggleCollapsed(message.id)
+      setFocusedAgentId(message.id)
+    }
+
+    return (
+      <box
+        key={message.id}
+        style={{
+          flexDirection: 'column',
+          gap: 0,
+          flexShrink: 0,
+        }}
+      >
+        <box
+          style={{
+            flexDirection: 'row',
+            flexShrink: 0,
+          }}
+        >
+          <text style={{ wrapMode: 'none' }}>
+            <span fg={theme?.success}>{fullPrefix}</span>
+          </text>
+          <box
+            style={{
+              flexDirection: 'column',
+              gap: 0,
+              flexShrink: 1,
+              flexGrow: 1,
+            }}
+          >
+            <Button
+              style={{
+                flexDirection: 'row',
+                alignSelf: 'flex-start',
+                backgroundColor: isCollapsed ? theme?.muted : theme?.success,
+                paddingLeft: 1,
+                paddingRight: 1,
+              }}
+              onClick={handleTitleClick}
+            >
+              <text style={{ wrapMode: 'word' }}>
+                <span fg={theme?.foreground}>{isCollapsed ? '▸ ' : '▾ '}</span>
+                <span fg={theme?.foreground} attributes={TextAttributes.BOLD}>
+                  {agentInfo.agentName}
+                </span>
+              </text>
+            </Button>
+            <Button
+              style={{ flexShrink: 1, paddingBottom: isCollapsed ? 1 : 0 }}
+              onClick={handleContentClick}
+            >
+              {isStreaming && isCollapsed && streamingPreview && (
+                <text
+                  style={{ wrapMode: 'word', fg: theme?.foreground }}
+                  attributes={TextAttributes.ITALIC}
+                >
+                  {streamingPreview}
+                </text>
+              )}
+              {!isStreaming && isCollapsed && finishedPreview && (
+                <text
+                  style={{ wrapMode: 'word', fg: theme?.muted }}
+                  attributes={TextAttributes.ITALIC}
+                >
+                  {finishedPreview}
+                </text>
+              )}
+              {!isCollapsed && (
+                <text
+                  key={`agent-content-${message.id}`}
+                  style={{ wrapMode: 'word', fg: theme?.foreground }}
+                >
+                  {displayContent}
+                </text>
+              )}
+            </Button>
+          </box>
+        </box>
+        {agentChildren.length > 0 && (
+          <AgentChildrenGrid
+            agentChildren={agentChildren}
+            depth={depth}
+            availableWidth={availableWidth}
+          />
+        )}
+      </box>
+    )
+  },
+)
+```
+- File `cli/src/utils/markdown-renderer.tsx` (1234 lines):
+```
+import { TextAttributes } from '@opentui/core'
+import React from 'react'
+import remarkBreaks from 'remark-breaks'
+import remarkGfm from 'remark-gfm'
+import remarkParse from 'remark-parse'
+import stringWidth from 'string-width'
+import { unified } from 'unified'
+
+import { logger } from './logger'
+
+import type {
+  Blockquote,
+  Code,
+  Content,
+  Emphasis,
+  Heading,
+  InlineCode,
+  Link,
+  List,
+  ListItem,
+  Paragraph,
+  Root,
+  Strong,
+  Table,
+  TableCell,
+  TableRow,
+  Text,
+} from 'mdast'
+import type { ReactNode } from 'react'
+
+// Helper component to work around TypeScript's Fragment key typing issue
+const KeyedFragment = React.Fragment as React.FC<{ key?: string | number; children?: ReactNode }>
+
+// Helper to wrap segments in KeyedFragments
+const wrapSegmentsInFragments = (
+  segments: ReactNode[],
+  keyPrefix: string,
+): ReactNode => {
+  return segments.map((segment, idx) => (
+    <KeyedFragment key={keyPrefix + '-' + idx}>{segment}</KeyedFragment>
+  ))
+}
+
+export interface MarkdownPalette {
+  inlineCodeFg: string
+  codeBackground: string
+  codeHeaderFg: string
+  headingFg: Record<number, string>
+  listBulletFg: string
+  blockquoteBorderFg: string
+  blockquoteTextFg: string
+  dividerFg: string
+  codeTextFg: string
+  codeMonochrome: boolean
+  linkFg: string
+}
+
+export interface MarkdownRenderOptions {
+  palette?: Partial<MarkdownPalette>
+  codeBlockWidth?: number
+}
+
+const defaultPalette: MarkdownPalette = {
+  inlineCodeFg: '#86efac',
+  codeBackground: '#0d1117',
+  codeHeaderFg: '#666',
+  headingFg: {
+    1: 'magenta',
+    2: 'green',
+    3: 'green',
+    4: 'green',
+    5: 'green',
+    6: 'green',
+  },
+  listBulletFg: 'white',
+  blockquoteBorderFg: 'gray',
+  blockquoteTextFg: 'gray',
+  dividerFg: '#666',
+  codeTextFg: 'brightWhite',
+  codeMonochrome: false,
+  linkFg: '#3B82F6',
+}
+
+const resolvePalette = (
+  overrides?: Partial<MarkdownPalette>,
+): MarkdownPalette => {
+  const palette: MarkdownPalette = {
+    ...defaultPalette,
+    headingFg: { ...defaultPalette.headingFg },
+  }
+
+  if (!overrides) {
+    return palette
+  }
+
+  const { headingFg, ...rest } = overrides
+  Object.assign(palette, rest)
+
+  if (headingFg) {
+    palette.headingFg = {
+      ...palette.headingFg,
+      ...headingFg,
+    }
+  }
+
+  return palette
+}
+
+const processor = unified()
+  .use(remarkParse)
+  .use(remarkGfm)
+  .use(remarkBreaks)
+
+type MarkdownNode = Content | Root
+
+type InlineFallbackNode = Text | Strong | Emphasis
+
+interface RenderState {
+  palette: MarkdownPalette
+  codeBlockWidth: number
+  nextKey: () => string
+}
+
+const createRenderState = (
+  palette: MarkdownPalette,
+  codeBlockWidth: number,
+  keyPrefix = '',
+): RenderState => {
+  let counter = 0
+  return {
+    palette,
+    codeBlockWidth,
+    nextKey: () => {
+      counter += 1
+      return `${keyPrefix}markdown-${counter}`
+    },
+  }
+}
+
+// Unified trim helper with predicate
+const trimTrailingNodes = (
+  nodes: ReactNode[],
+  predicate: (node: ReactNode) => boolean,
+): ReactNode[] => {
+  let end = nodes.length
+  while (end > 0 && predicate(nodes[end - 1])) {
+    end -= 1
+  }
+  return end === nodes.length ? nodes : nodes.slice(0, end)
+}
+
+const trimTrailingWhitespaceNodes = (nodes: ReactNode[]): ReactNode[] => {
+  return trimTrailingNodes(
+    nodes,
+    (node) => typeof node === 'string' && node.trim().length === 0,
+  )
+}
+
+const trimTrailingBreaks = (nodes: ReactNode[]): ReactNode[] => {
+  return trimTrailingNodes(
+    nodes,
+    (node) => typeof node === 'string' && /^\n+$/.test(node),
+  )
+}
+
+const splitNodesByNewline = (nodes: ReactNode[]): ReactNode[][] => {
+  const lines: ReactNode[][] = [[]]
+  nodes.forEach((node) => {
+    if (typeof node === 'string') {
+      const parts = node.split('\n')
+      parts.forEach((part, idx) => {
+        if (part.length > 0) {
+          lines[lines.length - 1].push(part)
+        }
+        if (idx < parts.length - 1) {
+          lines.push([])
+        }
+      })
+    } else {
+      lines[lines.length - 1].push(node)
+    }
+  })
+  return lines
+}
+
+const hasUnescapedMarker = (value: string): boolean => {
+  if (!value) {
+    return false
+  }
+  const markers = ['**', '*']
+  return markers.some((marker) => {
+    let idx = value.indexOf(marker)
+    while (idx !== -1) {
+      let backslashes = 0
+      for (let offset = idx - 1; offset >= 0 && value[offset] === '\\'; offset -= 1) {
+        backslashes += 1
+      }
+      if (backslashes % 2 === 0) {
+        return true
+      }
+      idx = value.indexOf(marker, idx + marker.length)
+    }
+    return false
+  })
+}
+
+const findClosingDelimiter = (
+  value: string,
+  start: number,
+  marker: string,
+): number => {
+  let idx = start
+  while (idx < value.length) {
+    idx = value.indexOf(marker, idx)
+    if (idx === -1) {
+      return -1
+    }
+    let backslashes = 0
+    for (let offset = idx - 1; offset >= 0 && value[offset] === '\\'; offset -= 1) {
+      backslashes += 1
+    }
+    if (backslashes % 2 === 0) {
+      return idx
+    }
+    idx += marker.length
+  }
+  return -1
+}
+
+/**
+ * Remark follows CommonMark's emphasis rules, which ignore some practical
+ * patterns (e.g., `Other**.github/**`). This fallback splits leftover text
+ * nodes on emphasis markers so we still render inline styling in those cases.
+ */
+const parseInlineFallback = (value: string): InlineFallbackNode[] => {
+  if (!value || !hasUnescapedMarker(value)) {
+    return [{ type: 'text', value }]
+  }
+
+  const nodes: InlineFallbackNode[] = []
+  let buffer = ''
+
+  const flushBuffer = () => {
+    if (buffer.length > 0) {
+      nodes.push({ type: 'text', value: buffer })
+      buffer = ''
+    }
+  }
+
+  let index = 0
+  while (index < value.length) {
+    const char = value[index]
+
+    if (char === '*') {
+      const markerChar = char
+      const isDouble =
+        index + 1 < value.length && value[index + 1] === markerChar
+      const marker = isDouble ? markerChar.repeat(2) : markerChar
+      const markerLength = marker.length
+
+      let backslashes = 0
+      for (
+        let offset = index - 1;
+        offset >= 0 && value[offset] === '\\';
+        offset -= 1
+      ) {
+        backslashes += 1
+      }
+
+      if (backslashes % 2 === 1) {
+        buffer += marker
+        index += markerLength
+        continue
+      }
+
+      const closing = findClosingDelimiter(value, index + markerLength, marker)
+      if (closing === -1) {
+        buffer += marker
+        index += markerLength
+        continue
+      }
+
+      const inner = value.slice(index + markerLength, closing)
+      flushBuffer()
+      const children = parseInlineFallback(inner).filter(
+        (node) => !(node.type === 'text' && node.value.length === 0),
+      )
+
+      const emphasisNode: InlineFallbackNode =
+        isDouble
+          ? { type: 'strong', children }
+          : { type: 'emphasis', children }
+
+      nodes.push(emphasisNode)
+      index = closing + markerLength
+      continue
+    }
+
+    buffer += char
+    index += 1
+  }
+
+  flushBuffer()
+
+  if (nodes.length === 0) {
+    return [{ type: 'text', value }]
+  }
+
+  return nodes
+}
+
+const applyInlineFallbackFormatting = (node: MarkdownNode): void => {
+  if (!node || typeof node !== 'object') {
+    return
+  }
+
+  const mutable = node as { children?: MarkdownNode[] }
+  if (!Array.isArray(mutable.children)) {
+    return
+  }
+
+  const nextChildren: MarkdownNode[] = []
+
+  mutable.children.forEach((child) => {
+    if (child.type === 'text') {
+      const replacements = parseInlineFallback(child.value)
+      const hasChanges =
+        replacements.length !== 1 ||
+        replacements[0].type !== 'text' ||
+        replacements[0].value !== child.value
+
+      if (hasChanges) {
+        replacements.forEach((replacement) => {
+          if (replacement.type === 'text') {
+            nextChildren.push(replacement)
+          } else {
+            applyInlineFallbackFormatting(
+              replacement as unknown as MarkdownNode,
+            )
+            nextChildren.push(replacement as unknown as MarkdownNode)
+          }
+        })
+        return
+      }
+    } else {
+      applyInlineFallbackFormatting(child as MarkdownNode)
+    }
+
+    nextChildren.push(child as MarkdownNode)
+  })
+
+  mutable.children = nextChildren
+}
+
+const getChildrenText = (children: MarkdownNode[]): string => {
+  return children.map(nodeToPlainText).join('')
+}
+
+const nodeToPlainText = (node: MarkdownNode): string => {
+  switch (node.type) {
+    case 'root':
+      return getChildrenText((node as Root).children as MarkdownNode[])
+
+    case 'paragraph':
+      return getChildrenText((node as Paragraph).children as MarkdownNode[]) + '\n\n'
+
+    case 'text':
+      return (node as Text).value
+
+    case 'strong':
+      return getChildrenText((node as Strong).children as MarkdownNode[])
+
+    case 'emphasis':
+      return getChildrenText((node as Emphasis).children as MarkdownNode[])
+
+    case 'inlineCode':
+      return (node as InlineCode).value
+
+    case 'heading': {
+      const heading = node as Heading
+      const prefix = '#'.repeat(Math.max(1, Math.min(heading.depth, 6)))
+      const content = getChildrenText(heading.children as MarkdownNode[])
+      return `${prefix} ${content}\n\n`
+    }
+
+    case 'list': {
+      const list = node as List
+      return (
+        list.children
+          .map((item, idx) => {
+            const marker = list.ordered ? `${(list.start ?? 1) + idx}. ` : '- '
+            const text = getChildrenText((item as ListItem).children as MarkdownNode[]).trimEnd()
+            return marker + text
+          })
+          .join('\n') + '\n\n'
+      )
+    }
+
+    case 'listItem':
+      return getChildrenText((node as ListItem).children as MarkdownNode[])
+
+    case 'blockquote': {
+      const blockquote = node as Blockquote
+      const content = blockquote.children
+        .map((child) => nodeToPlainText(child).replace(/^/gm, '> '))
+        .join('')
+      return `${content}\n\n`
+    }
+
+    case 'code': {
+      const code = node as Code
+      const header = code.lang ? `\`\`\`${code.lang}\n` : '```\n'
+      return `${header}${code.value}\n\`\`\`\n\n`
+    }
+
+    case 'break':
+      return '\n'
+
+    case 'thematicBreak':
+      return '---\n\n'
+
+    case 'link': {
+      const link = node as Link
+      const label = link.children.length > 0
+        ? getChildrenText(link.children as MarkdownNode[])
+        : link.url
+      return label
+    }
+
+    case 'table': {
+      const table = node as Table
+      return table.children
+        .map((row) => {
+          const cells = (row as TableRow).children as TableCell[]
+          return cells.map((cell) => nodeToPlainText(cell)).join(' | ')
+        })
+        .join('\n') + '\n\n'
+    }
+
+    case 'tableRow':
+      return (node as TableRow).children.map(nodeToPlainText).join(' | ')
+
+    case 'tableCell':
+      return getChildrenText((node as TableCell).children as MarkdownNode[])
+
+    case 'delete': {
+      // Strikethrough - just return the text content
+      const deleteNode = node as any
+      if (Array.isArray(deleteNode.children)) {
+        return getChildrenText(deleteNode.children as MarkdownNode[])
+      }
+      return ''
+    }
+
+    default: {
+      const anyNode = node as any
+      if (Array.isArray(anyNode.children)) {
+        return getChildrenText(anyNode.children as MarkdownNode[])
+      }
+      return ''
+    }
+  }
+}
+
+const renderNodes = (
+  children: MarkdownNode[],
+  state: RenderState,
+  parentType: MarkdownNode['type'],
+): ReactNode[] => {
+  const results: ReactNode[] = []
+  for (let index = 0; index < children.length; index += 1) {
+    const child = children[index]
+    const nextSibling = children[index + 1] as MarkdownNode | undefined
+    results.push(...renderNode(child, state, parentType, nextSibling))
+  }
+  return results
+}
+
+const renderCodeBlock = (code: Code, state: RenderState): ReactNode[] => {
+  const { palette, nextKey } = state
+  const lines = code.value.split('\n')
+  const nodes: ReactNode[] = []
+
+  if (code.lang) {
+    nodes.push(
+      <span key={nextKey()} fg={palette.codeHeaderFg}>
+        {`// ${code.lang}`}
+      </span>,
+      '\n',
+    )
+  }
+
+  lines.forEach((line, index) => {
+    const displayLine = line === '' ? ' ' : line
+    nodes.push(
+      <span
+        key={nextKey()}
+        fg={palette.codeTextFg}
+        bg={palette.codeMonochrome ? undefined : palette.codeBackground}
+      >
+        {displayLine}
+      </span>,
+    )
+    if (index < lines.length - 1) {
+      nodes.push('\n')
+    }
+  })
+
+  nodes.push('\n\n')
+  return nodes
+}
+
+const renderBlockquote = (
+  blockquote: Blockquote,
+  state: RenderState,
+): ReactNode[] => {
+  const { palette, nextKey } = state
+  const childNodes = renderNodes(
+    blockquote.children as MarkdownNode[],
+    state,
+    blockquote.type,
+  )
+  const lines = splitNodesByNewline(childNodes)
+  const nodes: ReactNode[] = []
+
+  lines.forEach((line, index) => {
+    if (line.length === 0) {
+      return
+    }
+    nodes.push(
+      <span key={nextKey()} fg={palette.blockquoteBorderFg}>
+        {'> '}
+      </span>,
+    )
+    nodes.push(
+      <span key={nextKey()} fg={palette.blockquoteTextFg}>
+        {wrapSegmentsInFragments(line, nextKey())}
+      </span>,
+    )
+    if (index < lines.length - 1) {
+      nodes.push('\n')
+    }
+  })
+
+  nodes.push('\n\n')
+  return nodes
+}
+
+const renderList = (list: List, state: RenderState): ReactNode[] => {
+  const { palette, nextKey } = state
+  const nodes: ReactNode[] = []
+  const start = list.start ?? 1
+
+  list.children.forEach((item, idx) => {
+    const listItem = item as ListItem
+    const marker =
+      listItem.checked === true
+        ? '[x] '
+        : listItem.checked === false
+          ? '[ ] '
+          : list.ordered
+            ? `${start + idx}. `
+            : '- '
+
+    nodes.push(
+      <span key={nextKey()} fg={palette.listBulletFg}>
+        {marker}
+      </span>,
+    )
+
+    const itemNodes = trimTrailingBreaks(
+      renderNodes(listItem.children as MarkdownNode[], state, listItem.type),
+    )
+    if (itemNodes.length === 0) {
+      nodes.push('\n')
+    } else {
+      nodes.push(
+        <KeyedFragment key={nextKey()}>
+          {wrapSegmentsInFragments(itemNodes, nextKey())}
+        </KeyedFragment>,
+      )
+      nodes.push('\n')
+    }
+  })
+
+  if (nodes.length > 0) {
+    nodes.push('\n')
+  }
+
+  return nodes
+}
+
+const renderHeading = (heading: Heading, state: RenderState): ReactNode[] => {
+  const { palette, nextKey } = state
+  const depth = Math.max(1, Math.min(heading.depth, 6))
+  const color = palette.headingFg[depth] ?? palette.headingFg[6]
+  const childNodes = renderNodes(
+    heading.children as MarkdownNode[],
+    state,
+    heading.type,
+  )
+
+  return [
+    <span key={nextKey()} fg={color} attributes={TextAttributes.BOLD}>
+      {childNodes.map((segment, idx) => (
+        <KeyedFragment key={nextKey() + '-' + idx}>{segment}</KeyedFragment>
+      ))}
+    </span>,
+    '\n\n',
+  ]
+}
+
+const renderInlineCode = (
+  inlineCode: InlineCode,
+  state: RenderState,
+): ReactNode[] => {
+  const { palette, nextKey } = state
+  const content = inlineCode.value || ' '
+  return [
+    <span
+      key={nextKey()}
+      fg={palette.inlineCodeFg}
+      bg={palette.codeMonochrome ? undefined : palette.codeBackground}
+      attributes={TextAttributes.BOLD}
+    >
+      {` ${content} `}
+    </span>,
+  ]
+}
+
+const renderLink = (link: Link, state: RenderState): ReactNode[] => {
+  const { palette, nextKey } = state
+  const labelNodes = renderNodes(
+    link.children as MarkdownNode[],
+    state,
+    link.type,
+  )
+  const label = labelNodes.length > 0 ? labelNodes : [link.url]
+
+  return [
+    <span key={nextKey()} fg={palette.linkFg}>
+      {wrapSegmentsInFragments(label, nextKey())}
+    </span>,
+  ]
+}
+
+/**
+ * Wraps text to fit within a specified width, returning an array of lines.
+ * Uses stringWidth to properly measure Unicode and wide characters.
+ * Performs word-wrapping where possible, falling back to character-level
+ * breaking for words that exceed the column width.
+ */
+const wrapText = (text: string, maxWidth: number): string[] => {
+  if (maxWidth < 1) return ['']
+  if (!text) return ['']
+  const textWidth = stringWidth(text)
+  if (textWidth <= maxWidth) return [text]
+
+  const lines: string[] = []
+  let currentLine = ''
+  let currentWidth = 0
+  const tokens = text.split(/(\s+)/)
+
+  for (const token of tokens) {
+    if (!token) continue
+    const tokenWidth = stringWidth(token)
+    const isWhitespace = /^\s+$/.test(token)
+
+    // Skip leading whitespace on new lines
+    if (isWhitespace && currentWidth === 0) continue
+
+    if (tokenWidth > maxWidth && !isWhitespace) {
+      // Break long words character by character
+      for (const char of token) {
+        const charWidth = stringWidth(char)
+        if (currentWidth + charWidth > maxWidth) {
+          if (currentLine) lines.push(currentLine)
+          currentLine = char
+          currentWidth = charWidth
+        } else {
+          currentLine += char
+          currentWidth += charWidth
+        }
+      }
+    } else if (currentWidth + tokenWidth > maxWidth) {
+      if (currentLine) lines.push(currentLine.trimEnd())
+      currentLine = isWhitespace ? '' : token
+      currentWidth = isWhitespace ? 0 : tokenWidth
+    } else {
+      currentLine += token
+      currentWidth += tokenWidth
+    }
+  }
+
+  if (currentLine) lines.push(currentLine.trimEnd())
+  return lines.length > 0 ? lines : ['']
+}
+
+/**
+ * Pads text to reach exact width using spaces.
+ */
+const padText = (text: string, targetWidth: number): string => {
+  const currentWidth = stringWidth(text)
+  if (currentWidth >= targetWidth) return text
+  return text + ' '.repeat(targetWidth - currentWidth)
+}
+
+const renderTable = (table: Table, state: RenderState): ReactNode[] => {
+  const { palette, nextKey, codeBlockWidth } = state
+  const nodes: ReactNode[] = []
+
+  // Extract all rows and their plain text content
+  const rows = table.children.map((row) => {
+    const cells = (row as TableRow).children as TableCell[]
+    return cells.map((cell) => nodeToPlainText(cell).trim())
+  })
+
+  if (rows.length === 0) return nodes
+
+  // Determine number of columns
+  const numCols = Math.max(...rows.map((r) => r.length))
+  if (numCols === 0) return nodes
+
+  // Calculate natural column widths (minimum 3 chars per column)
+  const naturalWidths: number[] = Array(numCols).fill(3)
+  for (const row of rows) {
+    for (let i = 0; i < row.length; i++) {
+      const cellWidth = stringWidth(row[i] || '')
+      naturalWidths[i] = Math.max(naturalWidths[i], cellWidth)
+    }
+  }
+
+  // Calculate total width needed:
+  // Each column has its content width
+  // Separators: " │ " between columns (3 chars each), none at edges
+  const separatorWidth = 3 // ' │ '
+  const numSeparators = numCols - 1
+  const totalNaturalWidth =
+    naturalWidths.reduce((a, b) => a + b, 0) + numSeparators * separatorWidth
+
+  // Available width for the table (leave some margin)
+  const availableWidth = Math.max(20, codeBlockWidth - 2)
+
+  // Calculate final column widths
+  let columnWidths: number[]
+  if (totalNaturalWidth <= availableWidth) {
+    // Table fits - use natural widths
+    columnWidths = naturalWidths
+  } else {
+    // Table too wide - proportionally shrink columns
+    const availableForContent = availableWidth - numSeparators * separatorWidth
+    const totalNaturalContent = naturalWidths.reduce((a, b) => a + b, 0)
+    const scale = availableForContent / totalNaturalContent
+    
+    columnWidths = naturalWidths.map((w) => {
+      // Minimum 3 chars, scale the rest
+      return Math.max(3, Math.floor(w * scale))
+    })
+    
+    // Distribute any remaining width to columns that were clamped
+    let usedWidth = columnWidths.reduce((a, b) => a + b, 0)
+    let remaining = availableForContent - usedWidth
+    for (let i = 0; i < columnWidths.length && remaining > 0; i++) {
+      if (columnWidths[i] < naturalWidths[i]) {
+        const add = Math.min(remaining, naturalWidths[i] - columnWidths[i])
+        columnWidths[i] += add
+        remaining -= add
+      }
+    }
+  }
+
+  // Helper to render a horizontal separator line
+  const renderSeparator = (leftChar: string, midChar: string, rightChar: string): void => {
+    let line = leftChar
+    columnWidths.forEach((width, idx) => {
+      line += '─'.repeat(width + 2) // +2 for padding spaces
+      line += idx < columnWidths.length - 1 ? midChar : rightChar
+    })
+    nodes.push(
+      <span key={nextKey()} fg={palette.dividerFg}>
+        {line}
+      </span>,
+    )
+    nodes.push('\n')
+  }
+
+  // Pre-wrap all cell contents so we know the height of each row
+  const wrappedRows: string[][][] = rows.map((row) =>
+    Array.from({ length: numCols }, (_, i) => {
+      const cellText = row[i] || ''
+      return wrapText(cellText, columnWidths[i])
+    }),
+  )
+
+  // Render top border
+  renderSeparator('┌', '┬', '┐')
+
+  // Render each row with word-wrapped cells
+  wrappedRows.forEach((wrappedCells, rowIdx) => {
+    const isHeader = rowIdx === 0
+    const rowHeight = Math.max(...wrappedCells.map((lines) => lines.length), 1)
+
+    // Render each visual line in the row
+    for (let lineIdx = 0; lineIdx < rowHeight; lineIdx++) {
+      for (let cellIdx = 0; cellIdx < numCols; cellIdx++) {
+        const colWidth = columnWidths[cellIdx]
+        const lineText = wrappedCells[cellIdx][lineIdx] || ''
+        const displayText = padText(lineText, colWidth)
+
+        // Left border for first cell
+        if (cellIdx === 0) {
+          nodes.push(
+            <span key={nextKey()} fg={palette.dividerFg}>
+              │
+            </span>,
+          )
+        }
+
+        // Cell content with padding
+        nodes.push(
+          <span
+            key={nextKey()}
+            fg={isHeader ? palette.headingFg[3] : undefined}
+            attributes={isHeader ? TextAttributes.BOLD : undefined}
+          >
+            {' '}
+            {displayText}
+            {' '}
+          </span>,
+        )
+
+        // Separator or right border
+        nodes.push(
+          <span key={nextKey()} fg={palette.dividerFg}>
+            │
+          </span>,
+        )
+      }
+      nodes.push('\n')
+    }
+
+    // Add separator line after header
+    if (isHeader) {
+      renderSeparator('├', '┼', '┤')
+    }
+  })
+
+  // Render bottom border
+  renderSeparator('└', '┴', '┘')
+
+  nodes.push('\n')
+  return nodes
+}
+
+const renderNode = (
+  node: MarkdownNode,
+  state: RenderState,
+  parentType: MarkdownNode['type'],
+  nextSibling?: MarkdownNode,
+): ReactNode[] => {
+  switch (node.type) {
+    case 'root':
+      return renderNodes(
+        (node as Root).children as MarkdownNode[],
+        state,
+        node.type,
+      )
+
+    case 'paragraph': {
+      const children = renderNodes(
+        (node as Paragraph).children as MarkdownNode[],
+        state,
+        node.type,
+      )
+      const nodes = [...children]
+      if (parentType === 'listItem') {
+        nodes.push('\n')
+      } else if (parentType === 'blockquote') {
+        nodes.push('\n')
+      } else {
+        const isTightFollowup =
+          parentType === 'root' &&
+          nextSibling &&
+          (nextSibling.type === 'blockquote' || nextSibling.type === 'list')
+        nodes.push(isTightFollowup ? '\n' : '\n\n')
+      }
+      return nodes
+    }
+
+    case 'text':
+      return [(node as Text).value]
+
+    case 'strong': {
+      const children = renderNodes(
+        (node as Strong).children as MarkdownNode[],
+        state,
+        node.type,
+      )
+      return [
+        <span key={state.nextKey()} attributes={TextAttributes.BOLD}>
+          {wrapSegmentsInFragments(children, state.nextKey())}
+        </span>,
+      ]
+    }
+
+    case 'emphasis': {
+      const children = renderNodes(
+        (node as Emphasis).children as MarkdownNode[],
+        state,
+        node.type,
+      )
+      return [
+        <span key={state.nextKey()} attributes={TextAttributes.ITALIC}>
+          {wrapSegmentsInFragments(children, state.nextKey())}
+        </span>,
+      ]
+    }
+
+    case 'inlineCode':
+      return renderInlineCode(node as InlineCode, state)
+
+    case 'heading':
+      return renderHeading(node as Heading, state)
+
+    case 'list':
+      return renderList(node as List, state)
+
+    case 'listItem': {
+      return renderNodes(
+        (node as ListItem).children as MarkdownNode[],
+        state,
+        node.type,
+      )
+    }
+
+    case 'blockquote':
+      return renderBlockquote(node as Blockquote, state)
+
+    case 'code':
+      return renderCodeBlock(node as Code, state)
+
+    case 'break':
+      return ['\n']
+
+    case 'thematicBreak': {
+      const width = Math.max(10, Math.min(state.codeBlockWidth, 80))
+      const divider = '─'.repeat(width)
+      return [
+        <span key={state.nextKey()} fg={state.palette.dividerFg}>
+          {divider}
+        </span>,
+        '\n\n',
+      ]
+    }
+
+    case 'link':
+      return renderLink(node as Link, state)
+
+    case 'table':
+      return renderTable(node as Table, state)
+
+    case 'delete': {
+      // Strikethrough from GFM
+      const anyNode = node as any
+      const children = renderNodes(
+        anyNode.children as MarkdownNode[],
+        state,
+        node.type,
+      )
+      return [
+        <span key={state.nextKey()} attributes={TextAttributes.DIM}>
+          {wrapSegmentsInFragments(children, state.nextKey())}
+        </span>,
+      ]
+    }
+
+    default: {
+      const fallbackText = nodeToPlainText(node)
+      if (fallbackText) {
+        return [fallbackText]
+      }
+
+      const anyNode = node as any
+      if (Array.isArray(anyNode.children)) {
+        return renderNodes(anyNode.children as MarkdownNode[], state, node.type)
+      }
+
+      return []
+    }
+  }
+}
+
+/**
+ * Merges adjacent styled runs that render identically, including runs separated
+ * only by whitespace.
+ *
+ * A frame costs the terminal roughly linearly in the number of nodes it has to
+ * walk - ~60ms for 1,500 nodes regardless of whether anything changed - so a
+ * code block emitted as one span per line is the expensive shape, not the
+ * characters. Merging `<span>line</span>'\n'<span>line</span>` into a single
+ * span removes those per-line nodes without changing a rendered character.
+ */
+const coalesceNodes = (nodes: ReactNode[]): ReactNode[] => {
+  const merged: ReactNode[] = []
+
+  const sameStyledStrings = (
+    a: ReactNode,
+    b: ReactNode,
+  ): [Record<string, unknown>, string, string] | null => {
+    if (!React.isValidElement(a) || !React.isValidElement(b)) return null
+    if (a.type !== b.type) return null
+    const aProps = a.props as Record<string, unknown>
+    const bProps = b.props as Record<string, unknown>
+    const aKeys = Object.keys(aProps).filter((k) => k !== 'children')
+    const bKeys = Object.keys(bProps).filter((k) => k !== 'children')
+    if (aKeys.length !== bKeys.length) return null
+    for (const key of aKeys) {
+      if (aProps[key] !== bProps[key]) return null
+    }
+    if (
+      typeof aProps.children !== 'string' ||
+      typeof bProps.children !== 'string'
+    ) {
+      return null
+    }
+    return [aProps, aProps.children, bProps.children]
+  }
+
+  for (let i = 0; i < nodes.length; i++) {
+    const node = nodes[i]
+    const prev = merged[merged.length - 1]
+
+    if (
+      typeof prev === 'string' &&
+      typeof node === 'string' &&
+      prev.trim().length > 0 &&
+      node.trim().length > 0
+    ) {
+      merged[merged.length - 1] = prev + node
+      continue
+    }
+
+    const direct = sameStyledStrings(prev, node)
+    if (direct) {
+      const [props, aChildren, bChildren] = direct
+      merged[merged.length - 1] = React.createElement(
+        (prev as React.ReactElement).type as React.ElementType,
+        { ...props, children: aChildren + bChildren },
+      )
+      continue
+    }
+
+    if (!React.isValidElement(node)) {
+      merged.push(node)
+      continue
+    }
+
+    // Absorb a following run of same-styled nodes separated only by
+    // whitespace. Whitespace-only strings after the last node are left alone:
+    // they are the block separator the document-level trim drops.
+    let end = i + 1
+    let separator = ''
+    let absorbed: string | null = null
+    let props: Record<string, unknown> | null = null
+
+    while (end < nodes.length) {
+      const next = nodes[end]
+      if (typeof next === 'string' && next.trim().length === 0) {
+        separator += next
+        end += 1
+        continue
+      }
+      const match = sameStyledStrings(node, next)
+      if (!match) break
+      const [nextProps, , nextChildren] = match
+      props = nextProps
+      absorbed = (absorbed ?? (node.props as { children: string }).children) +
+        separator +
+        nextChildren
+      separator = ''
+      end += 1
+    }
+
+    if (absorbed !== null && props !== null) {
+      merged.push(
+        React.createElement(
+          (node as React.ReactElement).type as React.ElementType,
+          { ...props, children: absorbed },
+        ),
+      )
+      // The run ended at a node that could not be merged; the whitespace after
+      // the last merged node was buffered, not consumed, so re-emit it.
+      if (separator) {
+        merged.push(separator)
+      }
+      i = end - 1
+      continue
+    }
+
+    merged.push(node)
+  }
+
+  return merged
+}
+
+const normalizeOutput = (nodes: ReactNode[]): ReactNode => {
+  const trimmed = trimTrailingWhitespaceNodes(nodes)
+  if (trimmed.length === 0) {
+    return ''
+  }
+  if (trimmed.length === 1) {
+    return trimmed[0]
+  }
+  return (
+    <>
+      {trimmed.map((node, idx) => (
+        <KeyedFragment key={`markdown-out-${idx}`}>{node}</KeyedFragment>
+      ))}
+    </>
+  )
+}
+
+/**
+ * Parses and renders markdown without trimming the trailing block separator.
+ *
+ * `renderMarkdown` drops that separator, which is correct for a whole document
+ * but not when several rendered fragments are stitched back together: the
+ * incremental streaming renderer needs the separators to line up exactly as a
+ * single render would produce them.
+ */
+export function renderMarkdownNodes(
+  markdown: string,
+  options: MarkdownRenderOptions = {},
+  keyPrefix = '',
+): ReactNode[] {
+  try {
+    const palette = resolvePalette(options.palette)
+    const codeBlockWidth = options.codeBlockWidth ?? 80
+    const state = createRenderState(palette, codeBlockWidth, keyPrefix)
+    const ast = processor.parse(markdown) as Root
+    applyInlineFallbackFormatting(ast)
+    return coalesceNodes(renderNode(ast, state, ast.type, undefined))
+  } catch (error) {
+    logger.error(error, 'Failed to parse markdown')
+    return [markdown]
+  }
+}
+
+/** Drops the whitespace-only nodes a rendered document ends with. */
+export const trimTrailingWhitespace = trimTrailingWhitespaceNodes
+
+export function renderMarkdown(
+  markdown: string,
+  options: MarkdownRenderOptions = {},
+): ReactNode {
+  try {
+    const palette = resolvePalette(options.palette)
+    const codeBlockWidth = options.codeBlockWidth ?? 80
+    const state = createRenderState(palette, codeBlockWidth)
+    const ast = processor.parse(markdown) as Root
+    applyInlineFallbackFormatting(ast)
+    const nodes = coalesceNodes(renderNode(ast, state, ast.type, undefined))
+    return normalizeOutput(nodes)
+  } catch (error) {
+    logger.error(error, 'Failed to parse markdown')
+    return markdown
+  }
+}
+
+export function hasMarkdown(content: string): boolean {
+  return /[*_`#>\-\+]|\[.*\]\(.*\)|```/.test(content)
+}
+
+export function hasIncompleteCodeFence(content: string): boolean {
+  let fenceCount = 0
+  const fenceRegex = /```/g
+  while (fenceRegex.exec(content)) {
+    fenceCount += 1
+  }
+  return fenceCount % 2 === 1
+}
+
+const mergeStreamingSegments = (segments: ReactNode[]): ReactNode => {
+  if (segments.length === 0) {
+    return ''
+  }
+  if (segments.length === 1) {
+    return segments[0]
+  }
+
+  return (
+    <>
+      {segments.map((segment, idx) => (
+        <KeyedFragment key={`stream-segment-${idx}`}>
+          {segment}
+        </KeyedFragment>
+      ))}
+    </>
+  )
+}
+
+export function renderStreamingMarkdown(
+  content: string,
+  options: MarkdownRenderOptions = {},
+): ReactNode {
+  if (!hasMarkdown(content)) {
+    return content
+  }
+
+  if (!hasIncompleteCodeFence(content)) {
+    return renderMarkdown(content, options)
+  }
+
+  const lastFenceIndex = content.lastIndexOf('```')
+  if (lastFenceIndex === -1) {
+    return renderMarkdown(content, options)
+  }
+
+  const completeSection = content.slice(0, lastFenceIndex)
+  const pendingSection = content.slice(lastFenceIndex)
+
+  const segments: ReactNode[] = []
+
+  if (completeSection.length > 0) {
+    segments.push(renderMarkdown(completeSection, options))
+  }
+
+  if (pendingSection.length > 0) {
+    segments.push(pendingSection)
+  }
+
+  return mergeStreamingSegments(segments)
+}
+```
+- File `cli/src/utils/streaming-markdown.ts` (205 lines):
+```
+import { Fragment, createElement, memo } from 'react'
+
+import {
+  hasIncompleteCodeFence,
+  renderMarkdownNodes,
+  trimTrailingWhitespace,
+} from './markdown-renderer'
+
+import type { MarkdownRenderOptions } from './markdown-renderer'
+import type { ReactNode } from 'react'
+
+/**
+ * Incremental renderer for the block that is still streaming.
+ *
+ * `renderMarkdown` costs roughly 3ms per kilobyte, and the live message is
+ * re-rendered on every flush while it grows - so a long answer re-parsed its
+ * whole transcript about ten times a second: a 200KB answer cost ~480ms of
+ * parsing per flush, on the render thread.
+ *
+ * Streaming text is append-only, so every complete block before the last
+ * boundary can be parsed once and reused. Only the tail - the block currently
+ * being written - is re-rendered per flush.
+ */
+
+/**
+ * Rendered once per committed segment. `memo` keeps React from re-walking the
+ * already-rendered prefix on every flush: the element objects are reused, so
+ * the reconcile cost stays proportional to the tail rather than the message.
+ */
+const RenderedSegment = memo(function RenderedSegment({
+  nodes,
+}: {
+  nodes: ReactNode[]
+}) {
+  return createElement(Fragment, null, ...nodes)
+})
+
+export type StreamingMarkdownCache = {
+  /** Already parsed and reusable. `content` must start with this. */
+  prefix: string
+  /** Committed segments, each a memoized element. */
+  segmentElements: ReactNode[]
+  /** How many segments have been committed; keys segment node keys apart. */
+  segments: number
+  /** Whether a fenced code block is still open at the end of `prefix`. */
+  fenceOpen: boolean
+  /** Options the nodes were rendered with; a change invalidates them. */
+  codeBlockWidth: number
+  palette: unknown
+}
+
+export const createStreamingMarkdownCache = (): StreamingMarkdownCache => ({
+  prefix: '',
+  segmentElements: [],
+  segments: 0,
+  fenceOpen: false,
+  codeBlockWidth: -1,
+  palette: undefined,
+})
+
+/** A blank line only separates blocks cleanly outside lists and quotes. */
+const LIST_OR_QUOTE_LINE = /^[ \t]*(?:[-*+]|\d+[.)]|>)/
+
+const previousLine = (content: string, index: number): string => {
+  let start = index - 1
+  while (start >= 0 && content[start] !== '\n') start--
+  return content.slice(start + 1, index)
+}
+
+const nextLine = (content: string, index: number): string => {
+  let start = index
+  while (
+    start < content.length &&
+    (content[start] === '\n' || content[start] === ' ' || content[start] === '\t')
+  ) {
+    start++
+  }
+  let end = start
+  while (end < content.length && content[end] !== '\n') end++
+  return content.slice(start, end)
+}
+
+const isSafeBoundary = (content: string, blankIndex: number): boolean => {
+  const next = nextLine(content, blankIndex)
+  // Nothing rendered after the boundary yet: no stable content to commit.
+  if (!next) return false
+
+  // A list or blockquote can continue across a blank line (loose lists), and
+  // parsing the halves separately would restart ordered numbering or split the
+  // quote. Leave those boundaries to the tail. Excluding them also means the
+  // last committed block is never a paragraph followed by a list, which is the
+  // only case where the renderer's trailing separator depends on the sibling
+  // on the other side of the boundary.
+  const prev = previousLine(content, blankIndex)
+  if (LIST_OR_QUOTE_LINE.test(prev) || LIST_OR_QUOTE_LINE.test(next)) {
+    return false
+  }
+
+  return true
+}
+
+/**
+ * Renders streaming markdown by reusing the parse of the stable prefix.
+ *
+ * Produces the same output as `renderStreamingMarkdown` for content that
+ * extends what was rendered before; falls back to a full parse when the
+ * content is replaced (chat reload, edit) or has no safe boundary yet.
+ */
+export function renderStreamingMarkdownCached(
+  content: string,
+  options: MarkdownRenderOptions,
+  cache: StreamingMarkdownCache,
+): ReactNode {
+  const codeBlockWidth = options.codeBlockWidth ?? 80
+
+  if (
+    codeBlockWidth !== cache.codeBlockWidth ||
+    options.palette !== cache.palette ||
+    !content.startsWith(cache.prefix)
+  ) {
+    cache.prefix = ''
+    cache.segmentElements = []
+    cache.segments = 0
+    cache.fenceOpen = false
+    cache.codeBlockWidth = codeBlockWidth
+    cache.palette = options.palette
+  }
+
+  let fenceOpen = cache.fenceOpen
+  let split = -1
+  let fenceAtSplit = false
+
+  for (let i = cache.prefix.length; i < content.length; i++) {
+    if (content.charCodeAt(i) === 96 /* ` */ && content.startsWith('```', i)) {
+      fenceOpen = !fenceOpen
+      i += 2
+      continue
+    }
+    if (
+      !fenceOpen &&
+      content.charCodeAt(i) === 10 /* \n */ &&
+      content[i + 1] === '\n' &&
+      isSafeBoundary(content, i)
+    ) {
+      split = i
+      fenceAtSplit = fenceOpen
+      i += 1
+    }
+  }
+
+  if (split > cache.prefix.length) {
+    const segment = content.slice(cache.prefix.length, split)
+    const key = `md-seg-${cache.segments++}`
+    // The renderer ends a block with its separator (`\n\n`); hold that at the
+    // top level instead of inside the memoized element, so the final trim can
+    // still drop it when nothing follows. Every boundary this renderer picks
+    // sits between two top-level blocks and never before a list or quote,
+    // which is the only case where the separator would be a single `\n`.
+    cache.segmentElements.push(
+      createElement(RenderedSegment, {
+        key,
+        nodes: trimTrailingWhitespace(
+          renderMarkdownNodes(segment, options, `${key}-`),
+        ),
+      }),
+      '\n\n',
+    )
+    cache.prefix = content.slice(0, split)
+    cache.fenceOpen = fenceAtSplit
+  }
+
+  const tail = content.slice(cache.prefix.length)
+
+  if (tail && hasIncompleteCodeFence(tail)) {
+    // Same split as renderStreamingMarkdown: rendered blocks, then the
+    // unterminated fence as literal text so it is not half-highlighted. That
+    // function trims the trailing separator before appending the literal text
+    // (so the pending fence continues the previous line); trimming here too
+    // keeps the stitched output identical.
+    const lastFence = tail.lastIndexOf('```')
+    const trimmedBefore = trimTrailingWhitespace([
+      ...cache.segmentElements,
+      ...renderMarkdownNodes(tail.slice(0, lastFence), options, 'md-tail-'),
+    ])
+    return createElement(
+      Fragment,
+      null,
+      ...trimmedBefore,
+      tail.slice(lastFence),
+    )
+  }
+
+  const tailNodes = tail
+    ? renderMarkdownNodes(tail, options, 'md-tail-')
+    : []
+  const trimmed = trimTrailingWhitespace([...cache.segmentElements, ...tailNodes])
+  if (trimmed.length === 0) {
+    return ''
+  }
+  if (trimmed.length === 1) {
+    return trimmed[0]
+  }
+  return createElement(Fragment, null, ...trimmed)
+}
+```
+Where the symbols this change introduces are used elsewhere, at this same revision (the code that reads them; this is evidence for the WHAT and the WHY, and it is the only source for who consumes this change):
+- File `cli/src/utils/__tests__/streaming-markdown.test.tsx` (13 matching lines):
+```
+import { describe, expect, test } from 'bun:test'
+import { createTestRenderer } from '@opentui/core/testing'
+import { createRoot, flushSync } from '@opentui/react'
+import React from 'react'
+
+import { renderStreamingMarkdown } from '../markdown-renderer'
+import {
+  createStreamingMarkdownCache,
+  renderStreamingMarkdownCached,
+} from '../streaming-markdown'
+
+import type { ReactNode } from 'react'
+
+const WIDTH = 72
+const HEIGHT = 90
+
+const renderFrame = async (node: ReactNode): Promise<string> => {
+  const setup = await createTestRenderer({ width: WIDTH, height: HEIGHT })
+  const root = createRoot(setup.renderer)
+  try {
+    flushSync(() =>
+…
+A closing paragraph that mentions a < b and 5 > 3 as plain text.
+`
+
+/** Every prefix that ends at a line boundary, i.e. where a flush could land. */
+const prefixEnds = (text: string): number[] => {
+  const ends: number[] = []
+  for (let i = 1; i < text.length; i++) {
+    if (text[i] === '\n') ends.push(i + 1)
+  }
+  return ends
+}
+
+describe('renderStreamingMarkdownCached', () => {
+  test('matches a full render at every streaming step', async () => {
+    const cache = createStreamingMarkdownCache()
+    const options = { codeBlockWidth: 72 }
+
+    for (const end of prefixEnds(DOC)) {
+      const content = DOC.slice(0, end)
+      const expected = await renderFrame(renderStreamingMarkdown(content, options))
+      const actual = await renderFrame(
+        renderStreamingMarkdownCached(content, options, cache),
+      )
+
+      // Guard against a vacuous pass: an empty or error frame would compare
+```
+- File `cli/src/components/blocks/user-content-copy.tsx` (7 matching lines):
+```
+palette: MarkdownPalette
+  showCopyButton: boolean
+}
+
+export const UserContentWithCopyButton = memo(
+  ({
+    content,
+    messageId,
+    isLoading,
+    isComplete,
+    isUser,
+    textColor,
+    codeBlockWidth,
+    palette,
+    showCopyButton,
+  }: UserContentWithCopyButtonProps) => {
+    const isStreamingMessage = isLoading || !isComplete
+    const normalizedContent = isStreamingMessage
+      ? trimNewlines(content)
+      : content.trim()
+
+    const hasContent = normalizedContent.length > 0
+
+    if (!hasContent) {
+      return null
+    }
+
+    if (!showCopyButton) {
+      return (
+        <text
+          key={`message-content-${messageId}`}
+          style={{ wrapMode: 'word', fg: textColor }}
+          attributes={isUser ? TextAttributes.ITALIC : undefined}
+        >
+          <ContentWithMarkdown
+            content={normalizedContent}
+            isStreaming={isStreamingMessage}
+            codeBlockWidth={codeBlockWidth}
+            palette={palette}
+          />
+        </text>
+      )
+    }
+
+    return (
+      <UserTextWithInlineCopy
+        messageId={messageId}
+        content={content}
+        normalizedContent={normalizedContent}
+        isStreamingMessage={isStreamingMessage}
+        textColor={textColor}
+        codeBlockWidth={codeBlockWidth}
+        palette={palette}
+      />
+    )
+  },
+)
+
+interface UserTextWithInlineCopyProps {
+  messageId: string
+  content: string
+  normalizedContent: string
+  isStreamingMessage: boolean
+  textColor: string
+```
+- File `cli/src/components/blocks/single-block.tsx` (3 matching lines):
+```
+isUser,
+    textColor,
+    availableWidth,
+    markdownPalette,
+    onToggleCollapsed,
+    onBuildFast,
+    onBuildMax,
+    onBuildLite,
+    isLastMessage,
+    contentToCopy,
+  }: SingleBlockProps): ReactNode => {
+    const theme = useTheme()
+    const codeBlockWidth = Math.max(10, availableWidth - 8)
+
+    switch (block.type) {
+      case 'text': {
+        if (isReasoningTextBlock(block)) {
+          return null
+        }
+        const textBlock = block as TextContentBlock
+        const isStreamingText = isLoading || !isComplete
+        const filteredContent = isStreamingText
+          ? trimNewlines(textBlock.content)
+          : textBlock.content.trim()
+        if (!filteredContent) {
+…
+const renderKey = `${messageId}-text-${idx}`
+        const explicitColor = textBlock.color
+        const blockTextColor = explicitColor ?? textColor
+
+        if (contentToCopy) {
+          return (
+            <UserBlockTextWithInlineCopy
+              key={renderKey}
+              content={filteredContent}
+              contentToCopy={contentToCopy}
+              isStreaming={isStreamingText}
+              textColor={blockTextColor}
+              codeBlockWidth={codeBlockWidth}
+              palette={markdownPalette}
+              marginTop={0}
+              marginBottom={0}
+            />
+          )
+        }
+
+        return (
+          <text
+            key={renderKey}
+            style={{
+              wrapMode: 'word',
+              fg: blockTextColor,
+            }}
+            attributes={isUser ? TextAttributes.ITALIC : undefined}
+          >
+            <ContentWithMarkdown
+              content={filteredContent}
+              isStreaming={isStreamingText}
+              codeBlockWidth={codeBlockWidth}
+              palette={markdownPalette}
+            />
+          </text>
+        )
+      }
+
+      case 'plan': {
+        return (
+          <box key={`${messageId}-plan-${idx}`} style={{ width: '100%' }}>
+            <PlanBox
+              planContent={block.content}
+              availableWidth={availableWidth}
+```
+- File `cli/src/utils/__tests__/markdown-renderer.test.tsx` (2 matching lines):
+```
+// Should preserve quotes and special characters within inline code
+    expect(inlineContent).toContain('git commit -m "fix: bug"')
+    expect(nodes[2]).toBe(' to commit.')
+  })
+
+  test('wraps table columns when content exceeds available width', () => {
+    // Table with very long content that should be wrapped
+    const markdown = `| ID | This is a very long column header that should wrap |
+| -- | -------------------------------------------------- |
+| 1  | This cell has extremely long content that definitely exceeds the width |`
+    
+    // Use a narrow codeBlockWidth to force wrapping
+    const output = renderMarkdown(markdown, { codeBlockWidth: 50 })
+    const nodes = flattenNodes(output)
+
+    const textContent = nodes
+      .map((node) => {
+        if (typeof node === 'string') return node
+        if (React.isValidElement(node)) {
+          return flattenChildren((node as El).props.children).join('')
+        }
+        return ''
+      })
+      .join('')
+…
+expect(textContent).toContain('long')
+    expect(textContent).toContain('header')
+    expect(textContent).toContain('wrap')
+    expect(textContent).toContain('extremely')
+    expect(textContent).toContain('exceeds')
+  })
+
+  test('does not wrap table columns when content fits available width', () => {
+    const markdown = `| Name | Age |
+| ---- | --- |
+| John | 30  |`
+    
+    // Use a wide codeBlockWidth so no wrapping is needed
+    const output = renderMarkdown(markdown, { codeBlockWidth: 80 })
+    const nodes = flattenNodes(output)
+
+    const textContent = nodes
+      .map((node) => {
+        if (typeof node === 'string') return node
+        if (React.isValidElement(node)) {
+          return flattenChildren((node as El).props.children).join('')
+        }
+        return ''
+      })
+      .join('')
+```
+- File `cli/src/components/blocks/agent-branch-wrapper.tsx` (1 matching line):
+```
+return (
+              <text
+                key={`${p.keyPrefix}-text-${index}`}
+                style={{
+                  wrapMode: 'word',
+                  fg: nestedTextColor,
+                }}
+              >
+                <ContentWithMarkdown
+                  content={filteredNestedContent}
+                  isStreaming={isNestedStreamingText}
+                  codeBlockWidth={markdownOptionsForLevel.codeBlockWidth}
+                  palette={markdownOptionsForLevel.palette}
+                />
+              </text>
+            )
+          }
+
+          if (block.type === 'html') {
+            const htmlBlock = block as HtmlContentBlock
+
+            return (
+              <box
+                key={`${p.keyPrefix}-html-${index}`}
+```
+- File `cli/src/components/blocks/tool-branch.tsx` (1 matching line):
+```
+const agentMarkdownOptions = {
+      codeBlockWidth: Math.max(10, availableWidth - 12),
+      palette: {
+        ...markdownPalette,
+        codeTextFg: theme.foreground,
+      },
+    }
+
+    const displayContent = (
+      <ContentWithMarkdown
+        content={fullContent}
+        isStreaming={false}
+        codeBlockWidth={agentMarkdownOptions.codeBlockWidth}
+        palette={agentMarkdownOptions.palette}
+      />
+    )
+
+    const renderableDisplayContent =
+      displayContent === null ||
+      displayContent === undefined ||
+      displayContent === false ||
+      displayContent === '' ? null : (
+        <text
+          fg={theme.foreground}
+          style={{ wrapMode: 'word' }}
+```
+Tests this commit changed (added lines only; the assertions are what the change is expected to do, not a description of the feature):
+- File `cli/src/utils/__tests__/streaming-markdown.test.tsx`: "renderStreamingMarkdownCached"; "matches a full render at every streaming step"; "matches a full render inside an unterminated code fence"; "a paragraph directly followed by a list keeps the same spacing"; "replaced content re-renders from scratch"; "a width change invalidates the cached prefix"; "merged styled runs keep block boundaries"; "a paragraph after a code block starts on its own line"
+```
+import { describe, expect, test } from 'bun:test'
+import { createTestRenderer } from '@opentui/core/testing'
+import { createRoot, flushSync } from '@opentui/react'
+import React from 'react'
+import { renderStreamingMarkdown } from '../markdown-renderer'
+import {
+  createStreamingMarkdownCache,
+  renderStreamingMarkdownCached,
+} from '../streaming-markdown'
+import type { ReactNode } from 'react'
+const WIDTH = 72
+const HEIGHT = 90
+const renderFrame = async (node: ReactNode): Promise<string> => {
+  const setup = await createTestRenderer({ width: WIDTH, height: HEIGHT })
+  const root = createRoot(setup.renderer)
+  try {
+    flushSync(() =>
+      root.render(
+        <box flexDirection="column">
+          <text>{node as React.ReactNode}</text>
+        </box>,
+      ),
+    )
+    await setup.renderOnce()
+    return setup.captureCharFrame()
+  } finally {
+    flushSync(() => root.unmount())
+    setup.renderer.destroy()
+  }
+}
+const DOC = `## Streaming equivalence
+A paragraph with **bold**, *italic*, \`inline code\` and a [link](https://example.com).
+- first bullet with \`code\`
+- second bullet
+- third bullet
+1. ordered one
+2. ordered two
+> a quoted line
+> with two lines
+| column a | column b |
+| -------- | -------- |
+| value 1  | value 2  |
+\`\`\`ts
+export const answer = 42
+function add(a: number, b: number) {
+  return a + b
+}
+\`\`\`
+A closing paragraph that mentions a < b and 5 > 3 as plain text.
+`
+/** Every prefix that ends at a line boundary, i.e. where a flush could land. */
+const prefixEnds = (text: string): number[] => {
+  const ends: number[] = []
+  for (let i = 1; i < text.length; i++) {
+    if (text[i] === '\n') ends.push(i + 1)
+  }
+  return ends
+}
+describe('renderStreamingMarkdownCached', () => {
+  test('matches a full render at every streaming step', async () => {
+    const cache = createStreamingMarkdownCache()
+    const options = { codeBlockWidth: 72 }
+    for (const end of prefixEnds(DOC)) {
+      const content = DOC.slice(0, end)
+      const expected = await ren
+```
+Diff (source hunks; lockfiles and pure test hunks omitted, except in a lockfile-only commit):
+```diff
+diff --git a/cli/src/components/blocks/content-with-markdown.tsx b/cli/src/components/blocks/content-with-markdown.tsx
+index ea25e6165..bb492cb93 100644
+--- a/cli/src/components/blocks/content-with-markdown.tsx
++++ b/cli/src/components/blocks/content-with-markdown.tsx
+@@ -1,33 +1,51 @@
+-import { memo } from 'react'
++import { memo, useRef } from 'react'
+ 
+ import {
+   renderMarkdown,
+-  renderStreamingMarkdown,
+   hasMarkdown,
+   type MarkdownPalette,
+ } from '../../utils/markdown-renderer'
++import {
++  createStreamingMarkdownCache,
++  renderStreamingMarkdownCached,
++} from '../../utils/streaming-markdown'
++
++import type { StreamingMarkdownCache } from '../../utils/streaming-markdown'
+ 
+ interface ContentWithMarkdownProps {
+   content: string
+   isStreaming: boolean
+   codeBlockWidth: number
+   palette: MarkdownPalette
+ }
+ 
+ export const ContentWithMarkdown = memo(
+   ({
+     content,
+     isStreaming,
+     codeBlockWidth,
+     palette,
+   }: ContentWithMarkdownProps) => {
++    // Streaming text only ever grows, so the already-rendered blocks can be
++    // kept and the tail re-rendered: parsing the whole message on every flush
++    // is what made long answers stall the render thread.
++    const cache = useRef<StreamingMarkdownCache | null>(null)
++    if (cache.current === null) {
++      cache.current = createStreamingMarkdownCache()
++    }
++
+     if (!hasMarkdown(content)) {
+       return content
+     }
++
+     const options = { codeBlockWidth, palette }
+     if (isStreaming) {
+-      return renderStreamingMarkdown(content, options)
++      return renderStreamingMarkdownCached(content, options, cache.current)
+     }
++
++    // Done streaming: render once from scratch so the final output does not
++    // depend on how the deltas happened to be split.
++    cache.current = createStreamingMarkdownCache()
+     return renderMarkdown(content, options)
+   },
+ )
+diff --git a/cli/src/components/message-with-agents.tsx b/cli/src/components/message-with-agents.tsx
+index cdc044029..97d9e3ee3 100644
+--- a/cli/src/components/message-with-agents.tsx
++++ b/cli/src/components/message-with-agents.tsx
+@@ -1,48 +1,52 @@
+ import { TextAttributes } from '@opentui/core'
+-import { memo, useCallback, useMemo, type ReactNode } from 'react'
++import { memo, useCallback, useMemo, useRef, type ReactNode } from 'react'
+ import React from 'react'
+ import { useShallow } from 'zustand/react/shallow'
+ 
+ import { Button } from './button'
+ import { ErrorBoundaryPlaceholder } from './error-boundary'
+ import { GridLayout } from './grid-layout'
+ import { MessageBlock } from './message-block'
+ import { ModeDivider } from './mode-divider'
+ import { useChatStore } from '../state/chat-store'
+ import { useMessageBlockStore } from '../state/message-block-store'
+ import { splitByAgentSize } from '../utils/block-processor'
+ import { getCliEnv } from '../utils/env'
+ import {
+   AGENT_CONTENT_HORIZONTAL_PADDING,
+   MAX_AGENT_DEPTH,
+ } from '../utils/layout-helpers'
+ import {
+   renderMarkdown,
+   hasMarkdown,
+   type MarkdownPalette,
+ } from '../utils/markdown-renderer'
++import {
++  createStreamingMarkdownCache,
++  renderStreamingMarkdownCached,
++} from '../utils/streaming-markdown'
+ 
+ import type { ChatMessage } from '../types/chat'
+ import type { FeedbackCategory } from '@codebuff/common/constants/feedback'
+ 
+ interface AgentChildrenGridProps {
+   agentChildren: ChatMessage[]
+   depth: number
+   availableWidth: number
+ }
+ 
+ const AgentChildrenGrid = memo(
+   ({ agentChildren, depth, availableWidth }: AgentChildrenGridProps) => {
+     const theme = useMessageBlockStore((state) => state.context.theme)
+ 
+     const getItemKey = useCallback((agent: ChatMessage) => agent.id, [])
+ 
+     const renderAgentChild = useCallback(
+       (agent: ChatMessage, _idx: number, columnWidth: number) => (
+         <MessageWithAgents
+           message={agent}
+           depth={depth + 1}
+           isLastMessage={false}
+           availableWidth={columnWidth}
+         />
+       ),
+@@ -335,97 +339,114 @@ export const MessageWithAgents = memo(
+   },
+ )
+ 
+ interface AgentMessageProps {
+   message: ChatMessage
+   depth: number
+   availableWidth: number
+ }
+ 
+ const AgentMessage = memo(
+   ({ message, depth, availableWidth }: AgentMessageProps): ReactNode => {
+     // Use useShallow for grouped selectors to prevent unnecessary re-renders
+     const { theme, markdownPalette, messageTree, onToggleCollapsed } = useMessageBlockStore(
+       useShallow((state) => ({
+         theme: state.context.theme,
+         markdownPalette: state.context.markdownPalette,
+         messageTree: state.context.messageTree,
+         onToggleCollapsed: state.callbacks.onToggleCollapsed,
+       })),
+     )
+ 
+     // Derive streaming boolean for this specific message to avoid re-renders when other agents change
+     const isStreaming = useChatStore((state) => state.streamingAgents.has(message.id))
+     const setFocusedAgentId = useChatStore((state) => state.setFocusedAgentId)
+ 
++    // A streaming agent re-renders on every flush, and a full markdown parse of
++    // its whole body per flush is the same quadratic cost the root message had.
++    const markdownCache = useRef<ReturnType<typeof createStreamingMarkdownCache> | null>(null)
++    if (markdownCache.current === null) {
++      markdownCache.current = createStreamingMarkdownCache()
++    }
++
++    const agentCodeBlockWidth = Math.max(
++      10,
++      availableWidth - AGENT_CONTENT_HORIZONTAL_PADDING,
++    )
++    const agentPalette: MarkdownPalette | undefined = useMemo(
++      () => markdownPalette ? {
++        ...markdownPalette,
++        codeTextFg: theme?.foreground ?? markdownPalette.codeTextFg,
++      } : undefined,
++      [markdownPalette, theme?.foreground],
++    )
++    const agentMarkdownOptions = useMemo(
++      () => ({ codeBlockWidth: agentCodeBlockWidth, palette: agentPalette! }),
++      [agentCodeBlockWidth, agentPalette],
++    )
++
+     // Guard against missing agent info (should not happen for agent variant messages)
+     if (!message.agent) {
+       return (
+         <text fg={theme?.error}>
+           Error: Missing agent info for agent message
+         </text>
+       )
+     }
+     const agentInfo = message.agent
+ 
+     // Get or initialize collapse state from message metadata
+     const isCollapsed = message.metadata?.isCollapsed ?? false
+ 
+     const agentChildren = messageTree?.get(message.id) ?? []
+ 
+     const bulletChar = '• '
+     const fullPrefix = bulletChar
+ 
+     const lines = message.content.split('\n').filter((line) => line.trim())
+     const firstLine = lines[0] || ''
+     const lastLine = lines[lines.length - 1] || firstLine
+     const rawDisplayContent = isCollapsed ? lastLine : message.content
+ 
+     const streamingPreview = isStreaming
+       ? firstLine.replace(/[#*_`~\[\]()]/g, '').trim() + '...'
+       : ''
+ 
+     const finishedPreview =
+       !isStreaming && isCollapsed
+         ? lastLine.replace(/[#*_`~\[\]()]/g, '').trim()
+         : ''
+ 
+-    const agentCodeBlockWidth = Math.max(
+-      10,
+-      availableWidth - AGENT_CONTENT_HORIZONTAL_PADDING,
+-    )
+-    const agentPalette: MarkdownPalette | undefined = markdownPalette ? {
+-      ...markdownPalette,
+-      codeTextFg: theme?.foreground ?? markdownPalette.codeTextFg,
+-    } : undefined
+-    const agentMarkdownOptions = {
+-      codeBlockWidth: agentCodeBlockWidth,
+-      palette: agentPalette!,
+-    }
+-    const displayContent = hasMarkdown(rawDisplayContent)
+-      ? renderMarkdown(rawDisplayContent, agentMarkdownOptions)
+-      : rawDisplayContent
++    const displayContent = !hasMarkdown(rawDisplayContent)
++      ? rawDisplayContent
++      : isStreaming
++        ? renderStreamingMarkdownCached(
++            rawDisplayContent,
++            agentMarkdownOptions,
++            markdownCache.current,
++          )
++        : renderMarkdown(rawDisplayContent, agentMarkdownOptions)
+ 
+     const handleTitleClick = (): void => {
+       onToggleCollapsed(message.id)
+       setFocusedAgentId(message.id)
+     }
+ 
+     const handleContentClick = (): void => {
+       if (!isCollapsed) {
+         return
+       }
+ 
+       onToggleCollapsed(message.id)
+       setFocusedAgentId(message.id)
+     }
+ 
+     return (
+       <box
+         key={message.id}
+         style={{
+           flexDirection: 'column',
+           gap: 0,
+           flexShrink: 0,
+         }}
+       >
+         <box
+diff --git a/cli/src/utils/markdown-renderer.tsx b/cli/src/utils/markdown-renderer.tsx
+index 662602cc2..d8afa77bc 100644
+--- a/cli/src/utils/markdown-renderer.tsx
++++ b/cli/src/utils/markdown-renderer.tsx
+@@ -102,58 +102,59 @@ const resolvePalette = (
+       ...headingFg,
+     }
+   }
+ 
+   return palette
+ }
+ 
+ const processor = unified()
+   .use(remarkParse)
+   .use(remarkGfm)
+   .use(remarkBreaks)
+ 
+ type MarkdownNode = Content | Root
+ 
+ type InlineFallbackNode = Text | Strong | Emphasis
+ 
+ interface RenderState {
+   palette: MarkdownPalette
+   codeBlockWidth: number
+   nextKey: () => string
+ }
+ 
+ const createRenderState = (
+   palette: MarkdownPalette,
+   codeBlockWidth: number,
++  keyPrefix = '',
+ ): RenderState => {
+   let counter = 0
+   return {
+     palette,
+     codeBlockWidth,
+     nextKey: () => {
+       counter += 1
+-      return `markdown-${counter}`
++      return `${keyPrefix}markdown-${counter}`
+     },
+   }
+ }
+ 
+ // Unified trim helper with predicate
+ const trimTrailingNodes = (
+   nodes: ReactNode[],
+   predicate: (node: ReactNode) => boolean,
+ ): ReactNode[] => {
+   let end = nodes.length
+   while (end > 0 && predicate(nodes[end - 1])) {
+     end -= 1
+   }
+   return end === nodes.length ? nodes : nodes.slice(0, end)
+ }
+ 
+ const trimTrailingWhitespaceNodes = (nodes: ReactNode[]): ReactNode[] => {
+   return trimTrailingNodes(
+     nodes,
+     (node) => typeof node === 'string' && node.trim().length === 0,
+   )
+ }
+ 
+ const trimTrailingBreaks = (nodes: ReactNode[]): ReactNode[] => {
+   return trimTrailingNodes(
+@@ -967,78 +968,220 @@ const renderNode = (
+         node.type,
+       )
+       return [
+         <span key={state.nextKey()} attributes={TextAttributes.DIM}>
+           {wrapSegmentsInFragments(children, state.nextKey())}
+         </span>,
+       ]
+     }
+ 
+     default: {
+       const fallbackText = nodeToPlainText(node)
+       if (fallbackText) {
+         return [fallbackText]
+       }
+ 
+       const anyNode = node as any
+       if (Array.isArray(anyNode.children)) {
+         return renderNodes(anyNode.children as MarkdownNode[], state, node.type)
+       }
+ 
+       return []
+     }
+   }
+ }
+ 
++/**
++ * Merges adjacent styled runs that render identically, including runs separated
++ * only by whitespace.
++ *
++ * A frame costs the terminal roughly linearly in the number of nodes it has to
++ * walk - ~60ms for 1,500 nodes regardless of whether anything changed - so a
++ * code block emitted as one span per line is the expensive shape, not the
++ * characters. Merging `<span>line</span>'\n'<span>line</span>` into a single
++ * span removes those per-line nodes without changing a rendered character.
++ */
++const coalesceNodes = (nodes: ReactNode[]): ReactNode[] => {
++  const merged: ReactNode[] = []
++
++  const sameStyledStrings = (
++    a: ReactNode,
++    b: ReactNode,
++  ): [Record<string, unknown>, string, string] | null => {
++    if (!React.isValidElement(a) || !React.isValidElement(b)) return null
++    if (a.type !== b.type) return null
++    const aProps = a.props as Record<string, unknown>
++    const bProps = b.props as Record<string, unknown>
++    const aKeys = Object.keys(aProps).filter((k) => k !== 'children')
++    const bKeys = Object.keys(bProps).filter((k) => k !== 'children')
++    if (aKeys.length !== bKeys.length) return null
++    for (const key of aKeys) {
++      if (aProps[key] !== bProps[key]) return null
++    }
++    if (
++      typeof aProps.children !== 'string' ||
++      typeof bProps.children !== 'string'
++    ) {
++      return null
++    }
++    return [aProps, aProps.children, bProps.children]
++  }
++
++  for (let i = 0; i < nodes.length; i++) {
++    const node = nodes[i]
++    const prev = merged[merged.length - 1]
++
++    if (
++      typeof prev === 'string' &&
++      typeof node === 'string' &&
++      prev.trim().length > 0 &&
++      node.trim().length > 0
++    ) {
++      merged[merged.length - 1] = prev + node
++      continue
++    }
++
++    const direct = sameStyledStrings(prev, node)
++    if (direct) {
++      const [props, aChildren, bChildren] = direct
++      merged[merged.length - 1] = React.createElement(
++        (prev as React.ReactElement).type as React.ElementType,
++        { ...props, children: aChildren + bChildren },
++      )
++      continue
++    }
++
++    if (!React.isValidElement(node)) {
++      merged.push(node)
++      continue
++    }
++
++    // Absorb a following run of same-styled nodes separated only by
++    // whitespace. Whitespace-only strings after the last node are left alone:
++    // they are the block separator the document-level trim drops.
++    let end = i + 1
++    let separator = ''
++    let absorbed: string | null = null
++    let props: Record<string, unknown> | null = null
++
++    while (end < nodes.length) {
++      const next = nodes[end]
++      if (typeof next === 'string' && next.trim().length === 0) {
++        separator += next
++        end += 1
++        continue
++      }
++      const match = sameStyledStrings(node, next)
++      if (!match) break
++      const [nextProps, , nextChildren] = match
++      props = nextProps
++      absorbed = (absorbed ?? (node.props as { children: string }).children) +
++        separator +
++        nextChildren
++      separator = ''
++      end += 1
++    }
++
++    if (absorbed !== null && props !== null) {
++      merged.push(
++        React.createElement(
++          (node as React.ReactElement).type as React.ElementType,
++          { ...props, children: absorbed },
++        ),
++      )
++      // The run ended at a node that could not be merged; the whitespace after
++      // the last merged node was buffered, not consumed, so re-emit it.
++      if (separator) {
++        merged.push(separator)
++      }
++      i = end - 1
++      continue
++    }
++
++    merged.push(node)
++  }
++
++  return merged
++}
++
+ const normalizeOutput = (nodes: ReactNode[]): ReactNode => {
+   const trimmed = trimTrailingWhitespaceNodes(nodes)
+   if (trimmed.length === 0) {
+     return ''
+   }
+   if (trimmed.length === 1) {
+     return trimmed[0]
+   }
+   return (
+     <>
+       {trimmed.map((node, idx) => (
+         <KeyedFragment key={`markdown-out-${idx}`}>{node}</KeyedFragment>
+       ))}
+     </>
+   )
+ }
+ 
++/**
++ * Parses and renders markdown without trimming the trailing block separator.
++ *
++ * `renderMarkdown` drops that separator, which is correct for a whole document
++ * but not when several rendered fragments are stitched back together: the
++ * incremental streaming renderer needs the separators to line up exactly as a
++ * single render would produce them.
++ */
++export function renderMarkdownNodes(
++  markdown: string,
++  options: MarkdownRenderOptions = {},
++  keyPrefix = '',
++): ReactNode[] {
++  try {
++    const palette = resolvePalette(options.palette)
++    const codeBlockWidth = options.codeBlockWidth ?? 80
++    const state = createRenderState(palette, codeBlockWidth, keyPrefix)
++    const ast = processor.parse(markdown) as Root
++    applyInlineFallbackFormatting(ast)
++    return coalesceNodes(renderNode(ast, state, ast.type, undefined))
++  } catch (error) {
++    logger.error(error, 'Failed to parse markdown')
++    return [markdown]
++  }
++}
++
++/** Drops the whitespace-only nodes a rendered document ends with. */
++export const trimTrailingWhitespace = trimTrailingWhitespaceNodes
++
+ export function renderMarkdown(
+   markdown: string,
+   options: MarkdownRenderOptions = {},
+ ): ReactNode {
+   try {
+     const palette = resolvePalette(options.palette)
+     const codeBlockWidth = options.codeBlockWidth ?? 80
+     const state = createRenderState(palette, codeBlockWidth)
+     const ast = processor.parse(markdown) as Root
+     applyInlineFallbackFormatting(ast)
+-    const nodes = renderNode(ast, state, ast.type, undefined)
++    const nodes = coalesceNodes(renderNode(ast, state, ast.type, undefined))
+     return normalizeOutput(nodes)
+   } catch (error) {
+     logger.error(error, 'Failed to parse markdown')
+     return markdown
+   }
+ }
+ 
+ export function hasMarkdown(content: string): boolean {
+   return /[*_`#>\-\+]|\[.*\]\(.*\)|```/.test(content)
+ }
+ 
+ export function hasIncompleteCodeFence(content: string): boolean {
+   let fenceCount = 0
+   const fenceRegex = /```/g
+   while (fenceRegex.exec(content)) {
+     fenceCount += 1
+   }
+   return fenceCount % 2 === 1
+ }
+ 
+ const mergeStreamingSegments = (segments: ReactNode[]): ReactNode => {
+   if (segments.length === 0) {
+     return ''
+   }
+   if (segments.length === 1) {
+diff --git a/cli/src/utils/streaming-markdown.ts b/cli/src/utils/streaming-markdown.ts
+new file mode 100644
+index 000000000..d84a04a56
+--- /dev/null
++++ b/cli/src/utils/streaming-markdown.ts
+@@ -0,0 +1,204 @@
++import { Fragment, createElement, memo } from 'react'
++
++import {
++  hasIncompleteCodeFence,
++  renderMarkdownNodes,
++  trimTrailingWhitespace,
++} from './markdown-renderer'
++
++import type { MarkdownRenderOptions } from './markdown-renderer'
++import type { ReactNode } from 'react'
++
++/**
++ * Incremental renderer for the block that is still streaming.
++ *
++ * `renderMarkdown` costs roughly 3ms per kilobyte, and the live message is
++ * re-rendered on every flush while it grows - so a long answer re-parsed its
++ * whole transcript about ten times a second: a 200KB answer cost ~480ms of
++ * parsing per flush, on the render thread.
++ *
++ * Streaming text is append-only, so every complete block before the last
++ * boundary can be parsed once and reused. Only the tail - the block currently
++ * being written - is re-rendered per flush.
++ */
++
++/**
++ * Rendered once per committed segment. `memo` keeps React from re-walking the
++ * already-rendered prefix on every flush: the element objects are reused, so
++ * the reconcile cost stays proportional to the tail rather than the message.
++ */
++const RenderedSegment = memo(function RenderedSegment({
++  nodes,
++}: {
++  nodes: ReactNode[]
++}) {
++  return createElement(Fragment, null, ...nodes)
++})
++
++export type StreamingMarkdownCache = {
++  /** Already parsed and reusable. `content` must start with this. */
++  prefix: string
++  /** Committed segments, each a memoized element. */
++  segmentElements: ReactNode[]
++  /** How many segments have been committed; keys segment node keys apart. */
++  segments: number
++  /** Whether a fenced code block is still open at the end of `prefix`. */
++  fenceOpen: boolean
++  /** Options the nodes were rendered with; a change invalidates them. */
++  codeBlockWidth: number
++  palette: unknown
++}
++
++export const createStreamingMarkdownCache = (): StreamingMarkdownCache => ({
++  prefix: '',
++  segmentElements: [],
++  segments: 0,
++  fenceOpen: false,
++  codeBlockWidth: -1,
++  palette: undefined,
++})
++
++/** A blank line only separates blocks cleanly outside lists and quotes. */
++const LIST_OR_QUOTE_LINE = /^[ \t]*(?:[-*+]|\d+[.)]|>)/
++
++const previousLine = (content: string, index: number): string => {
++  let start = index - 1
++  while (start >= 0 && content[start] !== '\n') start--
++  return content.slice(start + 1, index)
++}
++
++const nextLine = (content: string, index: number): string => {
++  let start = index
++  while (
++    start < content.length &&
++    (content[start] === '\n' || content[start] === ' ' || content[start] === '\t')
++  ) {
++    start++
++  }
++  let end = start
++  while (end < content.length && content[end] !== '\n') end++
++  return content.slice(start, end)
++}
++
++const isSafeBoundary = (content: string, blankIndex: number): boolean => {
++  const next = nextLine(content, blankIndex)
++  // Nothing rendered after the boundary yet: no stable content to commit.
++  if (!next) return false
++
++  // A list or blockquote can continue across a blank line (loose lists), and
++  // parsing the halves separately would restart ordered numbering or split the
++  // quote. Leave those boundaries to the tail. Excluding them also means the
++  // last committed block is never a paragraph followed by a list, which is the
++  // only case where the renderer's trailing separator depends on the sibling
++  // on the other side of the boundary.
++  const prev = previousLine(content, blankIndex)
++  if (LIST_OR_QUOTE_LINE.test(prev) || LIST_OR_QUOTE_LINE.test(next)) {
++    return false
++  }
++
++  return true
++}
++
++/**
++ * Renders streaming markdown by reusing the parse of the stable prefix.
++ *
++ * Produces the same output as `renderStreamingMarkdown` for content that
++ * extends what was rendered before; falls back to a full parse when the
++ * content is replaced (chat reload, edit) or has no safe boundary yet.
++ */
++export function renderStreamingMarkdownCached(
++  content: string,
++  options: MarkdownRenderOptions,
++  cache: StreamingMarkdownCache,
++): ReactNode {
++  const codeBlockWidth = options.codeBlockWidth ?? 80
++
++  if (
++    codeBlockWidth !== cache.codeBlockWidth ||
++    options.palette !== cache.palette ||
++    !content.startsWith(cache.prefix)
++  ) {
++    cache.prefix = ''
++    cache.segmentElements = []
++    cache.segments = 0
++    cache.fenceOpen = false
++    cache.codeBlockWidth = codeBlockWidth
++    cache.palette = options.palette
++  }
++
++  let fenceOpen = cache.fenceOpen
++  let split = -1
++  let fenceAtSplit = false
++
++  for (let i = cache.prefix.length; i < content.length; i++) {
++    if (content.charCodeAt(i) === 96 /* ` */ && content.startsWith('```', i)) {
++      fenceOpen = !fenceOpen
++      i += 2
++      continue
++    }
++    if (
++      !fenceOpen &&
++      content.charCodeAt(i) === 10 /* \n */ &&
++      content[i + 1] === '\n' &&
++      isSafeBoundary(content, i)
++    ) {
++      split = i
++      fenceAtSplit = fenceOpen
++      i += 1
++    }
++  }
++
++  if (split > cache.prefix.length) {
++    const segment = content.slice(cache.prefix.length, split)
++    const key = `md-seg-${cache.segments++}`
++    // The renderer ends a block with its separator (`\n\n`); hold that at the
++    // top level instead of inside the memoized element, so the final trim can
++    // still drop it when nothing follows. Every boundary this renderer picks
++    // sits between two top-level blocks and never before a list or quote,
++    // which is the only case where the separator would be a single `\n`.
++    cache.segmentElements.push(
++      createElement(RenderedSegment, {
++        key,
++        nodes: trimTrailingWhitespace(
++          renderMarkdownNodes(segment, options, `${key}-`),
++        ),
++      }),
++      '\n\n',
++    )
++    cache.prefix = content.slice(0, split)
++    cache.fenceOpen = fenceAtSplit
++  }
++
++  const tail = content.slice(cache.prefix.length)
++
++  if (tail && hasIncompleteCodeFence(tail)) {
++    // Same split as renderStreamingMarkdown: rendered blocks, then the
++    // unterminated fence as literal text so it is not half-highlighted. That
++    // function trims the trailing separator before appending the literal text
++    // (so the pending fence continues the previous line); trimming here too
++    // keeps the stitched output identical.
++    const lastFence = tail.lastIndexOf('```')
++    const trimmedBefore = trimTrailingWhitespace([
++      ...cache.segmentElements,
++      ...renderMarkdownNodes(tail.slice(0, lastFence), options, 'md-tail-'),
++    ])
++    return createElement(
++      Fragment,
++      null,
++      ...trimmedBefore,
++      tail.slice(lastFence),
++    )
++  }
++
++  const tailNodes = tail
++    ? renderMarkdownNodes(tail, options, 'md-tail-')
++    : []
++  const trimmed = trimTrailingWhitespace([...cache.segmentElements, ...tailNodes])
++  if (trimmed.length === 0) {
++    return ''
++  }
++  if (trimmed.length === 1) {
++    return trimmed[0]
++  }
++  return createElement(Fragment, null, ...trimmed)
++}
+
+```
