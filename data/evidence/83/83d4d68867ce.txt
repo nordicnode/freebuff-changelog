@@ -1,0 +1,482 @@
+Date: 2026-10-23T18:05:43Z
+Category: Core
+Areas: Shared/Core
+Commit nature: production
+Stats: +163 / -0
+Analysis notes: New files: `common/src/codex/questions.ts`.
+Added files: common/src/codex/questions.ts
+Modified files: common/src/desktop-cloud/questions.ts
+Key facts (ground the WHY and DETAIL sentences in these): - Shared native question shape; both Desktop and Cloud render the same card. - The host question service, independent of Codex's two native delivery formats. - Async tool answers are new user input, even if the original turn has already finished. - Native async tools already returned; their answers arrive as new input on the same session. - Codex serializes omitted choices as null for free-text async questions. - Owns only native RPC lifetimes. Async message cards belong to the thread, not this connection.
+Structured facts (extracted mechanically from the diff; copy names and values verbatim, never round or rename):
+- Exports added: CodexQuestion, CodexQuestionHost, codexQuestionAnswerPrompt, CodexQuestions
+Module & File Purpose (ground-truth documentation from touched files):
+- File `common/src/desktop-cloud/questions.ts`:
+```
+/** Older servers ignore this header; older clients never receive a blocking tool. */
+```
+- File `common/src/codex/questions.ts`:
+```
+/** Shared native question shape; both Desktop and Cloud render the same card. */
+```
+Complete Source of Modified Files (for complete module context):
+- File `common/src/desktop-cloud/questions.ts` (71 lines):
+```
+import { z } from 'zod/v4'
+
+/** Older servers ignore this header; older clients never receive a blocking tool. */
+export const CLOUD_QUESTIONS_HEADER = 'x-freebuff-cloud-questions'
+
+export const cloudQuestionsSchema = z.object({
+  questions: z
+    .array(
+      z.object({
+        question: z.string().trim().min(1).max(10_000),
+        header: z.string().max(24).optional().catch(undefined),
+        options: z
+          .array(
+            z.object({
+              label: z.string().trim().min(1).max(500),
+              description: z.string().max(2000).optional().catch(undefined),
+            }),
+          )
+          .max(6)
+          .optional()
+          .catch(undefined),
+        allowFreeText: z.boolean().optional(),
+        isSecret: z.boolean().optional(),
+        multiSelect: z.boolean().optional().catch(undefined),
+      }),
+    )
+    .min(1)
+    .max(20),
+})
+
+export type CloudQuestion = Omit<
+  z.infer<typeof cloudQuestionsSchema>['questions'][number],
+  'options'
+> & {
+  options: { label: string; description?: string }[]
+}
+export type CloudQuestionRequest = {
+  id: string
+  questions: CloudQuestion[]
+}
+
+export const cloudQuestionAnswerSchema = z.discriminatedUnion('skipped', [
+  z.object({ skipped: z.literal(true) }),
+  z.object({
+    skipped: z.literal(false),
+    answers: z
+      .array(z.array(z.string().trim().min(1).max(10_000)).max(7))
+      .min(1)
+      .max(20),
+  }),
+])
+export type CloudQuestionAnswer = z.infer<typeof cloudQuestionAnswerSchema>
+export type CloudQuestionResult = ReturnType<typeof cloudQuestionResult>
+
+export function cloudQuestionResult(
+  questions: CloudQuestion[],
+  answer: CloudQuestionAnswer,
+) {
+  return answer.skipped
+    ? {
+        skipped: true,
+        note: 'The user skipped these questions. Continue without assuming an answer.',
+      }
+    : {
+        answers: questions.map((question, index) => ({
+          question: question.question,
+          answers: answer.answers[index] ?? [],
+        })),
+      }
+}
+```
+- File `common/src/codex/questions.ts` (162 lines):
+```
+import { z } from 'zod/v4'
+
+/** Shared native question shape; both Desktop and Cloud render the same card. */
+export interface CodexQuestion {
+  question: string
+  header?: string
+  options: { label: string; description?: string }[]
+  allowFreeText?: boolean
+  isSecret?: boolean
+}
+
+/** The host question service, independent of Codex's two native delivery formats. */
+export interface CodexQuestionHost {
+  request: (
+    questions: CodexQuestion[],
+    signal: AbortSignal,
+  ) => Promise<string[][] | null>
+  // Async tool answers are new user input, even if the original turn has already finished.
+  notify: (questions: CodexQuestion[], itemId: string) => void
+}
+
+/** Native async tools already returned; their answers arrive as new input on the same session. */
+export function codexQuestionAnswerPrompt(
+  questions: Pick<CodexQuestion, 'question'>[],
+  answers: string[][],
+): string {
+  return [
+    'I answered your questions:',
+    ...questions.map((q, index) =>
+      `${q.question}\n${answers[index]?.join('\n') || '(No answer provided)'}`,
+    ),
+    'Continue using these answers.',
+  ].join('\n\n')
+}
+
+const option = z.object({ label: z.string(), description: z.string() })
+const requestSchema = z.object({
+  questions: z
+    .array(
+      z.object({
+        id: z.string().min(1),
+        header: z.string(),
+        question: z.string().min(1),
+        options: z.array(option).nullish(),
+        isOther: z.boolean().optional(),
+        isSecret: z.boolean().optional(),
+      }),
+    )
+    .min(1),
+})
+const asyncQuestionsSchema = z
+  .array(
+    z.object({
+      title: z.string().min(1),
+      // Codex serializes omitted choices as null for free-text async questions.
+      options: z.array(z.string()).nullish(),
+    }),
+  )
+  .min(1)
+
+/** Owns only native RPC lifetimes. Async message cards belong to the thread, not this connection. */
+export class CodexQuestions {
+  private readonly pending = new Map<string | number, AbortController>()
+  private readonly messages = new Set<string>()
+  private closed = false
+
+  constructor(private readonly host: CodexQuestionHost) {}
+
+  async request(id: string | number, params: unknown): Promise<unknown> {
+    if (this.closed) return undefined
+    const { questions } = requestSchema.parse(params)
+    if (new Set(questions.map((q) => q.id)).size !== questions.length)
+      throw new Error('Codex question IDs must be unique.')
+    if (this.pending.has(id))
+      throw new Error('Codex question request is already pending.')
+    const controller = new AbortController()
+    this.pending.set(id, controller)
+    const cancelled = new Promise<null>((resolve) => {
+      controller.signal.addEventListener('abort', () => resolve(null), {
+        once: true,
+      })
+    })
+    try {
+      const answers = await Promise.race([
+        this.host.request(
+          questions.map((q) => ({
+            question: q.question,
+            header: q.header,
+            options: q.options ?? [],
+            allowFreeText: q.isOther !== false || !q.options?.length,
+            ...(q.isSecret ? { isSecret: true } : {}),
+          })),
+          controller.signal,
+        ),
+        cancelled,
+      ])
+      // Codex already cleared this request (or the transport stopped). Never send a stale reply.
+      if (controller.signal.aborted) return undefined
+      return {
+        answers:
+          answers === null
+            ? {}
+            : Object.fromEntries(
+                questions.map((q, index) => [
+                  q.id,
+                  { answers: answers[index] ?? [] },
+                ]),
+              ),
+      }
+    } finally {
+      this.pending.delete(id)
+    }
+  }
+
+  resolve(id: unknown): void {
+    if (typeof id === 'string' || typeof id === 'number')
+      this.pending.get(id)?.abort()
+  }
+
+  close(): void {
+    this.closed = true
+    this.cancelRequests()
+  }
+
+  /** A host may run several native turns while async questions remain outstanding. */
+  cancelRequests(): void {
+    for (const controller of this.pending.values()) controller.abort()
+  }
+
+  /** Returns true when the structured message replaces the ordinary prose rendering. */
+  notification(
+    method: string,
+    params: Record<string, unknown> | undefined,
+  ): boolean {
+    if (this.closed) return false
+    if (method === 'serverRequest/resolved') this.resolve(params?.requestId)
+    if (method === 'item/agentMessage/delta')
+      return this.messages.has(String(params?.itemId))
+    if (method !== 'item/started' && method !== 'item/completed') return false
+    const item = params?.item as Record<string, unknown> | undefined
+    if (
+      item?.type !== 'agentMessage' ||
+      item.delivery !== 'async' ||
+      typeof item.id !== 'string'
+    )
+      return false
+    const parsed = asyncQuestionsSchema.safeParse(item.questions)
+    if (!parsed.success) return false // Keep ordinary async prose, or an unknown future shape, visible.
+    if (!this.messages.has(item.id)) {
+      this.messages.add(item.id)
+      this.host.notify(
+        parsed.data.map((q) => ({
+          question: q.title,
+          options: (q.options ?? []).map((label) => ({ label })),
+        })),
+        item.id,
+      )
+    }
+    return true
+  }
+}
+```
+Diff (source hunks; lockfiles and pure test hunks omitted, except in a lockfile-only commit):
+```diff
+diff --git a/common/src/codex/questions.ts b/common/src/codex/questions.ts
+new file mode 100644
+index 000000000..673c877b9
+--- /dev/null
++++ b/common/src/codex/questions.ts
+@@ -0,0 +1,161 @@
++import { z } from 'zod/v4'
++
++/** Shared native question shape; both Desktop and Cloud render the same card. */
++export interface CodexQuestion {
++  question: string
++  header?: string
++  options: { label: string; description?: string }[]
++  allowFreeText?: boolean
++  isSecret?: boolean
++}
++
++/** The host question service, independent of Codex's two native delivery formats. */
++export interface CodexQuestionHost {
++  request: (
++    questions: CodexQuestion[],
++    signal: AbortSignal,
++  ) => Promise<string[][] | null>
++  // Async tool answers are new user input, even if the original turn has already finished.
++  notify: (questions: CodexQuestion[], itemId: string) => void
++}
++
++/** Native async tools already returned; their answers arrive as new input on the same session. */
++export function codexQuestionAnswerPrompt(
++  questions: Pick<CodexQuestion, 'question'>[],
++  answers: string[][],
++): string {
++  return [
++    'I answered your questions:',
++    ...questions.map((q, index) =>
++      `${q.question}\n${answers[index]?.join('\n') || '(No answer provided)'}`,
++    ),
++    'Continue using these answers.',
++  ].join('\n\n')
++}
++
++const option = z.object({ label: z.string(), description: z.string() })
++const requestSchema = z.object({
++  questions: z
++    .array(
++      z.object({
++        id: z.string().min(1),
++        header: z.string(),
++        question: z.string().min(1),
++        options: z.array(option).nullish(),
++        isOther: z.boolean().optional(),
++        isSecret: z.boolean().optional(),
++      }),
++    )
++    .min(1),
++})
++const asyncQuestionsSchema = z
++  .array(
++    z.object({
++      title: z.string().min(1),
++      // Codex serializes omitted choices as null for free-text async questions.
++      options: z.array(z.string()).nullish(),
++    }),
++  )
++  .min(1)
++
++/** Owns only native RPC lifetimes. Async message cards belong to the thread, not this connection. */
++export class CodexQuestions {
++  private readonly pending = new Map<string | number, AbortController>()
++  private readonly messages = new Set<string>()
++  private closed = false
++
++  constructor(private readonly host: CodexQuestionHost) {}
++
++  async request(id: string | number, params: unknown): Promise<unknown> {
++    if (this.closed) return undefined
++    const { questions } = requestSchema.parse(params)
++    if (new Set(questions.map((q) => q.id)).size !== questions.length)
++      throw new Error('Codex question IDs must be unique.')
++    if (this.pending.has(id))
++      throw new Error('Codex question request is already pending.')
++    const controller = new AbortController()
++    this.pending.set(id, controller)
++    const cancelled = new Promise<null>((resolve) => {
++      controller.signal.addEventListener('abort', () => resolve(null), {
++        once: true,
++      })
++    })
++    try {
++      const answers = await Promise.race([
++        this.host.request(
++          questions.map((q) => ({
++            question: q.question,
++            header: q.header,
++            options: q.options ?? [],
++            allowFreeText: q.isOther !== false || !q.options?.length,
++            ...(q.isSecret ? { isSecret: true } : {}),
++          })),
++          controller.signal,
++        ),
++        cancelled,
++      ])
++      // Codex already cleared this request (or the transport stopped). Never send a stale reply.
++      if (controller.signal.aborted) return undefined
++      return {
++        answers:
++          answers === null
++            ? {}
++            : Object.fromEntries(
++                questions.map((q, index) => [
++                  q.id,
++                  { answers: answers[index] ?? [] },
++                ]),
++              ),
++      }
++    } finally {
++      this.pending.delete(id)
++    }
++  }
++
++  resolve(id: unknown): void {
++    if (typeof id === 'string' || typeof id === 'number')
++      this.pending.get(id)?.abort()
++  }
++
++  close(): void {
++    this.closed = true
++    this.cancelRequests()
++  }
++
++  /** A host may run several native turns while async questions remain outstanding. */
++  cancelRequests(): void {
++    for (const controller of this.pending.values()) controller.abort()
++  }
++
++  /** Returns true when the structured message replaces the ordinary prose rendering. */
++  notification(
++    method: string,
++    params: Record<string, unknown> | undefined,
++  ): boolean {
++    if (this.closed) return false
++    if (method === 'serverRequest/resolved') this.resolve(params?.requestId)
++    if (method === 'item/agentMessage/delta')
++      return this.messages.has(String(params?.itemId))
++    if (method !== 'item/started' && method !== 'item/completed') return false
++    const item = params?.item as Record<string, unknown> | undefined
++    if (
++      item?.type !== 'agentMessage' ||
++      item.delivery !== 'async' ||
++      typeof item.id !== 'string'
++    )
++      return false
++    const parsed = asyncQuestionsSchema.safeParse(item.questions)
++    if (!parsed.success) return false // Keep ordinary async prose, or an unknown future shape, visible.
++    if (!this.messages.has(item.id)) {
++      this.messages.add(item.id)
++      this.host.notify(
++        parsed.data.map((q) => ({
++          question: q.title,
++          options: (q.options ?? []).map((label) => ({ label })),
++        })),
++        item.id,
++      )
++    }
++    return true
++  }
++}
+diff --git a/common/src/desktop-cloud/questions.ts b/common/src/desktop-cloud/questions.ts
+index 1bed6f8ea..0112c7772 100644
+--- a/common/src/desktop-cloud/questions.ts
++++ b/common/src/desktop-cloud/questions.ts
+@@ -1,46 +1,48 @@
+ import { z } from 'zod/v4'
+ 
+ /** Older servers ignore this header; older clients never receive a blocking tool. */
+ export const CLOUD_QUESTIONS_HEADER = 'x-freebuff-cloud-questions'
+ 
+ export const cloudQuestionsSchema = z.object({
+   questions: z
+     .array(
+       z.object({
+         question: z.string().trim().min(1).max(10_000),
+         header: z.string().max(24).optional().catch(undefined),
+         options: z
+           .array(
+             z.object({
+               label: z.string().trim().min(1).max(500),
+               description: z.string().max(2000).optional().catch(undefined),
+             }),
+           )
+           .max(6)
+           .optional()
+           .catch(undefined),
++        allowFreeText: z.boolean().optional(),
++        isSecret: z.boolean().optional(),
+         multiSelect: z.boolean().optional().catch(undefined),
+       }),
+     )
+     .min(1)
+     .max(20),
+ })
+ 
+ export type CloudQuestion = Omit<
+   z.infer<typeof cloudQuestionsSchema>['questions'][number],
+   'options'
+ > & {
+   options: { label: string; description?: string }[]
+ }
+ export type CloudQuestionRequest = {
+   id: string
+   questions: CloudQuestion[]
+ }
+ 
+ export const cloudQuestionAnswerSchema = z.discriminatedUnion('skipped', [
+   z.object({ skipped: z.literal(true) }),
+   z.object({
+     skipped: z.literal(false),
+     answers: z
+       .array(z.array(z.string().trim().min(1).max(10_000)).max(7))
+       .min(1)
+
+```
