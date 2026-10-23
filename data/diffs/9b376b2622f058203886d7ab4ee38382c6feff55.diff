@@ -1,0 +1,282 @@
+diff --git a/packages/agent-runtime/src/__tests__/compaction-working-set.test.ts b/packages/agent-runtime/src/__tests__/compaction-working-set.test.ts
+index ffd3251f9..2ca1adf3a 100644
+--- a/packages/agent-runtime/src/__tests__/compaction-working-set.test.ts
++++ b/packages/agent-runtime/src/__tests__/compaction-working-set.test.ts
+@@ -1,28 +1,30 @@
+ import { describe, expect, it } from 'bun:test'
+ 
+ import {
++  capProtectedToolBatch,
++  MAX_PROTECTED_TOOL_CALLS,
+   MECHANICAL_HISTORY_TOKENS,
+   USER_MEMORY_TOKENS,
+   compactHistoryNow,
+ } from '../compact-history'
+ import {
+   COMPACTED_READ_MARKER,
+   WORKING_SET_TAG,
+   outlineOf,
+ } from '../compaction-working-set'
+ import { countTokensMessages } from '../util/token-counter'
+ 
+ import type { Message } from '@codebuff/common/types/messages/codebuff-message'
+ 
+ const user = (text: string, live = false): Message => ({
+   role: 'user',
+   ...(live ? { tags: ['USER_PROMPT'] } : {}),
+   content: [{ type: 'text', text }],
+ })
+ const said = (text: string): Message => ({
+   role: 'assistant',
+   content: [{ type: 'text', text }],
+ })
+ const todos = (list: Array<{ task: string; completed: boolean }>): Message[] => [
+   {
+     role: 'assistant',
+@@ -429,25 +431,75 @@ describe('outlineOf', () => {
+         'func (s *Server) Start() error {',
+         'pub fn parse() -> Result {',
+         '## Usage',
+       ].join('\n'),
+     )
+     expect(lines).toBe(11)
+     expect(outline.split('\n')).toEqual([
+       'L2 export const LIMIT = 3',
+       'L4 export async function upload()',
+       'L7 class Retry',
+       'L8 def handler(event):',
+       'L9 func (s *Server) Start() error',
+       'L10 pub fn parse() -> Result',
+       'L11 ## Usage',
+     ])
+   })
+ 
+   it('numbers a windowed read from the window start', () => {
+     const { lines, outline } = outlineOf(
+       'export function middle() {\n}\n\n[read_files: showing lines 120-121 of 400. Use code_search …]',
+     )
+     expect(lines).toBe(400)
+     expect(outline).toBe('L120 export function middle()')
+   })
+ })
++
++describe('an oversized newest tool batch (a runaway response)', () => {
++  // 10-22: one response made thousands of calls, then every later turn threw
++  // because the pass kept the whole batch and could not shrink the calls.
++  const runaway = (calls: number): Message[] => [
++    user('Fix the build.', true),
++    ...Array.from({ length: calls }, (_, i): Message => ({
++      role: 'assistant',
++      content: [
++        {
++          type: 'tool-call',
++          toolCallId: `c${i}`,
++          toolName: 'run_terminal_command',
++          input: { command: `npm run build -- --filter package-${i % 400} ${'--verbose '.repeat(30)}` },
++        },
++      ],
++    })),
++    ...Array.from({ length: calls }, (_, i): Message => ({
++      role: 'tool',
++      toolCallId: `c${i}`,
++      toolName: 'run_terminal_command',
++      content: [{ type: 'json', value: { stdout: `build ${i} ok`, exitCode: 0 } }],
++    })),
++  ]
++
++  it('keeps the newest calls with their results and summarizes the rest instead of failing', () => {
++    const compacted = compactHistoryNow({
++      messages: runaway(5_000),
++      maxContextLength: 400_000,
++      fixedTokenCount: 20_000,
++    })!
++    expect(compacted).not.toBeNull()
++    const calls = compacted.messages.flatMap((m) =>
++      m.role === 'assistant' && Array.isArray(m.content)
++        ? m.content.filter((p) => p.type === 'tool-call').map((p) => (p as { toolCallId: string }).toolCallId)
++        : [],
++    )
++    const results = compacted.messages.flatMap((m) => (m.role === 'tool' ? [m.toolCallId] : []))
++    expect(calls).toHaveLength(MAX_PROTECTED_TOOL_CALLS)
++    expect(calls.at(-1)).toBe('c4999')
++    expect(new Set(results)).toEqual(new Set(calls))
++    expect(compacted.nextTokens + 20_000).toBeLessThanOrEqual(400_000)
++  })
++
++  it('leaves a normal batch whole', () => {
++    const { kept, spilled } = capProtectedToolBatch(runaway(20).slice(1))
++    expect(spilled).toHaveLength(0)
++    expect(kept).toHaveLength(40)
++  })
++})
+diff --git a/packages/agent-runtime/src/compact-history.ts b/packages/agent-runtime/src/compact-history.ts
+index 6ade072c0..9dd47008e 100644
+--- a/packages/agent-runtime/src/compact-history.ts
++++ b/packages/agent-runtime/src/compact-history.ts
+@@ -933,103 +933,160 @@ function latestToolExchangeStart(messages: Message[]): number {
+   const resultIds = new Set(
+     messages
+       .slice(start, lastTool + 1)
+       .flatMap((message) =>
+         message.role === 'tool' ? [message.toolCallId] : [],
+       ),
+   )
+   const calls = new Set<string>()
+   while (start > 0 && messages[start - 1].role === 'assistant') {
+     start--
+     const message = messages[start]
+     if (message.role === 'assistant') {
+       for (const part of message.content) {
+         if (part.type === 'tool-call') calls.add(part.toolCallId)
+       }
+     }
+   }
+   // Do not preserve orphan results (interrupted histories are cleaned by the
+   // request builder), or cut a call away from another result in its batch.
+   return calls.size === resultIds.size &&
+     [...calls].every((id) => resultIds.has(id))
+     ? start
+     : messages.length
+ }
+ 
++/**
++ * The most tool calls of the newest exchange a pass keeps verbatim; any older
++ * calls in the same batch, with their results, go to the summary instead.
++ *
++ * Why (2026-10-23): a runaway response (3,539 to 12,146 calls, 10-22) left a
++ * batch whose calls alone were 150k-330k tokens and whole was up to ~9M.
++ * The pass kept the batch whole, `fitToolResults` can clip results but not
++ * calls, so it threw on every later turn and the chat stayed stuck at the 400k
++ * budget error. Matches the per-response cap in tools/stream-parser.ts.
++ */
++export const MAX_PROTECTED_TOOL_CALLS = 100
++
++/** Splits an oversized newest exchange: the newest calls (and every result of
++ *  a kept message) stay; the rest are returned to be summarized. */
++export function capProtectedToolBatch(batch: Message[]): {
++  kept: Message[]
++  spilled: Message[]
++} {
++  const callIds = batch.flatMap((message) =>
++    message.role === 'assistant' && Array.isArray(message.content)
++      ? message.content.flatMap((part) =>
++          part.type === 'tool-call' ? [part.toolCallId] : [],
++        )
++      : [],
++  )
++  if (callIds.length <= MAX_PROTECTED_TOOL_CALLS) return { kept: batch, spilled: [] }
++  const newest = new Set(callIds.slice(-MAX_PROTECTED_TOOL_CALLS))
++  const keptIds = new Set<string>()
++  const keptAssistant = new Set<Message>()
++  for (const message of batch) {
++    if (message.role !== 'assistant' || !Array.isArray(message.content)) continue
++    const ids = message.content.flatMap((part) =>
++      part.type === 'tool-call' ? [part.toolCallId] : [],
++    )
++    if (ids.some((id) => newest.has(id))) {
++      keptAssistant.add(message)
++      ids.forEach((id) => keptIds.add(id))
++    }
++  }
++  const keep = (message: Message) =>
++    message.role === 'tool'
++      ? keptIds.has(message.toolCallId)
++      : message.role === 'assistant'
++        ? keptAssistant.has(message)
++        : true
++  return {
++    kept: batch.filter(keep),
++    spilled: batch.filter((message) => !keep(message)),
++  }
++}
++
+ /** Runtime-only request budgeting around the shared historical summarizer.
+  * The serialized context-pruner still uses compactMessages' summary algorithm;
+  * it does not own the parent's live model request or its fixed token overhead.
+  *
+  * `tokenBudget` is hard: the live request and the fresh tool results must fit
+  * it, clipped if they must. `targetBudget` is soft: the working set and the
+  * summary stop there, so aiming low shrinks only what this pass rewrites and
+  * never clips a result the model has not read yet.
+  */
+ function compactRequestHistory(
+   messages: Message[],
+   tokenBudget: number,
+   targetBudget = tokenBudget,
+   historyBudget = Number.POSITIVE_INFINITY,
+ ) {
+   const tailStart = latestToolExchangeStart(messages)
+   let promptStart = messages
+     .slice(0, tailStart)
+     .findLastIndex((message) => message.tags?.includes('USER_PROMPT'))
+   // Several steering prompts may have arrived together; keep all of them.
+   while (
+     promptStart > 0 &&
+     messages[promptStart - 1].tags?.includes('USER_PROMPT')
+   )
+     promptStart--
+   const instructionIndex = messages.findLastIndex((message) =>
+     message.tags?.includes('INSTRUCTIONS_PROMPT'),
+   )
+   const livePrompts = messages
+     .slice(Math.max(0, promptStart), tailStart)
+     .filter(
+       (message) => promptStart >= 0 && message.tags?.includes('USER_PROMPT'),
+     )
+   const prefix: Message[] = [
+     ...(instructionIndex >= 0 && instructionIndex < tailStart
+       ? [messages[instructionIndex]]
+       : []),
+     ...livePrompts,
+   ]
+   if (!prefix.some((message) => message.tags?.includes('USER_PROMPT'))) {
+     prefix.push({
+       role: 'user',
+       content: [{ type: 'text', text: CONTINUATION_TEXT }],
+       sentAt: Date.now(),
+     })
+   }
+-  const fresh = messages
+-    .slice(tailStart)
+-    .filter((message) => !message.tags?.includes('STEP_PROMPT'))
++  const { kept: fresh, spilled } = capProtectedToolBatch(
++    messages
++      .slice(tailStart)
++      .filter((message) => !message.tags?.includes('STEP_PROMPT')),
++  )
+   const protectedMessages = new Set([...prefix, ...fresh])
+-  const older = messages
+-    .slice(0, tailStart)
+-    .filter((message) => !protectedMessages.has(message))
++  const older = [
++    ...messages
++      .slice(0, tailStart)
++      .filter((message) => !protectedMessages.has(message)),
++    // An oversized batch's older calls are history now, after everything else.
++    ...spilled,
++  ]
+   // A previous pass's working set is reads, not conversation: it feeds this
+   // pass's working set and stays out of the summary's tool log.
+   const result = compactMessages({
+     messages: older.filter((message) => !isWorkingSetMessage(message)),
+   })
+   const entries = parseSummaryIntoEntries(result.summaryText)
+   const now = Date.now()
+   // Old persisted compactions put the current request inside the summary and
+   // remove USER_PROMPT tags. Reserve that request as historical memory rather
+   // than letting a large fresh read squeeze the task itself out of context.
+   const historicalRequest =
+     livePrompts.length === 0 &&
+     !fresh.some((message) => message.tags?.includes('USER_PROMPT'))
+       ? entries.findLast(
+           (entry) =>
+             entry.role === 'user' &&
+             !entry.parts.includes(`[USER]\n${CONTINUATION_TEXT}`),
+         )
+       : undefined
+   const reservedMemory = historicalRequest
+     ? countTokensMessages([
+         buildSummaryMessage(renderSummaryText([historicalRequest]), [], now),
+       ])
+     : 0
+   const prefixTokens = countTokensMessages(prefix)
