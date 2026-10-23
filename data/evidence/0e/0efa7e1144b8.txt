@@ -1,0 +1,703 @@
+Date: 2026-10-23T12:35:06Z
+Category: Core
+Areas: Shared/Core
+Commit nature: production
+Stats: +1 / -1
+Analysis notes: Shared/Core changes across 1 file(s) (+1/−1).
+Modified files: common/src/sites/client.ts
+Module & File Purpose (ground-truth documentation from touched files):
+- File `common/src/sites/client.ts`:
+```
+// The SAME objects the tools publish as their input schemas, so a constraint
+// cannot be enforced here without the model being shown it. See `SITE_ARGS`.
+```
+Complete Source of Modified Files (for complete module context):
+- File `common/src/sites/client.ts` (466 lines):
+```
+import { AsyncLocalStorage } from 'node:async_hooks'
+import { z } from 'zod/v4'
+import { bundleSite, readSiteSecret } from './local-files'
+import { prepareNextSite } from './next-prepare'
+import { prepareRealtimeSite } from './realtime-prepare'
+import { SITE_ARGS } from './tools'
+
+import { SitesClientError } from './errors'
+export { SitesClientError } from './errors'
+// The SAME objects the tools publish as their input schemas, so a constraint
+// cannot be enforced here without the model being shown it. See `SITE_ARGS`.
+const uuid = SITE_ARGS.siteId
+const environment = SITE_ARGS.environment
+const key = SITE_ARGS.requestId
+const name = SITE_ARGS.bindingName
+const target = z.object({ siteId: uuid, environment })
+const invalid = (message: string) =>
+  new SitesClientError(400, 'invalid_site_request', message)
+
+/**
+ * Parse ONE argument, keeping its name on the issue.
+ *
+ * `schema.parse(args.name)` produces an issue with an empty path, so a refusal
+ * could only ever name the failing CHECK and not the argument — the half of
+ * this that a model cannot work around.
+ */
+function field<T>(schema: z.ZodType<T>, argName: string, value: unknown): T {
+  return z.object({ [argName]: schema }).parse({ [argName]: value })[
+    argName
+  ] as T
+}
+
+/**
+ * Name the arguments a Zod check rejected, and nothing else.
+ *
+ * The opaque fallback below exists because a filesystem or validator error may
+ * carry file contents or a secret value. A Zod issue cannot: this reports only
+ * the argument's path and the kind of check that failed, never the value that
+ * failed it and never the issue's own message (`invalid_value` carries the
+ * received literal). Without this an argument the model can fix reads as
+ * "check arguments and workspace files", so it retries the same call.
+ */
+function rejectedArguments(error: z.ZodError): string {
+  const named = [
+    ...new Set(
+      error.issues.map((issue) => {
+        const path = issue.path.map(String).join('.')
+        return path ? `${path} (${issue.code})` : issue.code
+      }),
+    ),
+  ]
+  return named.length > 0
+    ? `Sites rejected these arguments: ${named.join(', ')}. Read the tool's input schema and send values that match it.`
+    : 'Could not prepare the Sites request. Check arguments and workspace files.'
+}
+const IDEMPOTENT_TOOLS = new Set([
+  'sites_deploy',
+  'sites_add_storage',
+  'sites_set_secret',
+  'sites_set_published',
+])
+
+export class SitesClient {
+  private context = new AsyncLocalStorage<{
+    originProjectId: string
+    originProjectType: 'local' | 'cloud'
+  }>()
+  constructor(
+    private options: {
+      getToken: () => string | null | undefined
+      originApp: 'desktop' | 'web'
+      files?: { bundle: typeof bundleSite; secret: typeof readSiteSecret }
+      prepareNext?: typeof prepareNextSite
+      prepareRealtime?: typeof prepareRealtimeSite
+      host: string
+      fetcher?: (url: string, init: RequestInit) => Promise<Response>
+    },
+  ) {}
+  async request(
+    path: string,
+    method = 'GET',
+    body?: unknown,
+    idempotencyKey?: string,
+    signal?: AbortSignal,
+  ): Promise<unknown> {
+    const token = this.options.getToken()
+    if (!token)
+      throw new SitesClientError(
+        401,
+        'sites_sign_in_required',
+        'Sign in to Freebuff to view and deploy sites.',
+      )
+    // All callers construct a relative path from validated ids; no redirects may receive the bearer.
+    try {
+      const response = await (this.options.fetcher ?? fetch)(
+        `${this.options.host}/api/v1/sites${path}`,
+        {
+          method,
+          redirect: 'error',
+          signal: AbortSignal.any([
+            AbortSignal.timeout(120000),
+            ...(signal ? [signal] : []),
+          ]),
+          headers: {
+            Authorization: `Bearer ${token}`,
+            'Content-Type': 'application/json',
+            'X-Freebuff-Product-Context': JSON.stringify({
+              originApp: this.options.originApp,
+              ...this.context.getStore(),
+            }),
+            ...(idempotencyKey ? { 'Idempotency-Key': idempotencyKey } : {}),
+          },
+          body: body === undefined ? undefined : JSON.stringify(body),
+        },
+      )
+      const data = (await response.json()) as {
+        message?: string
+        error?: string
+        operation?: unknown
+      }
+      if (!response.ok && !data.operation) {
+        const knownErrors: Record<string, string> = {
+          sites_usage_limit:
+            'Your sites have reached a hosting allowance and are paused. Open Sites to view usage and reset dates. Your data is preserved.',
+          sites_usage_unavailable:
+            'Hosting usage is being checked. Try again shortly.',
+          project_limit:
+            'Your saved Sites limit has been reached. Delete an unused site to create another.',
+          published_site_limit:
+            'Your free hosting allowance includes 3 published sites. Unpublish every published environment of one site to publish another. Your saved sites and data are preserved.',
+          binding_limit:
+            'Each site environment includes one database and one storage bucket. Reuse the existing binding.',
+          variable_limit:
+            'This project has reached its limit of 25 environment variables across Preview and Production. Replace or delete an existing variable.',
+          deploy_required: 'Deploy this environment first.',
+          binding_exists:
+            'That name is already used by a database or storage binding.',
+          secret_not_found: 'This variable no longer exists. Refresh the list.',
+          environment_busy:
+            'An operation is still running, or an earlier one never reported its result. If this keeps happening, contact support@freebuff.com.',
+          site_deletion_needs_reconciliation:
+            'An earlier operation on this site never reported its result, so deletion is held until it is reconciled. Contact support@freebuff.com to have the site removed.',
+          site_deleting: 'This site is being deleted.',
+          subdomain_taken: 'This subdomain is already taken. Try another name.',
+          invalid_subdomain: 'Use 1–63 letters, numbers or hyphens. Start and end with a letter or number; generated addresses and customers are reserved.',
+          production_subdomain_only: 'Switch to Production to customize your Freebuff address.',
+          invalid_domain: 'Enter a subdomain such as www.example.com, without a URL or path. Root domains and platform domains are not supported.',
+          domain_claimed: 'This domain is already connected or being verified. Remove it from the other site or contact support to recover access.',
+          domain_limit: 'Remove the existing domain before connecting another.',
+          domain_not_ready: 'Wait for DNS and HTTPS verification before making this domain primary.',
+          domain_dns_unavailable: 'DNS could not be checked. Try again shortly.',
+          domain_dns_changed: 'Restore the active domain’s DNS or remove it to return to the Freebuff URL.',
+          domain_reconciliation_required: 'A provider registration needs reconciliation. Contact support before retrying.',
+          domains_not_configured: 'Custom-domain hosting is not configured for this deployment.',
+        }
+        const messages: Record<number, string> = {
+          401: 'Sign in to Freebuff to use Sites.',
+          403: 'Your account cannot access Sites.',
+          404: 'Sites is not enabled on this backend, or this site was not found.',
+          409: 'The environment is busy or the request conflicts with an earlier operation.',
+          429: 'Sites usage limit reached. Try again later.',
+          503: 'Sites is not configured or is temporarily busy.',
+        }
+        throw new SitesClientError(
+          response.status,
+          'sites_request_failed',
+          knownErrors[data.error ?? ''] ??
+            messages[response.status] ??
+            'The Sites request failed. Check the deployment manifest and operation status.',
+        )
+      }
+      return data
+    } catch (error) {
+      if (error instanceof SitesClientError) throw error
+      throw new SitesClientError(
+        502,
+        'sites_connection_failed',
+        'Couldn’t reach Sites. Check your connection and try again.',
+      )
+    }
+  }
+  async setSubdomain(siteId: string, env: string, raw: unknown, requestId: string) {
+    const input = z.strictObject({ subdomain: z.string().min(1).max(100) }).safeParse(raw)
+    if (!uuid.safeParse(siteId).success || !environment.safeParse(env).success || !key.safeParse(requestId).success || !input.success) throw invalid('Invalid subdomain request.')
+    return this.request(`/${siteId}/environments/${env}/subdomain`, 'POST', input.data, requestId)
+  }
+  async domainAction(siteId: string, env: string, raw: unknown, requestId: string) {
+    const input = z.discriminatedUnion('action', [
+      z.strictObject({ action: z.literal('connect'), hostname: z.string().min(1).max(253) }),
+      z.strictObject({ action: z.enum(['verify', 'primary', 'remove']), domainId: uuid }),
+    ]).safeParse(raw)
+    if (!uuid.safeParse(siteId).success || !environment.safeParse(env).success || !key.safeParse(requestId).success || !input.success) throw invalid('Invalid domain request.')
+    return this.request(`/${siteId}/environments/${env}/domains`, 'POST', input.data, requestId)
+  }
+  async setPublished(
+    siteId: string,
+    env: string,
+    published: boolean,
+    requestId: string,
+    signal?: AbortSignal,
+  ) {
+    try {
+      uuid.parse(siteId)
+      environment.parse(env)
+      key.parse(requestId)
+      z.boolean().parse(published)
+    } catch {
+      throw invalid('Use a valid site, environment and request id.')
+    }
+    return this.request(
+      `/${siteId}/environments/${env}/publication`,
+      published ? 'PUT' : 'DELETE',
+      undefined,
+      requestId,
+      signal,
+    )
+  }
+  async deleteSite(siteId: string) {
+    if (!uuid.safeParse(siteId).success) throw invalid('Use a valid site id.')
+    return this.request(`/${siteId}`, 'DELETE')
+  }
+  async writeSecret(
+    siteId: string,
+    env: string,
+    binding: string,
+    method: 'PUT' | 'DELETE',
+    raw: unknown,
+    requestId: string,
+  ) {
+    try {
+      uuid.parse(siteId)
+      environment.parse(env)
+      name.parse(binding)
+      key.parse(requestId)
+      const input =
+        method === 'PUT'
+          ? z
+              .strictObject({
+                value: z
+                  .string()
+                  .min(1)
+                  .max(5120)
+                  .refine((value) => Buffer.byteLength(value, 'utf8') <= 5120),
+              })
+              .parse(raw)
+          : undefined
+      return await this.request(
+        `/${siteId}/environments/${env}/secrets/${binding}`,
+        method,
+        input,
+        requestId,
+      )
+    } catch (error) {
+      if (error instanceof SitesClientError) throw error
+      throw invalid(
+        'Use an uppercase variable name and a non-empty value of at most 5 KB. Platform binding names are reserved.',
+      )
+    }
+  }
+  async read(parts: string[], query = new URLSearchParams()) {
+    if (parts.length === 0) return this.request('')
+    uuid.parse(parts[0])
+    if (parts.length === 1) return this.request('/' + parts[0])
+    if (parts[1] !== 'environments') throw invalid('Unknown Sites path.')
+    environment.parse(parts[2])
+    const suffix = parts.slice(3)
+    if (
+      !(
+        suffix.length === 0 ||
+        (suffix.length === 1 &&
+          ['operations', 'analytics', 'domains', 'subdomain'].includes(suffix[0])) ||
+        (suffix.length === 2 &&
+          suffix[0] === 'auth' &&
+          ['analytics', 'users'].includes(suffix[1])) ||
+        (suffix.length === 2 &&
+          suffix[0] === 'operations' &&
+          uuid.safeParse(suffix[1]).success) ||
+        (suffix.length === 3 &&
+          suffix[0] === 'storage' &&
+          name.safeParse(suffix[1]).success &&
+          ['tables', 'rows', 'objects'].includes(suffix[2]))
+      )
+    )
+      throw invalid('Unknown Sites path.')
+    const search = new URLSearchParams()
+    for (const field of ['table', 'offset', 'cursor', 'q', 'days', 'name']) {
+      const value = query.get(field)
+      if (value !== null && value.length <= 2000) search.set(field, value)
+    }
+    return this.request(
+      '/' +
+        parts.map(encodeURIComponent).join('/') +
+        (search.size ? '?' + search : ''),
+    )
+  }
+  async runToolWithContext(
+    tool: string,
+    raw: unknown,
+    cwd: string,
+    mode: string,
+    signal?: AbortSignal,
+    context?: { originProjectId: string; originProjectType: 'local' | 'cloud' },
+  ) {
+    const run = () => this.runTool(tool, raw, cwd, mode, signal)
+    return context ? this.context.run(context, run) : run()
+  }
+  private async runTool(
+    tool: string,
+    raw: unknown,
+    cwd: string,
+    mode: string,
+    signal?: AbortSignal,
+  ) {
+    try {
+      if (mode === 'plan' && !['sites_list', 'sites_inspect'].includes(tool))
+        throw invalid('Sites mutations are unavailable in plan mode.')
+      if (tool === 'sites_list')
+        return await this.request('', 'GET', undefined, undefined, signal)
+      if (tool === 'sites_prepare_realtime') {
+        const args = z
+          .object({ projectDirectory: SITE_ARGS.workspacePath.optional() })
+          .strict()
+          .parse(raw)
+        return await (this.options.prepareRealtime ?? prepareRealtimeSite)(
+          cwd,
+          args.projectDirectory ?? '.',
+          signal,
+        )
+      }
+      if (tool === 'sites_prepare_next') {
+        const args = z
+          .object({
+            projectDirectory: SITE_ARGS.workspacePath.optional(),
+            realtime: z.literal(true).optional(),
+          })
+          .strict()
+          .parse(raw)
+        const prepare = this.options.prepareNext ?? prepareNextSite
+        return args.realtime
+          ? await prepare(cwd, args.projectDirectory ?? '.', signal, {
+              realtime: true,
+            })
+          : await prepare(cwd, args.projectDirectory ?? '.', signal)
+      }
+      if (tool === 'sites_create') {
+        const args = z
+          .object({ siteId: uuid, name: z.string().min(1).max(80) })
+          .strict()
+          .parse(raw)
+        return await this.request(
+          '',
+          'POST',
+          { id: args.siteId, name: args.name },
+          undefined,
+          signal,
+        )
+      }
+      const args = target.passthrough().parse(raw)
+      const path = `/${args.siteId}/environments/${args.environment}`
+      if (tool === 'sites_set_published') {
+        const input = target
+          .extend({ published: z.boolean(), requestId: key })
+          .strict()
+          .parse(raw)
+        return await this.setPublished(
+          input.siteId,
+          input.environment,
+          input.published,
+          input.requestId,
+          signal,
+        )
+      }
+      if (tool === 'sites_inspect') {
+        const [environment, activity] = await Promise.all([
+          this.request(path, 'GET', undefined, undefined, signal),
+          this.request(
+            path + '/operations',
+            'GET',
+            undefined,
+            undefined,
+            signal,
+          ),
+        ])
+        return { environment, activity }
+      }
+      if (tool === 'sites_enable_auth') {
+        const input = target
+          .extend({ localOrigin: z.string().url().optional() })
+          .strict()
+          .parse(raw)
+        return await this.request(
+          path + '/auth',
+          'POST',
+          { localOrigin: input.localOrigin },
+          undefined,
+          signal,
+        )
+      }
+      const requestId = field(key, 'requestId', args.requestId)
+      if (tool === 'sites_deploy') {
+        const manifestPath = field(
+          SITE_ARGS.workspacePath,
+          'manifestPath',
+          args.manifestPath,
+        )
+        const bundle = await (this.options.files?.bundle ?? bundleSite)(
+          cwd,
+          manifestPath,
+        )
+        return await this.request(
+          path + '/deployments',
+          'POST',
+          bundle,
+          requestId,
+          signal,
+        )
+      }
+      if (tool === 'sites_add_storage') {
+        const kind = field(z.enum(['d1', 'r2']), 'kind', args.kind)
+        return await this.request(
+          path + '/' + kind,
+          'POST',
+          { name: field(name, 'name', args.name) },
+          requestId,
+          signal,
+        )
+      }
+      if (tool === 'sites_set_secret') {
+        const binding = field(name, 'name', args.name)
+        const value = await (this.options.files?.secret ?? readSiteSecret)(
+          cwd,
+          field(SITE_ARGS.workspacePath, 'valueFile', args.valueFile),
+        )
+        return await this.request(
+          path + '/secrets/' + binding,
+          'PUT',
+          { value },
+          requestId,
+          signal,
+        )
+      }
+      throw invalid('Unknown Sites tool.')
+    } catch (error) {
+      // People read the connection message; an agent also needs to know an
+      // unanswered mutation may have landed and is only safe to repeat by key.
+      if (error instanceof SitesClientError)
+        return {
+          error: error.code,
+          message:
+            error.code === 'sites_connection_failed' &&
+            IDEMPOTENT_TOOLS.has(tool)
+              ? `${error.message} The operation may still be running: retry with the same requestId.`
+              : error.message,
+        }
+      // Filesystem and validator errors must never echo file contents / secret values.
+      return {
+        error: 'invalid_site_request',
+        message:
+          error instanceof z.ZodError
+            ? rejectedArguments(error)
+            : 'Could not prepare the Sites request. Check arguments and workspace files.',
+      }
+    }
+  }
+}
+```
+Where the symbols this change introduces are used elsewhere, at this same revision (the code that reads them; this is evidence for the WHAT and the WHY, and it is the only source for who consumes this change):
+- File `common/src/constants/freebuff-signup-block.ts` (3 matching lines):
+```
+// DNS filter blocking it — a cause the user can fix in ten seconds if they
+  // know it and cannot fix at all if they do not. Retrying does not help here,
+  // so "please try again" alone would be actively misleading.
+  recaptcha_missing:
+    'Please complete the verification check on the sign-in page and try again. If it never appeared, an ad blocker or network filter may be blocking www.google.com/recaptcha.',
+  recaptcha_invalid:
+    'That verification check could not be confirmed. Please try again.',
+  mailbox_already_registered:
+    'An account already exists for this email address. Try signing in instead.',
+  privacy_egress:
+    '[freebuff product prompt text omitted]',
+  untrusted_client_ip:
+    'We could not verify where this request came from. Please try again, or contact support if it keeps happening.',
+  ip_signup_velocity:
+    '[freebuff product prompt text omitted]',
+  prefix_signup_velocity:
+    '[freebuff product prompt text omitted]',
+  // Also shown when GitHub's API could not be reached: the gate fails closed,
+  // and the same two remedies apply.
+  email_provider_not_allowed:
+    "New accounts can't use a privacy, alias or disposable email address (such as Proton Mail, Tutanota, DuckDuckGo or Firefox Relay). Please sign up with Gmail, Outlook, iCloud, or your work or school email. If you use GitHub, make one of those your primary email in GitHub's settings (Settings → Emails) first.",
+  privacy_unverified:
+    "We couldn't check your connection just now. Please try again in a few minutes, or continue with Google, Apple or GitHub.",
+  email_domain_velocity:
+    'Too many accounts have been created with this email domain today. Please try again tomorrow, or continue with Google, Apple or GitHub.',
+  github_email_unverified:
+    "GitHub sign-in needs a verified email. Verify your email in GitHub's settings (Settings → Emails) and try again, or sign in with Google instead. If your email is already verified, GitHub may be temporarily unreachable; please try again in a few minutes.",
+}
+```
+- File `cli/src/__tests__/release/download-integrity.test.ts` (1 matching line):
+```
+const response = await client.httpGet(
+      'https://codebuff.com/api/releases/download/1/x.tar.gz',
+    )
+    response.resume()
+    expect(response.statusCode).toBe(200)
+    expect(requested).toEqual([
+      'codebuff.com/api/releases/download/1/x.tar.gz',
+      'github.com/o/r/releases/download/v1/x.tar.gz',
+      'objects.githubusercontent.com/asset?sig=1',
+    ])
+  })
+
+  test('stops at a downgrade and does not contact the http host', async () => {
+    const { client, requested } = clientWithRedirects([
+      [302, 'http://codebuff.com/asset'],
+    ])
+    await expect(
+      client.httpGet('https://codebuff.com/api/releases/download/1/x.tar.gz'),
+    ).rejects.toMatchObject({
+      code: 'EREDIRECT_REFUSED',
+      retryable: false,
+    })
+    expect(requested).toHaveLength(1)
+  })
+```
+- File `common/src/ads/sponsored-proposal-view.ts` (1 matching line):
+```
+// own branch and stopped. `landed` still means a pull request EXISTS, and
+  // only the user's own "Create pull request" moves a row there.
+  | 'committed'
+  // Terminal, and the ordinary success of an IN-PLACE run (the 2026-09-24
+  // amendment in `docs/freebuff-sponsored-local-execution.md`): the edits are
+  // in the user's working copy. There is no branch, so nothing reaches
+  // `landed` or `merged` from here, and the review is the changes panel.
+  | 'delivered'
+  | 'landed'
+  | 'failed'
+  | 'merged'
+
+// Plain words for what is happening to the user's project, never our name for
+// the mechanism. The "Sponsored" disclosure belongs to each surface's own
+// chrome, so the titles do not repeat it.
+export const SPONSORED_STATE_TITLE: Record<SponsoredProposalState, string> = {
+  offered: 'Sponsored offer',
+  accepted: 'Getting started…',
+  running: 'Setting it up…',
+  // Names the OUTCOME, not a next step. The run is finished and the commits
+  // are on a branch; whether that becomes a pull request is the user's call,
+  // so the copy must not read as though something is still pending.
+  committed: 'Done — committed to its own branch',
+  // Says WHERE the work is, because that is the one thing a user needs to
+  // know here and it is different from every other terminal: the files in
+```
+- File `common/src/constants/analytics-events.ts` (1 matching line):
+```
+// aborted. Carries `latencyMs`, `model`, and `titleLength` so the failure/
+  // fallback rate and added latency are queryable.
+  FREEBUFF_CHAT_TITLE_GENERATED = 'freebuff.chat_title_generated',
+  FREEBUFF_TITLE_RATE_LIMITED = 'api.freebuff_title_rate_limited',
+
+  // Freebuff - CLI landing page (/cli). Fired when the install command is
+  // copied; `location` distinguishes hero vs install section. Lets us measure
+  // install intent per campaign (utm_* ride along as super-properties) — the
+  // best proxy conversion for CLI traffic, since CLI activation happens in a
+  // separate identity space with no key back to the web landing.
+  FREEBUFF_CLI_INSTALL_COMMAND_COPIED = 'freebuff.cli_install_command_copied',
+
+  // Freebuff - Enterprise landing page (/enterprise). Fired when the contact
+  // form is submitted successfully; carries `companySize` and whether the
+  // sender self-identified as an AI lab, so inbound demand can be segmented
+  // without reading the emails. The lead itself lands in james@/victor@ inboxes
+  // — this event only measures the funnel into them.
+  FREEBUFF_ENTERPRISE_CONTACT_SUBMITTED = 'freebuff.enterprise_contact_submitted',
+
+  // Freebuff - Desktop download CTAs (home hero, products row, /desktop).
+  // Fired on every click of a download button; `location` distinguishes the
+  // CTA, `platform` the build, and `repeat: true` marks a click we swallowed
+  // because the same download had just started (the "did that work?" double
+  // click) — a direct read on whether the click feedback is landing.
+  FREEBUFF_DESKTOP_DOWNLOAD_CLICKED = 'freebuff.desktop_download_clicked',
+```
+- File `common/src/constants/enterprise-leads-backend.ts` (1 matching line):
+```
+/**
+ * Which store owns /enterprise contact-form leads (Convex `enterprise_leads`;
+ * Postgres `enterprise_lead`, migration 0342) — the checked-in switch for
+ * moving them off platform Convex (COD-742 Wave A2, light tier; runbook in
+ * docs/convex-retirement-wave-a.md, "Enterprise leads").
+ *
+ * - `convex`   (default): `/api/enterprise-contact` records the lead and its
+ *              email outcome through the secret-gated `enterprise_leads:*`
+ *              mutations, exactly as before the port. Nothing in the
+ *              Postgres port runs.
+ * - `postgres` the route writes Postgres on the primary: the INSERT and, after
+ *              the send, the email outcome. The Convex functions stay
+ *              deployed as the rollback.
+ *
+```
+- File `common/src/constants/freebuff-models.ts` (1 matching line):
+```
+*  in-flight agent run, but no new prompt should start. Shared because the
+ *  client has to know it too — a tab keeps beating until its row is past this,
+ *  which is what lets the server tell a run that is finishing from a tab that
+ *  died. Server-side accessor: `getSessionGraceMs()`. */
+export const FREEBUFF_SESSION_GRACE_MS = 30 * 60 * 1000
+
+/** How long a Desktop tab may hold its session with nothing running before the
+ *  app gives the slot back.
+ *
+ *  Sessions are otherwise released only on tab close, sign-out and app exit, so
+ *  a tab that ran one turn and was left open held the account's ONLY slot (every
+ *  model on the limited tier, the premium bucket on full) for up to an hour with
+ *  nothing happening in it — and every other tab'[freebuff product prompt text omitted]'t
+ *  change model here".
+ *
+ *  Ending early is not a forfeit: the server re-stamps `session_units` to the
+ *  fraction actually elapsed (`buildAdmitStampStatement`), so the unused window
+ *  returns to the DAILY POOL and the next send re-admits on the same instance
+ *  id. Getting it wrong costs one extra admission, not a session.
+ *
+ *  That is the pool only. The Freebucks charged for the hour settle on provider
+ *  cost instead (`FREEBUCKS_SESSION_REFUND_REASON`), so the two refunds do not
+ *  agree and must not be described as one.
+ *
+ *  Ten minutes is measured against reading a long answer and typing the next
+```
+Diff (source hunks; lockfiles and pure test hunks omitted, except in a lockfile-only commit):
+```diff
+diff --git a/common/src/sites/client.ts b/common/src/sites/client.ts
+index 4f47e5e01..a754718a3 100644
+--- a/common/src/sites/client.ts
++++ b/common/src/sites/client.ts
+@@ -115,51 +115,51 @@ export class SitesClient {
+       )
+       const data = (await response.json()) as {
+         message?: string
+         error?: string
+         operation?: unknown
+       }
+       if (!response.ok && !data.operation) {
+         const knownErrors: Record<string, string> = {
+           sites_usage_limit:
+             'Your sites have reached a hosting allowance and are paused. Open Sites to view usage and reset dates. Your data is preserved.',
+           sites_usage_unavailable:
+             'Hosting usage is being checked. Try again shortly.',
+           project_limit:
+             'Your saved Sites limit has been reached. Delete an unused site to create another.',
+           published_site_limit:
+             'Your free hosting allowance includes 3 published sites. Unpublish every published environment of one site to publish another. Your saved sites and data are preserved.',
+           binding_limit:
+             'Each site environment includes one database and one storage bucket. Reuse the existing binding.',
+           variable_limit:
+             'This project has reached its limit of 25 environment variables across Preview and Production. Replace or delete an existing variable.',
+           deploy_required: 'Deploy this environment first.',
+           binding_exists:
+             'That name is already used by a database or storage binding.',
+           secret_not_found: 'This variable no longer exists. Refresh the list.',
+           environment_busy:
+-            'An operation is running or needs reconciliation. Refresh deployment activity before trying again.',
++            'An operation is still running, or an earlier one never reported its result. If this keeps happening, contact support@freebuff.com.',
+           site_deletion_needs_reconciliation:
+             'An earlier operation on this site never reported its result, so deletion is held until it is reconciled. Contact support@freebuff.com to have the site removed.',
+           site_deleting: 'This site is being deleted.',
+           subdomain_taken: 'This subdomain is already taken. Try another name.',
+           invalid_subdomain: 'Use 1–63 letters, numbers or hyphens. Start and end with a letter or number; generated addresses and customers are reserved.',
+           production_subdomain_only: 'Switch to Production to customize your Freebuff address.',
+           invalid_domain: 'Enter a subdomain such as www.example.com, without a URL or path. Root domains and platform domains are not supported.',
+           domain_claimed: 'This domain is already connected or being verified. Remove it from the other site or contact support to recover access.',
+           domain_limit: 'Remove the existing domain before connecting another.',
+           domain_not_ready: 'Wait for DNS and HTTPS verification before making this domain primary.',
+           domain_dns_unavailable: 'DNS could not be checked. Try again shortly.',
+           domain_dns_changed: 'Restore the active domain’s DNS or remove it to return to the Freebuff URL.',
+           domain_reconciliation_required: 'A provider registration needs reconciliation. Contact support before retrying.',
+           domains_not_configured: 'Custom-domain hosting is not configured for this deployment.',
+         }
+         const messages: Record<number, string> = {
+           401: 'Sign in to Freebuff to use Sites.',
+           403: 'Your account cannot access Sites.',
+           404: 'Sites is not enabled on this backend, or this site was not found.',
+           409: 'The environment is busy or the request conflicts with an earlier operation.',
+           429: 'Sites usage limit reached. Try again later.',
+           503: 'Sites is not configured or is temporarily busy.',
+         }
+         throw new SitesClientError(
+           response.status,
+
+```
