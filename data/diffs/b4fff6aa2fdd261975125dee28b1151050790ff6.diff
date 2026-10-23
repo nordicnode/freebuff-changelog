@@ -1,0 +1,576 @@
+diff --git a/cli/src/utils/__tests__/error-log-redaction.test.ts b/cli/src/utils/__tests__/error-log-redaction.test.ts
+new file mode 100644
+index 000000000..b88528af3
+--- /dev/null
++++ b/cli/src/utils/__tests__/error-log-redaction.test.ts
+@@ -0,0 +1,120 @@
++import { AnalyticsEvent } from '@codebuff/common/constants/analytics-events'
++import { describe, expect, test } from 'bun:test'
++
++import {
++  MAX_ERROR_LOG_STRING_CHARS,
++  sanitizeErrorLogData,
++} from '../error-log-redaction'
++import { remoteLogPayload, selectAxiomLogData } from '../logger'
++
++const SECRET_PROMPT = 'please refactor my proprietary billing module'
++const SECRET_SYSTEM = 'You are a coding agent. Project files follow: SECRET'
++const BULK = 'x'.repeat(50_000)
++
++function failurePayload() {
++  const error = new Error('Agent run failed: upstream 500')
++  return {
++    error,
++    agentId: 'agent-123',
++    runId: 'run-456',
++    totalSteps: 7,
++    messageHistory: [
++      { role: 'user', content: [{ type: 'text', text: SECRET_PROMPT }] },
++    ],
++    systemPrompt: SECRET_SYSTEM,
++    agentState: { output: { notes: SECRET_PROMPT } },
++    toolOutput: BULK,
++  }
++}
++
++function expectNoConversation(shipped: unknown) {
++  const text = JSON.stringify(shipped)
++  expect(text).not.toContain(SECRET_PROMPT)
++  expect(text).not.toContain('SECRET')
++  expect(text).not.toContain(BULK)
++  expect(text.length).toBeLessThan(12_000)
++}
++
++describe('sanitizeErrorLogData', () => {
++  test('keeps the error and scalar fields, drops the conversation and bulk', () => {
++    const payload = failurePayload()
++    const out = sanitizeErrorLogData(payload) as Record<string, any>
++
++    expectNoConversation(out)
++    expect(out.error.name).toBe('Error')
++    expect(out.error.message).toBe('Agent run failed: upstream 500')
++    expect(out.error.stack).toBe(payload.error.stack)
++    expect(out.agentId).toBe('agent-123')
++    expect(out.runId).toBe('run-456')
++    expect(out.totalSteps).toBe(7)
++    expect(out.messageHistory).toEqual({ kind: 'array', length: 1 })
++    expect(out.systemPrompt).toEqual({
++      kind: 'string',
++      length: SECRET_SYSTEM.length,
++    })
++    expect(out.agentState).toEqual({ kind: 'object', keyCount: 1, keys: ['output'] })
++    expect(out.toolOutput).toStartWith('x'.repeat(MAX_ERROR_LOG_STRING_CHARS))
++    expect(out.toolOutput).toEndWith(
++      `[${50_000 - MAX_ERROR_LOG_STRING_CHARS} chars omitted]`,
++    )
++  })
++
++  test('replaces a large array with its length and survives cycles', () => {
++    const cyclic: Record<string, unknown> = { paths: Array(500).fill('a.ts') }
++    cyclic.self = cyclic
++    const out = sanitizeErrorLogData(cyclic) as Record<string, unknown>
++    expect(out.paths).toEqual({ kind: 'array', length: 500 })
++    expect(out.self).toBe('[Circular]')
++  })
++
++  test('the Axiom record is sanitized for errors even under full telemetry', () => {
++    for (const level of ['error', 'fatal'] as const) {
++      const shipped = selectAxiomLogData({
++        level,
++        data: failurePayload(),
++        fullTelemetry: true,
++      }) as Record<string, any>
++      expectNoConversation(shipped)
++      expect(shipped.error.message).toBe('Agent run failed: upstream 500')
++      expect(shipped.error.stack).toContain('error-log-redaction.test')
++    }
++    // Other levels keep today's behaviour: raw only under full telemetry.
++    const data = { prompt: SECRET_PROMPT }
++    expect(selectAxiomLogData({ level: 'info', data, fullTelemetry: true })).toBe(
++      data,
++    )
++    expectNoConversation(
++      selectAxiomLogData({ level: 'info', data, fullTelemetry: false }),
++    )
++  })
++})
++
++// Through `remoteLogPayload`, not `logger.error`: other CLI test files
++// mock.module('../logger') for the whole `bun test` run, so a real logger call
++// here is the mock in CI and reaches no client.
++describe('what error and fatal records send to PostHog', () => {
++  test('error tracking and the analytics event get the error, never the conversation', () => {
++    for (const level of ['error', 'fatal'] as const) {
++      const { data, msg } = remoteLogPayload({
++        level,
++        data: { ...failurePayload(), eventId: AnalyticsEvent.CLI_FATAL_CRASH },
++        msg: `Agent execution failed ${BULK}`,
++      }) as { data: Record<string, any>; msg: string }
++      expectNoConversation(data)
++      expect(data.eventId).toBe(AnalyticsEvent.CLI_FATAL_CRASH)
++      expect(data.error.message).toBe('Agent run failed: upstream 500')
++      expect(data.error.stack).toContain('error-log-redaction.test')
++      expect(data.messageHistory).toEqual({ kind: 'array', length: 1 })
++      expect(msg).toStartWith('Agent execution failed')
++      expect(msg).not.toContain(BULK)
++    }
++  })
++
++  test('other levels pass through unchanged', () => {
++    const data = { prompt: SECRET_PROMPT }
++    expect(remoteLogPayload({ level: 'info', data, msg: 'm' })).toEqual({
++      data,
++      msg: 'm',
++    })
++  })
++})
+diff --git a/cli/src/utils/error-log-redaction.ts b/cli/src/utils/error-log-redaction.ts
+new file mode 100644
+index 000000000..ec4b29e2e
+--- /dev/null
++++ b/cli/src/utils/error-log-redaction.ts
+@@ -0,0 +1,129 @@
++import { summarizeAnalyticsValue } from '@codebuff/common/util/analytics-sampling'
++import {
++  redactErrorFieldForLog,
++  redactQueryErrorForLog,
++} from '@codebuff/common/util/log-redaction'
++
++/**
++ * Keys whose values are a user's conversation or code: chat history, prompts,
++ * file contents, tool inputs and results, an agent's state or output. An error
++ * record keeps only their shape (kind and length, or key names). The agent
++ * runtime runs inside the CLI and logs through its logger, so these are the
++ * names it and the SDK use (`messageHistory`, `systemPrompt`, `agentState`,
++ * set_output's `output`, `fileContext`, the AI SDK's `requestBodyValues`).
++ * Matched case-insensitively.
++ */
++const CONVERSATION_KEYS = new Set(
++  [
++    'messageHistory',
++    'messages',
++    'message_history',
++    'systemPrompt',
++    'system',
++    'prompt',
++    'userPrompt',
++    'assistantPrompt',
++    'promptMessage',
++    'content',
++    'contents',
++    'text',
++    'fileContents',
++    'fileContext',
++    'knowledgeFiles',
++    'userKnowledgeFiles',
++    'toolResults',
++    'toolResult',
++    'toolCalls',
++    'input',
++    'output',
++    'agentState',
++    'sessionState',
++    'runState',
++    'requestBodyValues',
++  ].map((key) => key.toLowerCase()),
++)
++
++/** Longer strings are a payload, not a reason. Matches the server's error clip. */
++export const MAX_ERROR_LOG_STRING_CHARS = 2_000
++/** Longer arrays are bulk data; the record keeps their length. */
++export const MAX_ERROR_LOG_ARRAY_ITEMS = 25
++const MAX_DEPTH = 6
++
++export function clipErrorLogString(text: string): string {
++  return text.length > MAX_ERROR_LOG_STRING_CHARS
++    ? `${text.slice(0, MAX_ERROR_LOG_STRING_CHARS)}… [${text.length - MAX_ERROR_LOG_STRING_CHARS} chars omitted]`
++    : text
++}
++
++function sanitize(
++  value: unknown,
++  depth: number,
++  seen: WeakSet<object>,
++): unknown {
++  if (typeof value === 'string') return clipErrorLogString(value)
++  if (typeof value === 'bigint') return value.toString()
++  if (typeof value === 'function' || typeof value === 'symbol') return undefined
++  if (value === null || typeof value !== 'object') return value
++
++  if (value instanceof Date) {
++    return Number.isNaN(value.getTime()) ? 'Invalid Date' : value.toISOString()
++  }
++  if (seen.has(value)) return '[Circular]'
++  if (depth >= MAX_DEPTH) return summarizeAnalyticsValue(value)
++  seen.add(value)
++
++  if (Array.isArray(value)) {
++    if (value.length > MAX_ERROR_LOG_ARRAY_ITEMS) {
++      return summarizeAnalyticsValue(value)
++    }
++    return value.map((item) => sanitize(item, depth + 1, seen))
++  }
++
++  if (value instanceof Error) {
++    // name, message and stack are non-enumerable; library fields (status,
++    // code, an AI SDK error's request body) are enumerable and walked below.
++    const error = redactQueryErrorForLog(value)
++    const fields: Record<string, unknown> = {}
++    for (const [key, field] of Object.entries(error)) {
++      fields[key] = sanitizeField(key, field, depth, seen)
++    }
++    return {
++      ...fields,
++      name: error.name,
++      message: clipErrorLogString(error.message),
++      ...(error.stack ? { stack: clipErrorLogString(error.stack) } : {}),
++      ...(error.cause !== undefined
++        ? { cause: sanitize(error.cause, depth + 1, seen) }
++        : {}),
++    }
++  }
++
++  const out: Record<string, unknown> = {}
++  for (const [key, field] of Object.entries(value)) {
++    out[key] = sanitizeField(key, field, depth, seen)
++  }
++  return out
++}
++
++function sanitizeField(
++  key: string,
++  value: unknown,
++  depth: number,
++  seen: WeakSet<object>,
++): unknown {
++  if (CONVERSATION_KEYS.has(key.toLowerCase())) {
++    return summarizeAnalyticsValue(value)
++  }
++  return sanitize(redactErrorFieldForLog(key, value), depth + 1, seen)
++}
++
++/**
++ * An error or fatal log payload fit to leave the machine (the Axiom mirror and
++ * PostHog error tracking). Error names, messages, stacks and scalar fields
++ * stay; conversation-shaped fields become their shape, strings over
++ * {@link MAX_ERROR_LOG_STRING_CHARS} are clipped with a length note, and arrays
++ * over {@link MAX_ERROR_LOG_ARRAY_ITEMS} become their length.
++ */
++export function sanitizeErrorLogData(data: unknown): unknown {
++  return sanitize(data, 0, new WeakSet())
++}
+diff --git a/cli/src/utils/logger.ts b/cli/src/utils/logger.ts
+index 1a4b5270e..4ea03094a 100644
+--- a/cli/src/utils/logger.ts
++++ b/cli/src/utils/logger.ts
+@@ -1,45 +1,49 @@
+ import { appendFileSync, existsSync, mkdirSync, unlinkSync } from 'fs'
+ import path, { dirname } from 'path'
+ import { format as stringFormat } from 'util'
+ 
+ import { env, IS_DEV, IS_TEST, IS_CI } from '@codebuff/common/env'
+ import { createAnalyticsDispatcher } from '@codebuff/common/util/analytics-dispatcher'
+ import { getAnalyticsEventId } from '@codebuff/common/util/analytics-log'
+ import { getAxiomOnlyLogEvent } from '@codebuff/common/util/axiom-only-log'
+ import {
+   isFullTelemetryEnabled,
+   summarizeAnalyticsValue,
+ } from '@codebuff/common/util/analytics-sampling'
+ import { pino } from 'pino'
+ 
+ import {
+   flushAnalytics,
+   logError,
+   setAnalyticsErrorLogger,
+   trackEvent,
+ } from './analytics'
++import {
++  clipErrorLogString,
++  sanitizeErrorLogData,
++} from './error-log-redaction'
+ import { enqueueClientLog } from './log-shipper'
+ import { getCurrentChatDir, getProjectRoot } from '../project-files'
+ 
+ import type { LogRecordInput } from '@codebuff/common/schemas/logs'
+ 
+ /** Name of the per-chat debug log file written in production builds */
+ export const CHAT_LOG_FILENAME = 'log.jsonl'
+ 
+ export interface LoggerContext {
+   userId?: string
+   userEmail?: string
+   clientSessionId?: string
+   fingerprintId?: string
+   clientRequestId?: string
+   [key: string]: any // Allow for future extensions
+ }
+ 
+ export const loggerContext: LoggerContext = {}
+ 
+ let logPath: string | undefined = undefined
+ let pinoLogger: any = undefined
+ 
+ const loggingLevels = ['info', 'debug', 'warn', 'error', 'fatal'] as const
+ type LogLevel = (typeof loggingLevels)[number]
+ const analyticsDispatcher = createAnalyticsDispatcher({
+@@ -131,145 +135,183 @@ function sendAnalyticsAndLog(
+   msg?: string,
+   ...args: any[]
+ ): void {
+   if (!IS_CI && !IS_TEST) {
+     let projectRoot: string | undefined
+     try {
+       projectRoot = getProjectRoot()
+     } catch {
+       projectRoot = undefined
+     }
+     if (projectRoot) {
+       const logTarget =
+         IS_DEV
+           ? path.join(projectRoot, 'debug', 'cli.jsonl')
+           : path.join(getCurrentChatDir(), CHAT_LOG_FILENAME)
+ 
+       setLogPath(logTarget)
+     }
+   }
+ 
+   const isStringOnly = typeof data === 'string' && msg === undefined
+   const normalizedData = isStringOnly ? undefined : data
+   const normalizedMsg = isStringOnly ? (data as string) : msg
+   const includeData = normalizedData != null && !isEmptyObject(normalizedData)
+   const axiomOnlyLogEvent = getAxiomOnlyLogEvent(normalizedData)
++  const { data: remoteData, msg: remoteMsg } = remoteLogPayload({
++    level,
++    data: includeData ? normalizedData : undefined,
++    msg: stringFormat(normalizedMsg ?? '', ...args),
++  })
+ 
+   const toTrack = {
+-    ...(includeData ? { data: normalizedData } : {}),
++    ...(includeData ? { data: remoteData } : {}),
+     level,
+     loggerContext,
+-    msg: stringFormat(normalizedMsg, ...args),
++    msg: remoteMsg,
+   }
+ 
+   logAsErrorIfNeeded(toTrack)
+ 
+   if (!IS_DEV && includeData && typeof normalizedData === 'object') {
+     const analyticsPayloads = analyticsDispatcher.process({
+-      data: normalizedData,
++      data: remoteData,
+       level,
+-      msg: stringFormat(normalizedMsg ?? '', ...args),
++      msg: remoteMsg,
+       fallbackUserId: loggerContext.userId,
+     })
+ 
+     analyticsPayloads.forEach((payload) => {
+       trackEvent(payload.event, payload.properties)
+     })
+   }
+ 
+   // Mirror the log/event into the server-side Axiom logs sink via /api/logs
+   // (in addition to PostHog). Best-effort and batched; skip noisy debug logs
+   // and anything before we know who the user is.
+   if (
+     !IS_DEV &&
+     !IS_TEST &&
+     !IS_CI &&
+     loggerContext.userId &&
+     level !== 'debug'
+   ) {
+     const analyticsEventId =
+       includeData && typeof normalizedData === 'object'
+         ? getAnalyticsEventId(normalizedData)
+         : null
+-    // Mirror the PostHog path's redaction: only ship raw payloads for errors or
+-    // when full telemetry is enabled; otherwise ship a summary. Keeps PII/data
+-    // volume symmetric across the two sinks.
+-    const includeRawData =
+-      isFullTelemetryEnabled({
+-        distinctId: loggerContext.userId,
+-        properties: loggerContext,
+-      }) ||
+-      level === 'error' ||
+-      level === 'fatal'
+     const shipData = axiomOnlyLogEvent
+       ? axiomOnlyLogEvent.data
+       : includeData
+-        ? includeRawData
+-          ? normalizedData
+-          : summarizeAnalyticsValue(normalizedData)
++        ? selectAxiomLogData({
++            level,
++            data: normalizedData,
++            sanitizedErrorData: remoteData,
++            fullTelemetry: isFullTelemetryEnabled({
++              distinctId: loggerContext.userId,
++              properties: loggerContext,
++            }),
++          })
+         : undefined
+     const record: LogRecordInput = {
+       timestamp: new Date().toISOString(),
+       level,
+       event:
+         axiomOnlyLogEvent?.event ??
+         (analyticsEventId ? String(analyticsEventId) : undefined),
+-      message: stringFormat(normalizedMsg ?? '', ...args),
++      message: remoteMsg,
+       client_session_id:
+         (axiomOnlyLogEvent?.data.client_session_id as string | undefined) ??
+         loggerContext.clientSessionId,
+       client_request_id:
+         (axiomOnlyLogEvent?.data.client_request_id as string | undefined) ??
+         loggerContext.clientRequestId,
+       fingerprint_id: loggerContext.fingerprintId,
+       data: shipData,
+     }
+     enqueueClientLog(record)
+   }
+ 
+   // In dev mode, use appendFileSync for real-time logging (Bun has issues with pino sync)
+   // In prod mode, use pino for better performance
+   if (IS_DEV && logPath) {
+     const logEntry = safeStringify({
+       level: level.toUpperCase(),
+       timestamp: new Date().toISOString(),
+       ...loggerContext,
+       ...(includeData ? { data: normalizedData } : {}),
+       msg: stringFormat(normalizedMsg ?? '', ...args),
+     })
+     try {
+       appendFileSync(logPath, logEntry + '\n')
+     } catch {
+       // Ignore write errors
+     }
+   } else if (pinoLogger !== undefined) {
+     const base = { ...loggerContext }
+     const obj = includeData ? { ...base, data: normalizedData } : base
+     pinoLogger[level](obj, normalizedMsg as any, ...args)
+   }
+ }
+ 
++/**
++ * What a record sends off the machine to both PostHog paths (error tracking
++ * and the analytics event) and the Axiom mirror: for error and fatal records,
++ * never the conversation, file contents or bulk data they may carry.
++ */
++export function remoteLogPayload(params: {
++  level: LogLevel
++  data: unknown
++  msg: string
++}): { data: unknown; msg: string } {
++  const { level, data, msg } = params
++  if (level !== 'error' && level !== 'fatal') return { data, msg }
++  return {
++    data: data === undefined ? undefined : sanitizeErrorLogData(data),
++    msg: clipErrorLogString(msg),
++  }
++}
++
++/**
++ * The `data` an Axiom mirror record carries. Error and fatal records ship the
++ * sanitized payload whatever the telemetry setting, so a failure never mirrors
++ * the conversation. Other levels ship raw only under full telemetry, otherwise
++ * a summary, matching the PostHog path.
++ */
++export function selectAxiomLogData(params: {
++  level: LogLevel
++  data: unknown
++  fullTelemetry: boolean
++  sanitizedErrorData?: unknown
++}): unknown {
++  const { level, data, fullTelemetry } = params
++  if (level === 'error' || level === 'fatal') {
++    return params.sanitizedErrorData ?? sanitizeErrorLogData(data)
++  }
++  return fullTelemetry ? data : summarizeAnalyticsValue(data)
++}
++
+ function logAsErrorIfNeeded(toTrack: {
+   data?: any
+   level: LogLevel
+   loggerContext: LoggerContext
+   msg: string
+ }) {
+   if (toTrack.level === 'error' || toTrack.level === 'fatal') {
+     logError(
+       new Error(toTrack.msg),
+       toTrack.loggerContext.userId ?? 'unknown',
+       { ...(toTrack.data ?? {}), context: toTrack.loggerContext },
+     )
+     flushAnalytics()
+   }
+ }
+ 
+ /**
+  * Wrapper around Pino logger.
+  *
+  * To also send to Posthog, set data.eventId to type AnalyticsEvent
+  *
+  * e.g. logger.info({eventId: AnalyticsEvent.SOME_EVENT, field: value}, 'some message')
+  */
+ export const logger: Record<LogLevel, pino.LogFn> = Object.fromEntries(
+   loggingLevels.map((level) => {
+diff --git a/common/src/util/axiom-only-log.ts b/common/src/util/axiom-only-log.ts
+index ccfb9e446..52b0514b5 100644
+--- a/common/src/util/axiom-only-log.ts
++++ b/common/src/util/axiom-only-log.ts
+@@ -22,52 +22,52 @@ export {
+   type FirstPartyViewAckOutcome,
+ }
+ export {
+   ADS_BREAK_CLICKED_EVENT,
+   ADS_BREAK_CLOSED_EVENT,
+   ADS_BREAK_SHOWN_EVENT,
+ }
+ 
+ import type { SponsorBreakEvent } from '../ads/sponsor-break-events'
+ 
+ /**
+  * Operational events that belong in Axiom but not in product analytics.
+  *
+  * This allowlist lets a small set of content-free operational events retain
+  * useful numeric/string/boolean metadata without becoming product events or
+  * providing a general redaction bypass. Unknown fields and unexpected value
+  * types are always discarded.
+  */
+ 
+ export const CONTEXT_PRUNING_COMPLETED_EVENT =
+   'context_pruning.completed' as const
+ 
+ /** Stream-cut / output-limit recovery (sdk/src/impl/stream-interruption.ts,
+  *  packages/agent-runtime/src/tools/stream-parser.ts). `metric` distinguishes
+  *  the log sites (stream_recovery_detected / _rescued) that share this one
+- *  allowlisted event — `_gave_up` logs at error level, which already ships
+- *  raw and doesn't need the allowlist. */
++ *  allowlisted event — `_gave_up` logs at error level, which ships its
++ *  scalar fields (CLI error sanitizer) and doesn't need the allowlist. */
+ export const STREAM_RECOVERY_EVENT = 'stream_recovery' as const
+ /** A file edit was refused because it looked cut off mid-generation
+  *  (packages/agent-runtime/src/util/truncated-write-guard.ts). `metric`
+  *  distinguishes truncated tool-call arguments from a write_file that would
+  *  replace a file with a cut-off copy of itself. Content-free: sizes, tool and
+  *  model names only, never a path or file content. */
+ export const FILE_WRITE_GUARD_EVENT = 'file_write_guard' as const
+ /** A compaction the mechanical pass did not apply: it threw (the live request
+  *  alone over budget), could not shrink the history, or would have left the
+  *  run back at the threshold that triggered it. Content-free: a fixed
+  *  `error_kind`, never the message. */
+ export const MECHANICAL_COMPACTION_SKIPPED_EVENT =
+   'mechanical_compaction.skipped' as const
+ /** The runtime's mechanical compaction (packages/agent-runtime/src/compact-history.ts).
+  *  Shares its field names
+  *  with `context_pruning.completed`. Content-free sizes and counts only. */
+ export const CONTEXT_COMPACTION_COMPLETED_EVENT =
+   'context_compaction_completed' as const
+ /** The runtime reminded a model that its to-do list had not moved for several
+  *  tool calls (packages/agent-runtime/src/util/todo-progress-reminder.ts).
+  *  Counts and labels only, never the to-dos or a user id. */
+ export const TODO_PROGRESS_REMINDER_EVENT = 'todo_progress_reminder' as const
+ /** A turn sitting on repeated rejected edits to the same file
+  *  (packages/agent-runtime/src/util/file-edit-loop.ts), emitted for
+  *  MEASUREMENT: it never stops a turn. `strictConsecutive` and `guardEligible`
