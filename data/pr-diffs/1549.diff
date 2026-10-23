@@ -134,10 +134,10 @@ index cdc0440298..97d9e3ee3c 100644
        onToggleCollapsed(message.id)
 diff --git a/cli/src/utils/__tests__/streaming-markdown.test.tsx b/cli/src/utils/__tests__/streaming-markdown.test.tsx
 new file mode 100644
-index 0000000000..2ac692c4ae
+index 0000000000..e1bad462a0
 --- /dev/null
 +++ b/cli/src/utils/__tests__/streaming-markdown.test.tsx
-@@ -0,0 +1,153 @@
+@@ -0,0 +1,192 @@
 +import { describe, expect, test } from 'bun:test'
 +import { createTestRenderer } from '@opentui/core/testing'
 +import { createRoot, flushSync } from '@opentui/react'
@@ -291,8 +291,47 @@ index 0000000000..2ac692c4ae
 +    expect(actual).toEqual(expected)
 +  })
 +})
++
++describe('merged styled runs keep block boundaries', () => {
++  // Regression: merging same-styled nodes must not swallow the blank line
++  // between a code block and the paragraph that follows it.
++  test('a paragraph after a code block starts on its own line', async () => {
++    const doc = `\`\`\`ts
++const a = 1
++const b = 2
++\`\`\`
++
++After the block.
++`
++    const frame = await renderFrame(
++      renderStreamingMarkdown(doc, { codeBlockWidth: 60 }),
++    )
++    const lines = frame.split('\n').map((line) => line.trimEnd())
++
++    expect(lines).toContain('const b = 2')
++    expect(lines).toContain('After the block.')
++    expect(lines.some((line) => line.includes('const b = 2After'))).toBe(false)
++  })
++
++  test('code block lines stay on separate lines', async () => {
++    const doc = `\`\`\`ts
++const a = 1
++const b = 2
++const c = 3
++\`\`\`
++`
++    const frame = await renderFrame(
++      renderStreamingMarkdown(doc, { codeBlockWidth: 60 }),
++    )
++    const lines = frame.split('\n').map((line) => line.trimEnd())
++
++    expect(lines).toContain('const a = 1')
++    expect(lines).toContain('const b = 2')
++    expect(lines).toContain('const c = 3')
++  })
++})
 diff --git a/cli/src/utils/markdown-renderer.tsx b/cli/src/utils/markdown-renderer.tsx
-index 662602cc25..0c6b9f4768 100644
+index 662602cc25..d8afa77bc7 100644
 --- a/cli/src/utils/markdown-renderer.tsx
 +++ b/cli/src/utils/markdown-renderer.tsx
 @@ -124,6 +124,7 @@ interface RenderState {
@@ -312,7 +351,127 @@ index 662602cc25..0c6b9f4768 100644
      },
    }
  }
-@@ -1006,6 +1007,35 @@ const normalizeOutput = (nodes: ReactNode[]): ReactNode => {
+@@ -989,6 +990,119 @@ const renderNode = (
+   }
+ }
+ 
++/**
++ * Merges adjacent styled runs that render identically, including runs separated
++ * only by whitespace.
++ *
++ * A frame costs the terminal roughly linearly in the number of nodes it has to
++ * walk - ~60ms for 1,500 nodes regardless of whether anything changed - so a
++ * code block emitted as one span per line is the expensive shape, not the
++ * characters. Merging `<span>line</span>'\n'<span>line</span>` into a single
++ * span removes those per-line nodes without changing a rendered character.
++ */
++const coalesceNodes = (nodes: ReactNode[]): ReactNode[] => {
++  const merged: ReactNode[] = []
++
++  const sameStyledStrings = (
++    a: ReactNode,
++    b: ReactNode,
++  ): [Record<string, unknown>, string, string] | null => {
++    if (!React.isValidElement(a) || !React.isValidElement(b)) return null
++    if (a.type !== b.type) return null
++    const aProps = a.props as Record<string, unknown>
++    const bProps = b.props as Record<string, unknown>
++    const aKeys = Object.keys(aProps).filter((k) => k !== 'children')
++    const bKeys = Object.keys(bProps).filter((k) => k !== 'children')
++    if (aKeys.length !== bKeys.length) return null
++    for (const key of aKeys) {
++      if (aProps[key] !== bProps[key]) return null
++    }
++    if (
++      typeof aProps.children !== 'string' ||
++      typeof bProps.children !== 'string'
++    ) {
++      return null
++    }
++    return [aProps, aProps.children, bProps.children]
++  }
++
++  for (let i = 0; i < nodes.length; i++) {
++    const node = nodes[i]
++    const prev = merged[merged.length - 1]
++
++    if (
++      typeof prev === 'string' &&
++      typeof node === 'string' &&
++      prev.trim().length > 0 &&
++      node.trim().length > 0
++    ) {
++      merged[merged.length - 1] = prev + node
++      continue
++    }
++
++    const direct = sameStyledStrings(prev, node)
++    if (direct) {
++      const [props, aChildren, bChildren] = direct
++      merged[merged.length - 1] = React.createElement(
++        (prev as React.ReactElement).type as React.ElementType,
++        { ...props, children: aChildren + bChildren },
++      )
++      continue
++    }
++
++    if (!React.isValidElement(node)) {
++      merged.push(node)
++      continue
++    }
++
++    // Absorb a following run of same-styled nodes separated only by
++    // whitespace. Whitespace-only strings after the last node are left alone:
++    // they are the block separator the document-level trim drops.
++    let end = i + 1
++    let separator = ''
++    let absorbed: string | null = null
++    let props: Record<string, unknown> | null = null
++
++    while (end < nodes.length) {
++      const next = nodes[end]
++      if (typeof next === 'string' && next.trim().length === 0) {
++        separator += next
++        end += 1
++        continue
++      }
++      const match = sameStyledStrings(node, next)
++      if (!match) break
++      const [nextProps, , nextChildren] = match
++      props = nextProps
++      absorbed = (absorbed ?? (node.props as { children: string }).children) +
++        separator +
++        nextChildren
++      separator = ''
++      end += 1
++    }
++
++    if (absorbed !== null && props !== null) {
++      merged.push(
++        React.createElement(
++          (node as React.ReactElement).type as React.ElementType,
++          { ...props, children: absorbed },
++        ),
++      )
++      // The run ended at a node that could not be merged; the whitespace after
++      // the last merged node was buffered, not consumed, so re-emit it.
++      if (separator) {
++        merged.push(separator)
++      }
++      i = end - 1
++      continue
++    }
++
++    merged.push(node)
++  }
++
++  return merged
++}
++
+ const normalizeOutput = (nodes: ReactNode[]): ReactNode => {
+   const trimmed = trimTrailingWhitespaceNodes(nodes)
+   if (trimmed.length === 0) {
+@@ -1006,6 +1120,35 @@ const normalizeOutput = (nodes: ReactNode[]): ReactNode => {
    )
  }
  
@@ -335,7 +494,7 @@ index 662602cc25..0c6b9f4768 100644
 +    const state = createRenderState(palette, codeBlockWidth, keyPrefix)
 +    const ast = processor.parse(markdown) as Root
 +    applyInlineFallbackFormatting(ast)
-+    return renderNode(ast, state, ast.type, undefined)
++    return coalesceNodes(renderNode(ast, state, ast.type, undefined))
 +  } catch (error) {
 +    logger.error(error, 'Failed to parse markdown')
 +    return [markdown]
@@ -348,6 +507,15 @@ index 662602cc25..0c6b9f4768 100644
  export function renderMarkdown(
    markdown: string,
    options: MarkdownRenderOptions = {},
+@@ -1016,7 +1159,7 @@ export function renderMarkdown(
+     const state = createRenderState(palette, codeBlockWidth)
+     const ast = processor.parse(markdown) as Root
+     applyInlineFallbackFormatting(ast)
+-    const nodes = renderNode(ast, state, ast.type, undefined)
++    const nodes = coalesceNodes(renderNode(ast, state, ast.type, undefined))
+     return normalizeOutput(nodes)
+   } catch (error) {
+     logger.error(error, 'Failed to parse markdown')
 diff --git a/cli/src/utils/streaming-markdown.ts b/cli/src/utils/streaming-markdown.ts
 new file mode 100644
 index 0000000000..d84a04a567
