@@ -1,0 +1,294 @@
+diff --git a/cli/src/commands/__tests__/btw.test.ts b/cli/src/commands/__tests__/btw.test.ts
+new file mode 100644
+index 0000000000..2928767f77
+--- /dev/null
++++ b/cli/src/commands/__tests__/btw.test.ts
+@@ -0,0 +1,76 @@
++import { describe, expect, test } from 'bun:test'
++
++import { askSideQuestion } from '../btw'
++
++import type { RunState } from '@codebuff/sdk'
++
++const previousRun = {
++  output: { type: 'lastMessage', value: [] },
++  traceSessionId: 'trace',
++} as unknown as RunState
++
++function clientReturning(output: RunState['output']) {
++  const calls: Record<string, unknown>[] = []
++  const getClient = (async () => ({
++    run: async (options: Record<string, unknown>) => {
++      calls.push(options)
++      return { output, traceSessionId: 'trace' }
++    },
++  })) as unknown as Parameters<typeof askSideQuestion>[0]['getClient']
++  return { calls, getClient }
++}
++
++describe('askSideQuestion', () => {
++  test('asks once, with no tools, off the current run', async () => {
++    const { calls, getClient } = clientReturning({
++      type: 'lastMessage',
++      value: [
++        {
++          role: 'assistant',
++          content: [{ type: 'text', text: 'Because the flag defaults to off.' }],
++        },
++      ],
++    })
++
++    const answer = await askSideQuestion({
++      question: 'Why is X off?',
++      previousRun,
++      getClient,
++    })
++
++    expect(answer).toBe('Because the flag defaults to off.')
++    expect(calls).toHaveLength(1)
++    expect(calls[0]?.prompt).toBe('Why is X off?')
++    expect(calls[0]?.previousRun).toBe(previousRun)
++    expect(calls[0]?.maxAgentSteps).toBe(1)
++    expect((calls[0]?.agent as { toolNames: string[] }).toolNames).toEqual([])
++  })
++
++  test('surfaces a run error', async () => {
++    const { getClient } = clientReturning({
++      type: 'error',
++      message: 'Out of credits',
++    })
++
++    await expect(
++      askSideQuestion({ question: 'Anything?', previousRun, getClient }),
++    ).rejects.toThrow('Out of credits')
++  })
++
++  test('fails when the run returns no text', async () => {
++    const { getClient } = clientReturning({ type: 'lastMessage', value: [] })
++
++    await expect(
++      askSideQuestion({ question: 'Anything?', previousRun, getClient }),
++    ).rejects.toThrow('No answer came back.')
++  })
++
++  test('asks the user to log in when there is no client', async () => {
++    const getClient = (async () =>
++      null) as unknown as Parameters<typeof askSideQuestion>[0]['getClient']
++
++    await expect(
++      askSideQuestion({ question: 'Anything?', previousRun, getClient }),
++    ).rejects.toThrow('/login')
++  })
++})
+diff --git a/cli/src/commands/__tests__/freebuff-command-aliases.test.ts b/cli/src/commands/__tests__/freebuff-command-aliases.test.ts
+index 51df54c66d..b5c3e933b6 100644
+--- a/cli/src/commands/__tests__/freebuff-command-aliases.test.ts
++++ b/cli/src/commands/__tests__/freebuff-command-aliases.test.ts
+@@ -33,6 +33,12 @@ describe('freebuff command aliases', () => {
+             assert.equal(SLASH_COMMANDS.some(cmd => cmd.id === name), !isFree)
+           }
+ 
++          // /btw builds its side-question agent from the freebuff catalog, so
++          // Codebuff must not offer it at all.
++          const freeMode = process.env.FREEBUFF_MODE === 'true'
++          assert.equal(SLASH_COMMANDS.some(cmd => cmd.id === 'btw'), freeMode)
++          assert.equal(findCommand('btw') !== undefined, freeMode)
++
+           if (process.env.FREEBUFF_MODE !== 'true') {
+             for (const name of ['reasoning', 'effort', 'think']) {
+               assert.equal(findCommand(name), undefined)
+diff --git a/cli/src/commands/btw.ts b/cli/src/commands/btw.ts
+new file mode 100644
+index 0000000000..31751e5197
+--- /dev/null
++++ b/cli/src/commands/btw.ts
+@@ -0,0 +1,83 @@
++import { compiledFreebuffModelIdOfRow } from '@codebuff/common/util/freebuff-catalog-compiled-model'
++
++import { getFreebuffModelDirectory } from '../state/freebuff-catalog-store'
++import { getSelectedFreebuffModel } from '../state/freebuff-model-store'
++import { getCodebuffClient } from '../utils/codebuff-client'
++import { extractSpawnAgentResultContent } from '../utils/message-block-helpers'
++
++import type { AgentDefinition, ResolvedByokConnection, RunState } from '@codebuff/sdk'
++
++export const BTW_USAGE = 'Usage: /btw <question>'
++
++/**
++ * `/btw` is Claude Code's side question: one answer that sees the conversation,
++ * takes no actions, and never becomes part of the history. The constraints are
++ * in the system prompt because the agent has no tools to enforce them.
++ */
++const SIDE_QUESTION_SYSTEM_PROMPT = [
++  'You are answering a side question the user asked in the middle of a task.',
++  'Answer directly in a single response, using only what this conversation already shows.',
++  'You have no tools: do not read files, run commands, search, or change anything, and never promise to try, check, or look something up.',
++  'When the conversation does not contain the answer, say what is missing.',
++].join('\n')
++
++/**
++ * The model the current selection runs, in the form an inline agent may name:
++ * a catalog row runs the server-side handle, which only its own root admits, so
++ * a plain definition has to name the compiled model id underneath it.
++ */
++function sideQuestionAgent(): AgentDefinition {
++  const selection = getSelectedFreebuffModel()
++  const row = getFreebuffModelDirectory().row(selection)
++  const model =
++    row?.key === selection ? compiledFreebuffModelIdOfRow(row) : selection
++  return {
++    id: 'freebuff-side-question',
++    displayName: 'Side question',
++    model: model as AgentDefinition['model'],
++    systemPrompt: SIDE_QUESTION_SYSTEM_PROMPT,
++    toolNames: [],
++  }
++}
++
++/**
++ * Runs the question against `previousRun` and returns the answer. The returned
++ * run state is dropped: forking from the session means the answer is not
++ * appended to the conversation the main agent keeps working in.
++ */
++export async function askSideQuestion({
++  question,
++  previousRun,
++  byok,
++  getClient = getCodebuffClient,
++}: {
++  question: string
++  previousRun: RunState
++  /** The BYOK connection the session runs on, if the user selected one. */
++  byok?: ResolvedByokConnection
++  getClient?: typeof getCodebuffClient
++}): Promise<string> {
++  const client = await getClient({ ...(byok ? { byok } : {}) })
++  if (!client) {
++    throw new Error('Not logged in. Run /login first.')
++  }
++
++  const state = await client.run({
++    agent: sideQuestionAgent(),
++    prompt: question,
++    previousRun,
++    // One model call and no tool round trip.
++    maxAgentSteps: 1,
++    costMode: 'free',
++  })
++
++  if (state.output.type === 'error') {
++    throw new Error(state.output.message)
++  }
++  const { content, hasError } = extractSpawnAgentResultContent(state.output)
++  const answer = content.trim()
++  if (hasError || !answer) {
++    throw new Error('No answer came back.')
++  }
++  return answer
++}
+diff --git a/cli/src/commands/command-registry.ts b/cli/src/commands/command-registry.ts
+index 3ca7b2c4a8..642e253b55 100644
+--- a/cli/src/commands/command-registry.ts
++++ b/cli/src/commands/command-registry.ts
+@@ -19,6 +19,8 @@ import {
+   handleProposalsOff,
+ } from './ads'
+ import { handleDealsCommand } from './deals'
++import { askSideQuestion, BTW_USAGE } from './btw'
++import { resolveByokConnection, selectedByokConnection } from '../utils/byok'
+ import { handleCopyConversationCommand } from './copy-conversation'
+ import { handleExportConversationCommand } from './export-conversation'
+ import { handleHelpCommand } from './help'
+@@ -225,6 +227,9 @@ const FREEBUFF_ONLY_COMMANDS = new Set([
+   // (isFreebuffOriginatedRequest). On Codebuff the command would take a value
+   // and silently drop it.
+   'reasoning',
++  // Side questions fork the freebuff root agent, which /btw builds from the
++  // freebuff model catalog.
++  'btw',
+ ])
+ 
+ const ALL_COMMANDS: CommandDefinition[] = [
+@@ -810,6 +815,58 @@ const ALL_COMMANDS: CommandDefinition[] = [
+       openFreebuffReasoningPicker()
+     },
+   }),
++  defineCommandWithArgs({
++    name: 'btw',
++    handler: async (params, args) => {
++      params.saveToHistory(params.inputValue.trim())
++      clearInput(params)
++
++      const question = args.trim()
++      if (!question) {
++        params.setMessages((prev) => [...prev, getSystemMessage(BTW_USAGE)])
++        return
++      }
++
++      // Fork the last settled turn, not a transcript copy: the side answer
++      // sees what the agent sees, and the run it produces is discarded.
++      const previousRun = useChatStore.getState().runState
++      if (!previousRun) {
++        params.setMessages((prev) => [
++          ...prev,
++          getSystemMessage(
++            'Nothing to answer from yet. Send a message first, then ask /btw.',
++          ),
++        ])
++        return
++      }
++
++      const pending = getSystemMessage(`/btw ${question}`)
++      params.setMessages((prev) => [...prev, pending])
++      const settle = (content: string) =>
++        params.setMessages((prev) =>
++          prev.map((message) =>
++            message.id === pending.id ? { ...message, content } : message,
++          ),
++        )
++
++      try {
++        const selectedByok = selectedByokConnection()
++        const byok = selectedByok
++          ? await resolveByokConnection(selectedByok)
++          : undefined
++        const answer = await askSideQuestion({
++          question,
++          previousRun,
++          byok,
++        })
++        settle(`/btw ${question}\n\n${answer}`)
++      } catch (error) {
++        settle(
++          `❌ /btw failed: ${error instanceof Error ? error.message : String(error)}`,
++        )
++      }
++    },
++  }),
+   defineCommand({
+     name: 'end-session',
+     handler: (params) => {
+diff --git a/cli/src/data/slash-commands.ts b/cli/src/data/slash-commands.ts
+index e9d234de52..7be7968a12 100644
+--- a/cli/src/data/slash-commands.ts
++++ b/cli/src/data/slash-commands.ts
+@@ -49,6 +49,7 @@ const FREEBUFF_ONLY_COMMAND_IDS = new Set([
+   'reasoning',
+   'dashboard',
+   'deals',
++  'btw',
+ ])
+ 
+ const ALL_SLASH_COMMANDS: SlashCommand[] = [
+@@ -70,6 +71,11 @@ const ALL_SLASH_COMMANDS: SlashCommand[] = [
+     description: 'Show local CLI resource usage and terminal tool process IDs',
+     aliases: ['diag', 'processes'],
+   },
++  {
++    id: 'btw',
++    label: 'btw',
++    description: 'Ask a quick side question without adding it to the conversation',
++  },
+   {
+     id: 'ads:enable',
+     label: 'ads:enable',
