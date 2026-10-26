@@ -1,0 +1,427 @@
+diff --git a/evals/buffbench/judge-prompt.test.ts b/evals/buffbench/judge-prompt.test.ts
+index c1118f3c8..667eea6e7 100644
+--- a/evals/buffbench/judge-prompt.test.ts
++++ b/evals/buffbench/judge-prompt.test.ts
+@@ -1,28 +1,28 @@
+ import { describe, expect, it } from 'bun:test'
+ 
+-import { buildJudgePrompt, splitUnifiedDiff } from './judge'
++import { buildJudgePrompt, judgeTraceSessionId, splitUnifiedDiff } from './judge'
+ 
+ import type { FileDiff } from './types'
+ 
+ /**
+  * The judge used to be handed context, ground truth and diff whole, and on
+  * the largest tasks returned nothing — the large cross-cutting changes a
+  * comparison most wants scored came back 0 for both arms. The prompt is now
+  * built to a budget: whole per-file sections, the most relevant first, and a
+  * complete list of what was left out.
+  */
+ 
+ const fileDiff = (path: string, lines: number): FileDiff => ({
+   path,
+   status: 'modified',
+   diff: `--- a/${path}\n+++ b/${path}\n@@ -1 +1 @@\n${Array.from({ length: lines }, (_, i) => `+line ${i} of ${path}`).join('\n')}\n`,
+ })
+ 
+ const agentSection = (path: string, lines: number) =>
+   `diff --git a/${path} b/${path}\n--- a/${path}\n+++ b/${path}\n@@ -1 +1 @@\n${Array.from({ length: lines }, (_, i) => `+agent line ${i} of ${path}`).join('\n')}\n`
+ 
+ const small = {
+   prompt: 'Add the thing',
+   fileDiffs: [fileDiff('src/a.ts', 3), fileDiff('src/b.ts', 2)],
+   contextFiles: { 'src/a.ts': 'const a = 1\n', 'src/b.ts': 'const b = 2\n' },
+   agentDiff: agentSection('src/a.ts', 3) + agentSection('src/c.ts', 1),
+@@ -136,25 +136,62 @@ describe('buildJudgePrompt', () => {
+     expect(built.prompt).toContain('Context files not shown for length:')
+     expect(built.sizes['context files']!.after).toBeLessThanOrEqual(12_000)
+   })
+ 
+   it('shortens ground truth the same way, the files the agent touched first', () => {
+     const built = buildJudgePrompt(
+       {
+         ...small,
+         fileDiffs: [fileDiff('src/elsewhere.ts', 300), fileDiff('src/a.ts', 4)],
+       },
+       {
+         contextChars: 100_000,
+         contextFileChars: 24_000,
+         groundTruthChars: 1_200,
+         agentDiffChars: 100_000,
+         finalCheckChars: 16_000,
+       },
+     )
+     expect(built.truncated).toEqual(['ground truth'])
+     expect(built.prompt).toContain('+line 3 of src/a.ts')
+     expect(built.prompt).toContain(
+       '- src/elsewhere.ts (+300 −0 lines, not shown)',
+     )
+   })
+ })
++
++describe('judge prompt caching', () => {
++  it('puts the length note after the agent\'s changes, so the shared prefix does not depend on the run', () => {
++    const big = 'x'.repeat(200)
++    const built = buildJudgePrompt(
++      {
++        prompt: 'do it',
++        fileDiffs: [{ path: 'src/a.ts', diff: `diff --git a/src/a.ts b/src/a.ts\n+${big}` } as never],
++        contextFiles: { 'src/a.ts': big },
++        agentDiff: `diff --git a/src/a.ts b/src/a.ts\n+${big}`,
++      },
++      { contextChars: 50, contextFileChars: 50, groundTruthChars: 1_000, agentDiffChars: 1_000, finalCheckChars: 100 },
++    )
++    expect(built.prompt).toContain('## Note on length')
++    expect(built.prompt.indexOf('## Note on length')).toBeGreaterThan(
++      built.prompt.indexOf("## Agent's Changes"),
++    )
++  })
++
++  it('renders the ground truth identically whatever the agent touched, when it fits', () => {
++    const fileDiffs = ['src/a.ts', 'src/b.ts', 'src/c.ts'].map(
++      (path) => ({ path, diff: `diff --git a/${path} b/${path}\n+line of ${path}` }) as never,
++    )
++    const one = buildJudgePrompt({ prompt: 'p', fileDiffs, contextFiles: {}, agentDiff: 'diff --git a/src/c.ts b/src/c.ts\n+mine' })
++    const two = buildJudgePrompt({ prompt: 'p', fileDiffs, contextFiles: {}, agentDiff: 'diff --git a/src/a.ts b/src/a.ts\n+other' })
++    const prefix = (s: string) => s.slice(0, s.indexOf("## Agent's Changes"))
++    expect(prefix(one.prompt)).toBe(prefix(two.prompt))
++  })
++
++  it('gives every judge call on a task the same UUID-shaped trace session, distinct per judge and task', () => {
++    const a = judgeTraceSessionId('commit-1', 'judge-luna')
++    expect(a).toBe(judgeTraceSessionId('commit-1', 'judge-luna'))
++    expect(a).not.toBe(judgeTraceSessionId('commit-2', 'judge-luna'))
++    expect(a).not.toBe(judgeTraceSessionId('commit-1', 'judge-gpt-6-sol'))
++    expect(a).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-8[0-9a-f]{3}-[0-9a-f]{12}$/)
++  })
++})
+diff --git a/evals/buffbench/judge.ts b/evals/buffbench/judge.ts
+index a34a97fbc..f13a2ee2a 100644
+--- a/evals/buffbench/judge.ts
++++ b/evals/buffbench/judge.ts
+@@ -1,25 +1,26 @@
++import { createHash } from 'node:crypto'
+ import fs from 'fs'
+ import path from 'path'
+ 
+ import { withTimeout } from '@codebuff/common/util/promise'
+ import { z } from 'zod/v4'
+ 
+ import type { EvalCommitV2, FileDiff } from './types'
+ import type { AgentDefinition, CodebuffClient } from '@codebuff/sdk'
+ 
+ const DEBUG_ERROR = true
+ 
+ export const JudgingResultSchema = z.object({
+   analysis: z
+     .string()
+     .describe('Detailed analysis comparing agent changes to ground truth'),
+   strengths: z
+     .array(z.string())
+     .describe('Key strengths of the implementation'),
+   weaknesses: z.array(z.string()).describe('Key weaknesses or issues found'),
+   completionScore: z
+     .number()
+     .min(0)
+     .max(10)
+     .describe('How completely the prompt was addressed'),
+   codeQualityScore: z
+@@ -128,72 +129,74 @@ function countChanges(diff: string): { added: number; removed: number } {
+   for (const line of diff.split('\n')) {
+     if (line.startsWith('+') && !line.startsWith('+++')) added++
+     else if (line.startsWith('-') && !line.startsWith('---')) removed++
+   }
+   return { added, removed }
+ }
+ 
+ /**
+  * Keep whole sections, most relevant first, until the budget is spent; name
+  * the rest. `priority` paths (the files the other side of the comparison
+  * also touched) come first, then the smallest sections, so the most files
+  * fit. A single section larger than the whole budget is cut to the budget
+  * with a note rather than dropped, since it may be the whole change.
+  */
+ function fitSections(
+   sections: DiffSection[],
+   budget: number,
+   priority: Set<string>,
+   render: (section: DiffSection) => string,
+ ): { text: string; elided: DiffSection[]; keptChars: number } {
+   const ordered = [...sections].sort((a, b) => {
+     const pa = priority.has(a.path) ? 0 : 1
+     const pb = priority.has(b.path) ? 0 : 1
+     return pa - pb || a.text.length - b.text.length
+   })
+-  const kept: string[] = []
++  const byPath = new Map<string, string>()
+   const elided: DiffSection[] = []
+   let used = 0
+   let keptChars = 0
+   for (const section of ordered) {
+     const rendered = render(section)
+     if (used + rendered.length <= budget) {
+-      kept.push(rendered)
++      byPath.set(section.path, rendered)
+       used += rendered.length
+       keptChars += section.text.length
+-    } else if (kept.length === 0 && rendered.length > budget) {
+-      kept.push(
++    } else if (byPath.size === 0 && rendered.length > budget) {
++      byPath.set(
++        section.path,
+         `${rendered.slice(0, budget)}\n... (this file's diff continues; ${rendered.length - budget} more characters not shown)`,
+       )
+       used = budget
+       keptChars += Math.min(section.text.length, budget)
+     } else {
+       elided.push(section)
+     }
+   }
+-  // Back to the diff's own order, so the judge reads it as the agent made it.
+-  const byPath = new Map(kept.map((text, i) => [ordered[i]!.path, text]))
++  // Back to the diff's own order, so the judge reads it as the agent made it
++  // (and so the ground truth renders identically for every agent run of a
++  // task whenever it fits: the prompt cache's shared prefix).
+   const text = sections
+     .filter((section) => byPath.has(section.path))
+     .map((section) => byPath.get(section.path)!)
+     .join('\n\n')
+   return { text, elided, keptChars }
+ }
+ 
+ const elisionList = (elided: DiffSection[]) =>
+   elided
+     .map((s) => `- ${s.path} (+${s.added} −${s.removed} lines, not shown)`)
+     .join('\n')
+ 
+ /** The judge prompt, built to the budget. Pure, so a test can hold it to it. */
+ export function buildJudgePrompt(
+   input: JudgePromptInput,
+   budget: JudgePromptBudget = DEFAULT_JUDGE_BUDGET,
+ ): BuiltJudgePrompt {
+   const { prompt, fileDiffs, contextFiles, agentDiff, error } = input
+   const truncated: string[] = []
+   const sizes: BuiltJudgePrompt['sizes'] = {}
+ 
+   // Context files: whole files until the total budget, each file capped.
+   const contextEntries = Object.entries(contextFiles)
+   const contextBefore = contextEntries.reduce((n, [, c]) => n + c.length, 0)
+   const contextParts: string[] = []
+@@ -264,65 +267,69 @@ export function buildJudgePrompt(
+   if (agent.elided.length > 0 || agent.keptChars < agentBefore) {
+     truncated.push("agent's changes")
+   }
+   sizes["agent's changes"] = { before: agentBefore, after: agent.keptChars }
+   const agentChanges =
+     (agent.text || '(No changes made)') +
+     (agent.elided.length > 0
+       ? `\n\`\`\`\n\nAgent files not shown for length (every changed file is listed here):\n${elisionList(agent.elided)}\n\`\`\`diff`
+       : '')
+ 
+   let finalCheckOutputs = input.finalCheckOutputs
+   if (finalCheckOutputs && finalCheckOutputs.length > budget.finalCheckChars) {
+     sizes['final checks'] = {
+       before: finalCheckOutputs.length,
+       after: budget.finalCheckChars,
+     }
+     finalCheckOutputs = `${finalCheckOutputs.slice(0, budget.finalCheckChars)}\n... (output cut for length)`
+     truncated.push('final checks')
+   }
+ 
+   const lengthNote =
+     truncated.length > 0
+       ? `\n## Note on length\nTo fit your input, these sections were shortened: ${truncated.join(', ')}. Whole files were kept where possible, the most relevant first, and every file left out is named with its line counts, so the file lists are complete even where the content is not. Judge what is shown; do not count as missing anything the list says was left out.\n`
+       : ''
+ 
++  // Everything that is the same for every agent run of a task (the prompt,
++  // the context files, the ground truth) comes first and the run's own parts
++  // last, so judge calls on one task share a cacheable prefix. The length
++  // note depends on the agent's diff, so it goes at the end.
+   const built = `## User Prompt (What the agent was asked to do)
+ ${prompt}
+-${lengthNote}
++
+ ## Context Files (from parent commit)
+ ${contextFilesContent || '(No context files)'}
+ 
+ ## Ground Truth Changes (One valid implementation)
+ ${groundTruthDiffs}
+ 
+ ## Agent's Changes (What the agent actually did)
+ \`\`\`diff
+ ${agentChanges}
+ \`\`\`
+ ${error ? `\n## Error Encountered\n${error}` : ''}
+-${finalCheckOutputs ? `\n## Final Check Command Outputs\n${finalCheckOutputs}` : ''}`
++${finalCheckOutputs ? `\n## Final Check Command Outputs\n${finalCheckOutputs}` : ''}${lengthNote}`
+ 
+   return { prompt: built, truncated, sizes }
+ }
+ 
+ const judgeAgentBase: Omit<AgentDefinition, 'id' | 'model'> = {
+   displayName: 'Judge',
+   toolNames: ['set_output'],
+   inputSchema: {
+     prompt: { type: 'string', description: 'The evaluation prompt' },
+   },
+   outputMode: 'structured_output',
+   outputSchema: {
+     type: 'object',
+     properties: {
+       analysis: {
+         type: 'string',
+         description:
+           'Detailed analysis comparing agent changes to ground truth',
+       },
+       strengths: {
+         type: 'array',
+         items: { type: 'string' },
+         description: 'Key strengths of the implementation',
+       },
+       weaknesses: {
+@@ -392,114 +399,144 @@ The ground truth shows ONE valid implementation, but it's not the only correct a
+ 
+ Provide detailed analysis, strengths, weaknesses, and numerical scores.`,
+ }
+ 
+ const judgeAgents: Record<string, AgentDefinition> = {
+   'judge-gpt': {
+     id: 'judge-gpt',
+     model: 'openai/gpt-5.4',
+     ...judgeAgentBase,
+   },
+   'judge-gpt-6-sol': {
+     id: 'judge-gpt-6-sol',
+     model: 'openai/gpt-6-sol',
+     ...judgeAgentBase,
+   },
+   'judge-gemini': {
+     id: 'judge-gemini',
+     model: 'google/gemini-3.1-pro-preview',
+     ...judgeAgentBase,
+   },
+   'judge-sonnet': {
+     id: 'judge-sonnet',
+     model: 'anthropic/claude-sonnet-4.6',
+     ...judgeAgentBase,
+   },
++  'judge-luna': {
++    id: 'judge-luna',
++    model: 'openai/gpt-6-luna',
++    ...judgeAgentBase,
++    reasoningOptions: { enabled: true, effort: 'high' },
++  },
+ }
+ 
+ /**
+  * The judges that actually score a run.
+  *
+  * Not judge-gemini: Gemini Pro is gated to the gemini-thinker subagent
+  * server-side, so that judge 403s with free_mode_gemini_thinker_required on
+  * every task. It failed silently for a long time — failures are dropped and the
+  * remaining judge still reports a confident number — which meant scores billed
+  * as a median were really one model's opinion.
+  *
+  * judge-gpt-6-sol replaced judge-gpt (gpt-5.4) on 2026-09-26: the stronger
+  * judge, and gpt-5.4 had failed every task of that day's runs on OpenAI
+  * credits, leaving sonnet alone. judge-gpt stays defined for old logs.
++ *
++ * judge-luna replaced judge-sonnet on 2026-10-26: the Sonnet judge cost
++ * several times what the agents being judged cost, with little of its prompt
++ * cached. GPT-6 Luna is far cheaper per call and caches automatically on the
++ * shared prefix (see judgeTraceSessionId).
++ * judge-sonnet stays defined for old logs.
+  */
+-const ACTIVE_JUDGE_IDS = ['judge-gpt-6-sol', 'judge-sonnet'] as const
++const ACTIVE_JUDGE_IDS = ['judge-gpt-6-sol', 'judge-luna'] as const
+ 
+ interface JudgeCommitResultInput {
+   client: CodebuffClient
+   commit: EvalCommitV2
+   contextFiles: Record<string, string>
+   agentDiff: string
+   error?: string
+   finalCheckOutputs?: string
+ }
+ 
+ /** Up to three attempts, with a pause before each retry: a judge that
+  *  returns nothing is as often a dropped connection or a backend that would
+  *  not start the run as a real refusal, and those clear in seconds rather
+  *  than instantly. A task scored by one judge instead of two is a quieter
+  *  failure than a task not scored at all. */
+ const JUDGE_RETRY_DELAYS_MS = [10_000, 45_000]
+ 
+ async function runSingleJudge(
+   input: JudgeCommitResultInput,
+   judgePrompt: string,
+   judgeAgentId: string,
+ ): Promise<JudgingResult | null> {
+   for (let attempt = 0; ; attempt++) {
+     const result = await runSingleJudgeOnce(input, judgePrompt, judgeAgentId)
+     if (result) return result
+     const delay = JUDGE_RETRY_DELAYS_MS[attempt]
+     if (delay === undefined) return null
+     console.warn(
+       `Judge ${judgeAgentId} returned nothing; retrying in ${delay / 1000}s`,
+     )
+     await new Promise((resolve) => setTimeout(resolve, delay))
+   }
+ }
+ 
++/**
++ * One trace session per task and judge: the server keys OpenAI's
++ * `prompt_cache_key` on it (applyOpenRouterPromptCacheKey), so every judge
++ * call on a task (each arm, each replicate) lands on the machine that already
++ * holds its prompt, the context files and ground truth, in cache.
++ */
++export function judgeTraceSessionId(
++  commitId: string,
++  judgeAgentId: string,
++): string {
++  // Shaped as a UUID, which is what the SDK documents for this field.
++  const hex = createHash('sha256')
++    .update(`buffbench-judge:${judgeAgentId}:${commitId}`)
++    .digest('hex')
++  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-5${hex.slice(13, 16)}-8${hex.slice(17, 20)}-${hex.slice(20, 32)}`
++}
++
+ async function runSingleJudgeOnce(
+   input: JudgeCommitResultInput,
+   judgePrompt: string,
+   judgeAgentId: string,
+ ): Promise<JudgingResult | null> {
+   const { client } = input
+ 
+   const judgeAgent = judgeAgents[judgeAgentId]
+   const agentOutput: string[] = []
+   try {
+     const judgeResult = await withTimeout(
+       client.run({
+         agent: judgeAgent.id,
+         prompt: judgePrompt,
++        traceSessionId: judgeTraceSessionId(input.commit.id, judgeAgentId),
+         agentDefinitions: Object.values(judgeAgents),
+         handleEvent: (event) => {
+           if (event.type === 'text') {
+             agentOutput.push(event.text)
+           } else if (event.type === 'tool_call') {
+             agentOutput.push(JSON.stringify(event, null, 2))
+           } else if (event.type === 'error') {
+             console.warn(`[Judge ${judgeAgentId}] Error event:`, event.message)
+           }
+         },
+       }),
+       20 * 60 * 1000,
+       'Judge agent timed out after 20 minutes',
+     )
+ 
+     if (judgeResult.output.type !== 'structuredOutput') {
+       console.error(
+         `Judge ${judgeAgentId} - not structured output`,
+         JSON.stringify(judgeResult.output, null, 2),
+       )
+       console.error(
+         'Judge agent output:',
+         JSON.stringify(judgeResult.output, null, 2),
+         'Judge agent output trace:',
+         agentOutput.join(''),
