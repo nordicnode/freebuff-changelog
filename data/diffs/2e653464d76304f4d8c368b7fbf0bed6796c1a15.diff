@@ -1,0 +1,204 @@
+diff --git a/common/src/util/__tests__/log-redaction.test.ts b/common/src/util/__tests__/log-redaction.test.ts
+index b7738a1d5..2e3f35782 100644
+--- a/common/src/util/__tests__/log-redaction.test.ts
++++ b/common/src/util/__tests__/log-redaction.test.ts
+@@ -1,31 +1,32 @@
+ import { APICallError } from 'ai'
+ import { describe, expect, test } from 'bun:test'
+ 
+ import { getErrorObject } from '../error'
+ import { serializeLogData } from '../log-data'
+ import {
++  redactConvexKeysForLog,
+   redactHeadersForLog,
+   redactQueryErrorForLog,
+   redactUrlForLog,
+   summarizeRequestBodyForLog,
+ } from '../log-redaction'
+ 
+ const PROMPT = 'my private prompt about src/secret.ts'
+ 
+ function providerError() {
+   return new APICallError({
+     message: 'Bad Request',
+     url: 'https://user:pass@api.example.com/v1/chat/completions?key=sk-query',
+     requestBodyValues: {
+       model: 'byok-model',
+       messages: [
+         { role: 'system', content: 'system prompt' },
+         { role: 'user', content: PROMPT },
+       ],
+       tools: [],
+     },
+     statusCode: 400,
+     responseHeaders: {
+       'set-cookie': 'session=abc',
+       'x-api-key': 'sk-header',
+       'x-ratelimit-remaining-tokens': '1000',
+@@ -211,25 +212,86 @@ describe('redactQueryErrorForLog', () => {
+     )
+     expect(redacted.stack).toStartWith(`DrizzleQueryError: ${redacted.message}`)
+     expect(redacted.stack).toContain('    at ')
+     expect(redacted.query).toBe(query)
+     expect(redacted.params).toBe('[3 params omitted]' as never)
+     expect((redacted.cause as { code: string }).code).toBe('23505')
+     for (const out of [
+       JSON.stringify({ ...redacted }),
+       redacted.message,
+       redacted.stack,
+       serializeLogData({ error: queryError() }),
+       JSON.stringify(getErrorObject(queryError(), { includeRawError: true })),
+     ]) {
+       expect(out).not.toContain('ya29.access-secret')
+       expect(out).not.toContain('eyJ.id-secret')
+     }
+   })
+ 
+   test('returns any other value unchanged', () => {
+     const plain = new Error('boom')
+     expect(redactQueryErrorForLog(plain)).toBe(plain)
+     expect(redactQueryErrorForLog('text')).toBe('text')
+     expect(redactQueryErrorForLog(undefined)).toBeUndefined()
+   })
+ })
++
++describe('redactConvexKeysForLog', () => {
++  // Synthetic, in the shape Convex mints (base64 JSON starting `{"v2":`).
++  const TOKEN = 'eyJ2MiI6ImFiY2RlZjAxMjM0NTY3ODkwYWJjZGVmIn0='
++
++  test('keeps the deployment name of a deploy key, drops the token', () => {
++    // The create_deploy_key response body management_api logged until 2026-10-27.
++    const body = JSON.stringify({ deployKey: `dev:brave-otter-123|${TOKEN}` })
++    expect(redactConvexKeysForLog(body)).toBe(
++      '{"deployKey":"dev:brave-otter-123|[redacted]"}',
++    )
++    expect(redactConvexKeysForLog(`prod:calm-fox-9|${TOKEN}`)).toBe(
++      'prod:calm-fox-9|[redacted]',
++    )
++    expect(redactConvexKeysForLog(`preview:team:project:branch|${TOKEN}`)).toBe(
++      'preview:team:project:branch|[redacted]',
++    )
++  })
++
++  test('admin keys in a request header and in a CLI error URL', () => {
++    expect(
++      redactConvexKeysForLog(`Authorization: 'Convex calm-fox-9|${TOKEN}'`),
++    ).toBe("Authorization: 'Convex calm-fox-9|[redacted]'")
++    // `convex env list` handed a key where it wanted a deployment name.
++    expect(
++      redactConvexKeysForLog(
++        `✖ Error fetching GET  https://api.convex.dev/api/deployment/calm-fox-9|${TOKEN} 400 Bad Request`,
++      ),
++    ).toBe(
++      '✖ Error fetching GET  https://api.convex.dev/api/deployment/calm-fox-9|[redacted] 400 Bad Request',
++    )
++    expect(redactConvexKeysForLog(`my-instance|${'a1'.repeat(32)}`)).toBe(
++      'my-instance|[redacted]',
++    )
++  })
++
++  test('bare access tokens and command-line assignments', () => {
++    expect(redactConvexKeysForLog(`Authorization: 'Bearer ${TOKEN}'`)).toBe(
++      "Authorization: 'Bearer [redacted]'",
++    )
++    expect(
++      redactConvexKeysForLog(
++        `CONVEX_DEPLOY_KEY='prod:calm-fox-9|${TOKEN}' bun run convex deploy`,
++      ),
++    ).toBe("CONVEX_DEPLOY_KEY='[redacted]' bun run convex deploy")
++    expect(
++      redactConvexKeysForLog('CONVEX_SELF_HOSTED_ADMIN_KEY=abc123 npx convex'),
++    ).toBe('CONVEX_SELF_HOSTED_ADMIN_KEY=[redacted] npx convex')
++  })
++
++  test('leaves key references and ordinary text alone', () => {
++    for (const text of [
++      'CONVEX_DEPLOY_KEY=$(cat $HOME/.vly-convex/dev.key) npx convex export',
++      '[Management API] Creating deploy key for: calm-fox-9',
++      'Request failed with status code 401',
++      'a | b',
++    ]) {
++      expect(redactConvexKeysForLog(text)).toBe(text)
++    }
++  })
++})
+diff --git a/common/src/util/log-redaction.ts b/common/src/util/log-redaction.ts
+index 99922375b..8488ef8ec 100644
+--- a/common/src/util/log-redaction.ts
++++ b/common/src/util/log-redaction.ts
+@@ -100,50 +100,75 @@ const URL_LIKE = /^[a-z][a-z0-9+.-]*:\/\//i
+  * carries the whole request body and both header sets, and Bun's fetch errors
+  * carry the request URL as `path`. Every error serializer (`getErrorObject`'s
+  * raw dump, the Axiom and Convex-ingest log data) goes through this one
+  * function, so a field redacted on one path cannot leak on another.
+  */
+ export function redactErrorFieldForLog(key: string, val: unknown): unknown {
+   if (key === 'requestBodyValues') return summarizeRequestBodyForLog(val)
+   if (
+     key === 'requestHeaders' ||
+     key === 'responseHeaders' ||
+     key === 'headers'
+   ) {
+     return redactHeadersForLog(val) ?? val
+   }
+   // `url` is always a URL; `path` is also a filesystem path on other errors,
+   // so it is rewritten only when it is one.
+   if (
+     typeof val === 'string' &&
+     (key === 'url' || (key === 'path' && URL_LIKE.test(val)))
+   ) {
+     return redactUrlForLog(val)
+   }
+   return val
+ }
+ 
++// `<deployment>|<token>`: an admin key, and a deploy key's body after its
++// `prod:`/`dev:`/`preview:<team>:<project>:` prefix. The name part is kept.
++const CONVEX_KEY_AFTER_NAME = /(\b[A-Za-z0-9_.:-]+\|)[A-Za-z0-9+/=_.-]{20,}/g
++// The token Convex mints for deploy keys and team/project access tokens is
++// base64 JSON starting `{"v2":`, so it is recognisable without a name.
++const CONVEX_V2_TOKEN = /eyJ2MiI6[A-Za-z0-9+/=_.-]*/g
++// `CONVEX_DEPLOY_KEY=…` in a command line; `$(cat …)` is a reference, kept.
++const CONVEX_KEY_ASSIGNMENT =
++  /(\bCONVEX_[A-Z_]*(?:KEY|TOKEN)=)(['"]?)(?!\$)[^\s'"]+/g
++
++/**
++ * Text with every Convex credential replaced by `[redacted]`: deploy keys,
++ * admin keys (`Authorization: Convex <deployment>|<token>`, and the URL the
++ * Convex CLI echoes when handed one), bare access tokens, and
++ * `CONVEX_*_KEY=`/`CONVEX_*_TOKEN=` assignments. The deployment name stays, as
++ * it is what says which key would need rotating. For Convex Management API
++ * response bodies, CLI output and error text bound for a log line.
++ */
++export function redactConvexKeysForLog(text: string): string {
++  return text
++    .replace(CONVEX_KEY_ASSIGNMENT, '$1$2[redacted]')
++    .replace(CONVEX_KEY_AFTER_NAME, '$1[redacted]')
++    .replace(CONVEX_V2_TOKEN, '[redacted]')
++}
++
+ const QUERY_PARAMS_MARKER = '\nparams: '
+ 
+ /**
+  * A drizzle `DrizzleQueryError` without its bound values. Drizzle writes every
+  * param into `message` (and so into `stack`) as well as `params`, and the
+  * values of an auth write are credentials: on 2026-10-19 freebuff-web logged a
+  * Google access token and ID token from a failed `linkAccount` insert. The
+  * statement and the `cause` holding the Postgres reason are kept; the params
+  * become their count. Any other value is returned unchanged.
+  */
+ export function redactQueryErrorForLog<T>(error: T): T {
+   if (!(error instanceof Error)) return error
+   const fields = error as Error & { query?: unknown; params?: unknown }
+   if (typeof fields.query !== 'string' || !('params' in fields)) return error
+   const marker = error.message.indexOf(QUERY_PARAMS_MARKER)
+   const count = Array.isArray(fields.params) ? fields.params.length : 0
+   const omitted = `[${count} params omitted]`
+   const message =
+     marker === -1
+       ? error.message
+       : `${error.message.slice(0, marker)}${QUERY_PARAMS_MARKER}${omitted}`
+   const redacted = new Error(message, { cause: error.cause })
+   Object.assign(redacted, error, { params: omitted })
+   redacted.name = error.name
+   redacted.stack =
