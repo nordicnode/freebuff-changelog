@@ -1,0 +1,743 @@
+diff --git a/agents/__tests__/base3.test.ts b/agents/__tests__/base3.test.ts
+index dee1302d9..69df6aa5d 100644
+--- a/agents/__tests__/base3.test.ts
++++ b/agents/__tests__/base3.test.ts
+@@ -327,62 +327,72 @@ describe('base3 CLI roots', () => {
+ 
+ describe('a lean compaction policy', () => {
+   const { lean: _, ...runtimePolicy } = LEAN_COMPACTION_POLICY
+   const lean = createBase3('anthropic/claude-haiku-5.5', {
+     compaction: LEAN_COMPACTION_POLICY,
+   })
+   const plain = createBase3('anthropic/claude-haiku-5.5', {
+     compaction: runtimePolicy,
+   })
+ 
+   test('adds the context-budget section, naming where compaction fires', () => {
+     expect(lean.systemPrompt).toContain('# Context budget')
+     expect(lean.systemPrompt).toContain('past ~88k tokens')
+     expect(plain.systemPrompt).not.toContain('# Context budget')
+   })
+ 
+   test('keeps `lean` out of compactContext, whose schema is strict', () => {
+     expect(lean.compactContext).toEqual(runtimePolicy)
+   })
+ })
+ 
+ describe('working in batches', () => {
+   const FLASH = 'deepseek/deepseek-v4-flash'
+   const SECTION = '## Work in batches'
+ 
+-  test('a root gets the section only when it asks, and never as a step prompt', () => {
++  test('a root gets the section and its reminder only when it asks', () => {
+     expect(createBase3(FLASH).systemPrompt).not.toContain(SECTION)
+-    expect(createBase3(FLASH, { batching: true }).systemPrompt).toContain(SECTION)
+-    expect(createBase3CliRoot({ model: FLASH }).systemPrompt).toContain(SECTION)
+-    expect(createBase3CliRoot({ model: FLASH, batching: false }).systemPrompt).not.toContain(SECTION)
+-    expect(createBase3CliRoot({ model: FLASH }).stepPrompt).toBeUndefined()
++    expect(createBase3(FLASH).stepPrompt).toBeUndefined()
++    const batched = createBase3(FLASH, { batching: true })
++    expect(batched.systemPrompt).toContain(SECTION)
++    expect(batched.stepPrompt).toStartWith('Work in batches:')
++    const cli = createBase3CliRoot({ model: FLASH })
++    expect(cli.systemPrompt).toContain(SECTION)
++    expect(cli.stepPrompt).toBe(batched.stepPrompt)
++    const off = createBase3CliRoot({ model: FLASH, batching: false })
++    expect(off.systemPrompt).not.toContain(SECTION)
++    expect(off.stepPrompt).toBeUndefined()
+   })
+ 
+   test('only on the models it is measured to help', () => {
+-    expect(
+-      createBase3('mimo/mimo-v2.5', { batching: true }).systemPrompt,
+-    ).not.toContain(SECTION)
+-    expect(
+-      createBase3('openai/gpt-6-luna', { batching: true }).systemPrompt,
+-    ).not.toContain(SECTION)
++    // their caches need each request to extend the last: a step prompt,
++    // deleted each step, would miss most of every request
++    for (const model of ['mimo/mimo-v2.5', 'openai/gpt-6-luna']) {
++      const def = createBase3(model, { batching: true })
++      expect(def.systemPrompt).not.toContain(SECTION)
++      expect(def.stepPrompt).toBeUndefined()
++    }
+     // a catalog handle is matched by the model it stands for
+-    expect(
+-      createBase3('fbm1.handle', { batching: true, compiledModelId: FLASH })
+-        .systemPrompt,
+-    ).toContain(SECTION)
++    const handle = createBase3('fbm1.handle', {
++      batching: true,
++      compiledModelId: FLASH,
++    })
++    expect(handle.systemPrompt).toContain(SECTION)
++    expect(handle.stepPrompt).toStartWith('Work in batches:')
+   })
+ 
+   test('a lean row never gets it: its context budget says to read narrowly', () => {
+-    const lean = createBase3('anthropic/claude-haiku-5.5', {
++    const lean = createBase3(FLASH, {
+       compaction: LEAN_COMPACTION_POLICY,
+       batching: true,
+     })
+     expect(lean.systemPrompt).not.toContain(SECTION)
++    expect(lean.stepPrompt).toBeUndefined()
+   })
+ 
+   test('it comes after the dynamic context, outside the core the server compares', () => {
+     const prompt = createBase3(FLASH, { batching: true }).systemPrompt!
+     expect(prompt.indexOf(SECTION)).toBeGreaterThan(
+       prompt.indexOf(PLACEHOLDER.GIT_CHANGES_PROMPT),
+     )
+   })
+ })
+diff --git a/agents/base3.ts b/agents/base3.ts
+index 8423d4517..1acfc3db5 100644
+--- a/agents/base3.ts
++++ b/agents/base3.ts
+@@ -1,84 +1,86 @@
+ import {
+   compactionPolicyForModel,
+   type RootCompactionPolicy,
+ } from '@codebuff/common/constants/compaction-policy'
++import { BASE3_BATCHING_STEP_PROMPT } from '@codebuff/common/constants/base3-step-prompt'
+ import {
+   FREEBUFF_DEEPSEEK_V4_FLASH_MODEL_ID,
+   FREEBUFF_MUSE_SPARK_13_CONTRIBUTOR_MODEL_ID,
+   FREEBUFF_SOLAR_MINI_4_MODEL_ID,
+   FREEBUFF_SOLAR_PRO_4_MODEL_ID,
+   freebuffModelIdMatches,
+ } from '@codebuff/common/constants/freebuff-models'
+ import {
+   TURN_ENDING_NOTE,
+   TURN_ENDING_RULE,
+ } from '@codebuff/common/constants/turn-ending-rule'
+ import { AGENT_PROGRESS_GUIDANCE, AGENT_VERIFICATION_GUIDANCE } from '@codebuff/common/constants/agent-work-style'
+ 
+ import { leanContextGuidance } from './lean-context'
+ import {
+   FOLLOWUP_STYLE_GUIDANCE,
+   gravityIndexGuidance,
+   OPUS_MODEL,
+   publisher,
+   SKILL_DISCOVERY_GUIDANCE,
+ } from './constants'
+ import {
+   PLACEHOLDER,
+   type SecretAgentDefinition,
+ } from './types/secret-agent-definition'
+ 
+ /**
+  * Working in batches, appended to base3's prompt for the roots that ask for it
+  * (`batching`) on the models in BATCHING_MODELS. Every response re-sends the
+  * conversation, so the same work in fewer responses is faster and cheaper
+  * (docs/benchmarks/base3-batched/README.md).
+  * It comes after the dynamic context, outside the core the server compares
+  * (web/src/llm-api/root-instruction-contract.ts), so older clients still match.
+  * Deliberately NOT repeated as a per-step `stepPrompt`: a step prompt is
+  * deleted each step, so no request is a prefix of the next and the prompt
+  * cache collapses (#1158; measured in the benchmark doc above).
+  */
+ const BATCHING_GUIDANCE = `## Work in batches
+ 
+ Every response is a round trip: the whole conversation is sent again before the next reply begins, so a task done in fewer responses finishes sooner and costs less. Get as much done in each response as you can.
+ 
+ - **Make every call you already can.** Tool calls that do not depend on each other's results belong in one response, not in a sequence of responses.
+ - **Search in one batch.** When you need to find something, send every code_search and glob you can think of together (the names, strings and paths it could be under), rather than one search per response.
+ - **Read in one batch.** Read every file that looks relevant in one read_files call, often 5 to 15 of them, including the ones you expect to need next, rather than one file at a time. Go back for more only when what you read points to something specific.
+ - **Explore with the dedicated tools.** code_search, glob, list_directory and read_files take many patterns or paths per call; ls, cat, grep and find in the terminal do not.
+ - **Edit in one batch.** Make all the edits you already know in one response.
+ - **Check in one batch.** Run the checks in the same response as your last edits, as one terminal command that runs every check the change needs (for example each touched package's typecheck and the tests that cover the change), each with its exit status echoed and not piped into head or tail.
+ - **Stop when it is done.** Once the request is met and its checks pass, or the question is answered, give the final message.`
+ 
+ /**
+- * The models the section is measured to help: on DeepSeek V4.1 Flash it
+- * finished sooner at the same score. On GPT-6 Luna it bought no time, and on
+- * MiMo v2.5 it cost score, so both keep base3's prompt as it was
+- * (docs/benchmarks/base3-batched/README.md). Add a model only with a paired
+- * buffbench run on it.
++ * The models the section and its reminder are measured to help: on DeepSeek
++ * V4.1 Flash they finished sooner at the same score. On GPT-6 Luna the section
++ * bought no time, and on MiMo v2.5 it cost score, so both keep base3's prompt
++ * as it was (docs/benchmarks/base3-batched/README.md). Add a model only with a
++ * paired buffbench run on it that also checks its cache hit: the reminder
++ * comes with the section.
+  */
+ const BATCHING_MODELS = [FREEBUFF_DEEPSEEK_V4_FLASH_MODEL_ID]
+ 
+ /**
+  * The models that end a turn on a status line or a plan instead of calling the
+  * tool that does the work, and so get TURN_ENDING_NOTE as `instructionsPrompt`
+  * — the rule again, right after every user message. The system prompt's
+  * TURN_ENDING_RULE alone does not stop them (docs/freebuff-muse-spark.md).
+  * Every copy stays in history, so the cached prefix only grows.
+  *
+  * Muse Spark 1.3 has been here since 2026-10-11, and the note measurably
+  * worked: across the Desktop 0.0.171 -> 0.0.172 boundary its short
+  * status-line turns (no tool call, 20-400 characters) fell from 8.5% to 2.9%
+  * of turns.
+  *
+  * Solar Pro 4 and Solar Mini 4 joined on 2026-10-14, after five reports in a
+  * week ("solar pro keep not replying me when it finish my task", "do not write
+  * code into the project") and this measurement over 24h of completed,
+  * user-initiated Desktop turns (`desktop.turn_completed`), prose-only meaning
+  * zero tool calls and over 1,000 characters of reply:
+  *
+  *   upstage/solar-pro4           12,742 turns  24.0% prose-only
+  *   upstage/solar-mini4           2,302 turns  18.8%
+  *   z-ai/glm-5.3-flash           15,484 turns   6.9%
+  *   deepseek/deepseek-v4-flash   33,165 turns   1.7%
+@@ -112,122 +114,132 @@ export function createBase3(
+     supportsBackgroundCommands?: boolean
+     /** Append the "Work in batches" section, on a model in BATCHING_MODELS.
+      *  For the roots that run the user's coding agent in build mode: the CLI
+      *  (`createBase3CliRoot`), Desktop and Desktop Cloud. Plan mode, fast mode,
+      *  sponsored runs and Web/Cloud (whose platform runs the checks) leave it
+      *  off, and a lean row never gets it: its context budget says to read
+      *  narrowly. */
+     batching?: boolean
+     /** The compiled model a catalog handle stands for, which decides the
+      *  per-model parts below; defaults to `model`. */
+     compiledModelId?: string
+   } = {},
+ ): Omit<SecretAgentDefinition, 'id'> {
+   const turnEndingNote = TURN_ENDING_NOTE_MODELS.some((id) =>
+     freebuffModelIdMatches(options.compiledModelId ?? model, id),
+   )
+   const batchingModel = BATCHING_MODELS.some((id) =>
+     freebuffModelIdMatches(options.compiledModelId ?? model, id),
+   )
+   const { lean, ...compactContext }: RootCompactionPolicy =
+     options.compaction ?? compactionPolicyForModel(model)
+   const leanGuidance =
+     lean && compactContext.maxContextLength
+       ? `\n${leanContextGuidance(compactContext.maxContextLength)}\n`
+       : ''
++  const batching = options.batching === true && batchingModel && !lean
+   return {
+     publisher,
+     model,
+     providerOptions: model.startsWith('anthropic/')
+       ? { only: ['amazon-bedrock'], data_collection: 'deny' }
+       : { data_collection: 'deny' },
+     displayName: 'Buffy',
+     spawnerPrompt:
+       'Single-loop coding agent that explores, edits, and verifies directly with its own tools',
+     inputSchema: {
+       prompt: {
+         type: 'string',
+         description: 'A coding task to complete',
+       },
+     },
+     outputMode: 'last_message',
+     includeMessageHistory: true,
+     windowedFileReads: true,
+     // A root built on this that can spawn lists those agents once, at the end
+     // of its system prompt, not in a message after every user prompt that
+     // stays in history.
+     spawnableAgentsInSystemPrompt: true,
+     // Per-model idle gap and token floor (common/src/constants/
+     // compaction-policy.ts). Explicit, not `true`: a bare `true` would take
+     // the runtime default instead of the model's.
+     compactContext,
+     ...(turnEndingNote ? { instructionsPrompt: TURN_ENDING_NOTE } : {}),
++    // The section's reminder at the end of every step, dropped from history
++    // after it. Read once, Flash drifts back to one call per step; repeated,
++    // it keeps batching. A step prompt is deleted each step, so no request
++    // extends the previous one: a provider that caches only exact prefix
++    // extensions then misses most of every request (MiMo and Luna did,
++    // #1158), while Flash's lanes cache partial prefixes and kept their hit
++    // rate. The server skips it where it reads the user's own words
++    // (`isRootStepReminderMessage`).
++    ...(batching ? { stepPrompt: BASE3_BATCHING_STEP_PROMPT } : {}),
+     toolNames: [
+       'read_files',
+       'str_replace',
+       'write_file',
+       'run_terminal_command',
+       'code_search',
+       'glob',
+       'list_directory',
+       'write_todos',
+     ],
+ 
+     // No deadline, time-budget or "minimal result early" wording: no product
+     // host gives the model a deadline, and that wording made models invent
+     // one and stop short. A host with a real deadline passes `deadlineAt`; the
+     // runtime then states it.
+     systemPrompt: `You are Buffy, the coding agent behind Codebuff. You help users with software engineering tasks: fixing bugs, adding functionality, refactoring, and explaining code.
+ 
+ Current date: ${PLACEHOLDER.CURRENT_DATE}.
+ 
+ - Size the work to the request. Do everything the user asked for, completely, and nothing they did not: no unrequested features, refactors, new files, dependencies or polish. A question gets an answer, not a change. A small or specific request gets a direct fix, without a plan, a to-do list or a survey of the codebase.
+ - When a request is open-ended or high-level ("build me an app", "improve the onboarding", "make this faster") and reasonable readings differ in size or direction, settle the scope yourself, build the smallest version that meets the goal, then name the main choices you made and what could come next. Do not build the largest version you can imagine.
+ - Match the project's existing conventions. Verify a library is already used in the project before employing it.
+ - Prefer editing existing files over creating new ones. Make the fewest changes that address the request.
+ - Note the request's explicit requirements (exact output paths, file names, interfaces, schemas, formats, performance or resource constraints) and check the result against them before finishing.
+ - For performance work, do not claim a speedup without a measurement.
+ - Verify the final edited files: after a repair, rerun the affected checks; earlier passing results do not cover later changes. When filtering test or build output through a pipeline, preserve the tested command's exit status (for example, Bash pipefail or explicit status capture), and inspect the failure output.
+ - Take screenshots or drive a browser for visual inspection only when the user explicitly asks for a screenshot or a visual check.
+ - Fix the cause of a failing check. Do not skip tests, weaken assertions, swallow errors, or add type/lint suppressions just to make verification pass. If such a change is required by the requested behavior, explain why and verify that behavior. Report checks that failed or could not run as limitations, never as passes.
+ - ${options.supportsBackgroundCommands === false ? 'Terminal commands support only SYNC on this host. Use the host-managed preview controls for persistent services; do not request BACKGROUND or use shell backgrounding. Split other long jobs into bounded commands.' : 'Use BACKGROUND for persistent services or long jobs, inspect their logs and readiness, and verify they are still running when required. Do not assume shell backgrounding inside a SYNC command survives tool cleanup.'}
+ - Use write_todos only for work with several distinct steps, and list only the steps the request needs, never extras you might add. The user watches the list as your live progress: each time you finish an item, call write_todos again with it marked completed before you start the next one, rather than marking everything done at the end.
+ - When the work is done, finish every tool call first (including marking your last to-do completed), then end with a self-contained final message. Do not point back to earlier messages ("as above"); the user may see only this one.
+ - ${TURN_ENDING_RULE}
+ - Don't run destructive or hard-to-undo commands (git push, resets, deploys) unless the user asks for them.
+ - Stay inside the project folder. Do not read, list or search files outside it (the home directory, other projects, app or system folders) unless the user gave you that exact path or asked you to look there, and then only that path, not its parent or sibling folders. If the task seems to need anything else outside the project, ask the user first.
+ 
+ ${AGENT_PROGRESS_GUIDANCE}
+ 
+ When a progress update is warranted and more work remains, put it before the next tool call in the same response so the update does not end the turn.
+ 
+ ${AGENT_VERIFICATION_GUIDANCE}
+ 
+ ${PLACEHOLDER.KNOWLEDGE_FILES_CONTENTS}
+ 
+ ${PLACEHOLDER.GIT_CHANGES_PROMPT}
+-${leanGuidance}${options.batching && batchingModel && !lean ? `\n${BATCHING_GUIDANCE}` : ''}`,
++${leanGuidance}${batching ? `\n${BATCHING_GUIDANCE}` : ''}`,
+   }
+ }
+ 
+ /**
+  * The CLI's own base3 roots — Codebuff's DEFAULT and LITE modes, and every
+  * Freebuff model the picker offers.
+  *
+  * Kept separate from `createBase3` rather than folded into it, because Freebuff
+  * Desktop derives its toolset from `createBase3().toolNames` and would silently
+  * inherit whatever is added here (THREAD_AGENT_TOOLS in
+  * freebuff-desktop/.../thread-agent.ts unions that array with its own extras).
+  * The bare eight are the harness; what follows is CLI product surface.
+  *
+  * One thing is load-bearing, for the same reason it is on the Web roots
+  * (docs/freebuff-base3-harness.md): the appendix is APPENDED. The root prompt
+  * must keep its canonical opening first (`hasFreebuffRootSystemPromptOpening`).
+  */
+ export function createBase3CliRoot(
+   options: {
+     model?: SecretAgentDefinition['model']
+     /** Freebuff branding and meta-information instead of Codebuff's. */
+     isFreebuff?: boolean
+     /** Drop the tools that address a human. For the eval harness, where an
+      *  ask_user call would stall the run rather than gather anything. */
+     noAskUser?: boolean
+diff --git a/cli/src/utils/__tests__/trace-writer.test.ts b/cli/src/utils/__tests__/trace-writer.test.ts
+index e16780d0e..4d8e0775e 100644
+--- a/cli/src/utils/__tests__/trace-writer.test.ts
++++ b/cli/src/utils/__tests__/trace-writer.test.ts
+@@ -70,50 +70,66 @@ describe('createTraceWriter', () => {
+       step: 1,
+       messages: [userMessage('hello')],
+     })
+ 
+     const lines = readTraceLines()
+     expect(lines).toHaveLength(1)
+     expect(lines[0].message.role).toBe('user')
+   })
+ 
+   test('writes each message exactly once across steps', () => {
+     const writer = createTraceWriter(() => tracePathFor(tempDir))!
+     const history = [userMessage('hello')]
+ 
+     writer.recordStep({ ...baseParams, step: 1, messages: history })
+     history.push(assistantMessage('hi there'))
+     writer.recordStep({ ...baseParams, step: 1, messages: history })
+     // Re-recording the same history adds nothing
+     writer.recordStep({ ...baseParams, step: 2, messages: history })
+ 
+     const lines = readTraceLines()
+     expect(lines).toHaveLength(2)
+     expect(lines.map((l) => l.message.role)).toEqual(['user', 'assistant'])
+     expect(lines.map((l) => l.index)).toEqual([0, 1])
+   })
+ 
++  test('records a step prompt once, and its removal each step is not a rewrite', () => {
++    const writer = createTraceWriter(() => tracePathFor(tempDir))!
++    const reminder: Message = {
++      ...userMessage('<system_reminder>Work in batches</system_reminder>'),
++      tags: ['STEP_PROMPT'],
++    }
++    const history = [userMessage('hello')]
++    writer.recordStep({ ...baseParams, step: 1, messages: [...history, reminder] })
++    history.push(assistantMessage('reading'))
++    writer.recordStep({ ...baseParams, step: 2, messages: [...history, reminder] })
++
++    const lines = readTraceLines()
++    expect(lines.map((l) => l.type)).toEqual(['step_prompt', 'message', 'message'])
++    expect(lines.filter((l) => l.type === 'message').map((l) => l.index)).toEqual([0, 1])
++  })
++
+   test('records system prompt once and again only when it changes', () => {
+     const writer = createTraceWriter(() => tracePathFor(tempDir))!
+ 
+     writer.recordStep({
+       ...baseParams,
+       step: 1,
+       system: 'be helpful',
+       messages: [userMessage('hello')],
+     })
+     writer.recordStep({
+       ...baseParams,
+       step: 2,
+       system: 'be helpful',
+       messages: [userMessage('hello'), assistantMessage('hi')],
+     })
+     writer.recordStep({
+       ...baseParams,
+       step: 3,
+       system: 'be terse',
+       messages: [
+         userMessage('hello'),
+         assistantMessage('hi'),
+         userMessage('more'),
+       ],
+     })
+diff --git a/cli/src/utils/trace-writer.ts b/cli/src/utils/trace-writer.ts
+index a3279d063..5415fe5fd 100644
+--- a/cli/src/utils/trace-writer.ts
++++ b/cli/src/utils/trace-writer.ts
+@@ -1,43 +1,45 @@
+ import { appendFileSync, mkdirSync } from 'fs'
+ import path, { dirname } from 'path'
+ 
+ import { IS_DEV } from '@codebuff/common/env'
+ 
+ import { getCliEnv } from './env'
+ import { getCurrentChatDir, getProjectRoot } from '../project-files'
+ 
+ import type { TraceWriter } from '@codebuff/common/types/contracts/trace'
+ import type { Message } from '@codebuff/common/types/messages/codebuff-message'
+ 
+ const TRACE_FILENAME = 'trace.jsonl'
+ 
+ type AgentTraceState = {
+   /** Roles of messages already written, in order. Used to detect history
+    * rewrites (compaction/expiry) without holding onto message objects. */
+   writtenRoles: string[]
+   system: string | undefined
++  /** The step prompt last written, serialised. */
++  stepPrompt: string | undefined
+ }
+ 
+ /**
+  * Returns whether trace writing is enabled: always in dev, opt-in via
+  * CODEBUFF_TRACE=1 in production builds (so users don't pay disk for a second
+  * copy of their conversation by default).
+  */
+ export function isTraceEnabled(): boolean {
+   if (IS_DEV) return true
+   // Same accepted values as CODEBUFF_FULL_TELEMETRY (see analytics-sampling)
+   const flag = getCliEnv().CODEBUFF_TRACE
+   return flag === '1' || flag === 'true' || flag === 'yes'
+ }
+ 
+ function getTraceFilePath(): string | null {
+   try {
+     return IS_DEV
+       ? path.join(getProjectRoot(), 'debug', TRACE_FILENAME)
+       : path.join(getCurrentChatDir(), TRACE_FILENAME)
+   } catch {
+     return null // No project root set yet
+   }
+ }
+ 
+ /**
+@@ -55,82 +57,96 @@ function getTraceFilePath(): string | null {
+  * re-traced — acceptable for a debug trace.
+  */
+ export function createTraceWriter(
+   resolveTraceFilePath: () => string | null = getTraceFilePath,
+ ): TraceWriter | undefined {
+   if (!isTraceEnabled()) {
+     return undefined
+   }
+ 
+   const agentStates = new Map<string, AgentTraceState>()
+   let ensuredDir: string | undefined
+ 
+   return {
+     recordStep: ({
+       agentId,
+       agentType,
+       runId,
+       userInputId,
+       step,
+       system,
+       messages,
+     }) => {
+       const state = agentStates.get(agentId) ?? {
+         writtenRoles: [],
+         system: undefined,
++        stepPrompt: undefined,
+       }
+       const base = { agentId, agentType, runId, userInputId, step }
+       const timestamp = new Date().toISOString()
+       const lines: string[] = []
+       const appendLine = (record: Record<string, unknown>): void => {
+         lines.push(JSON.stringify({ timestamp, ...record }))
+       }
+ 
++      // An agent's step prompt ends each step's request and is gone from the
++      // next (the runtime drops it every step): diffed with the history it
++      // would read as a rewrite at every step. It is recorded like the system
++      // prompt instead, once and again only when it changes.
++      const history = messages.filter((m) => !m.tags?.includes('STEP_PROMPT'))
++      const stepPrompt = messages.find((m) => m.tags?.includes('STEP_PROMPT'))
++
+       const rewritten =
+-        messages.length < state.writtenRoles.length ||
+-        state.writtenRoles.some((role, i) => messages[i]?.role !== role)
++        history.length < state.writtenRoles.length ||
++        state.writtenRoles.some((role, i) => history[i]?.role !== role)
+       if (rewritten) {
+         appendLine({
+           ...base,
+           type: 'history_rewritten',
+           previousMessageCount: state.writtenRoles.length,
+-          messageCount: messages.length,
++          messageCount: history.length,
+         })
+         state.writtenRoles = []
+       }
+ 
+       if (system !== undefined && system !== state.system) {
+         appendLine({ ...base, type: 'system', system })
+         state.system = system
+       }
+ 
+-      for (let i = state.writtenRoles.length; i < messages.length; i++) {
+-        const message = messages[i] as Message
++      const stepPromptText = stepPrompt && JSON.stringify(stepPrompt.content)
++      if (stepPromptText && stepPromptText !== state.stepPrompt) {
++        appendLine({ ...base, type: 'step_prompt', message: stepPrompt })
++        state.stepPrompt = stepPromptText
++      }
++
++      for (let i = state.writtenRoles.length; i < history.length; i++) {
++        const message = history[i] as Message
+         appendLine({
+           ...base,
+           type: 'message',
+           index: i,
+           message,
+         })
+       }
+ 
+-      state.writtenRoles = messages.map((m) => m.role)
++      state.writtenRoles = history.map((m) => m.role)
+       agentStates.set(agentId, state)
+ 
+       if (lines.length === 0) return
+       // Resolve the path per step (not cached for the writer's lifetime: the
+       // current chat directory changes when the user starts a new chat).
+       const filePath = resolveTraceFilePath()
+       if (!filePath) return
+       try {
+         const dir = dirname(filePath)
+         if (ensuredDir !== dir) {
+           mkdirSync(dir, { recursive: true })
+           ensuredDir = dir
+         }
+         appendFileSync(filePath, lines.join('\n') + '\n')
+       } catch {
+         // Tracing must never break the run
+       }
+     },
+   }
+ }
+diff --git a/common/src/constants/base3-step-prompt.ts b/common/src/constants/base3-step-prompt.ts
+new file mode 100644
+index 000000000..a5ff463fd
+--- /dev/null
++++ b/common/src/constants/base3-step-prompt.ts
+@@ -0,0 +1,7 @@
++/**
++ * base3's per-step batching reminder on DeepSeek V4.1 Flash (`stepPrompt`,
++ * agents/base3.ts). Here so the server can recognise it by its exact text
++ * (`isRootStepReminderMessage`, common/src/util/system-reminder.ts): it is the
++ * last user message of every such request, never the user's own words.
++ */
++export const BASE3_BATCHING_STEP_PROMPT = `Work in batches: put every tool call you can already make into this response (all the searches you can think of, every file worth reading, all the edits you know with their checks in one command). Once the request is met, give the final message instead.`
+diff --git a/common/src/util/__tests__/system-reminder.test.ts b/common/src/util/__tests__/system-reminder.test.ts
+new file mode 100644
+index 000000000..19de57572
+--- /dev/null
++++ b/common/src/util/__tests__/system-reminder.test.ts
+@@ -0,0 +1,42 @@
++import { describe, expect, test } from 'bun:test'
++
++import { BASE3_BATCHING_STEP_PROMPT } from '../../constants/base3-step-prompt'
++import {
++  isRootStepReminderMessage,
++  withSystemReminderTags,
++} from '../system-reminder'
++
++describe('root step reminders', () => {
++  const reminder = withSystemReminderTags(BASE3_BATCHING_STEP_PROMPT)
++
++  test('a root step reminder is recognised as it arrives', () => {
++    expect(isRootStepReminderMessage({ role: 'user', content: reminder })).toBe(true)
++    expect(
++      isRootStepReminderMessage({
++        role: 'user',
++        content: [{ type: 'text', text: reminder }],
++      }),
++    ).toBe(true)
++  })
++
++  test('nothing else passes for one, not even a prompt wrapped in its tags', () => {
++    expect(
++      isRootStepReminderMessage({
++        role: 'user',
++        content: withSystemReminderTags('a script shared by many accounts'),
++      }),
++    ).toBe(false)
++    expect(isRootStepReminderMessage({ role: 'user', content: 'fix the bug' })).toBe(false)
++    expect(
++      isRootStepReminderMessage({
++        role: 'user',
++        content: [
++          { type: 'text', text: reminder },
++          { type: 'image_url', image_url: { url: 'data:image/png;base64,' } },
++        ],
++      }),
++    ).toBe(false)
++    expect(isRootStepReminderMessage({ role: 'assistant', content: reminder })).toBe(false)
++    expect(isRootStepReminderMessage(null)).toBe(false)
++  })
++})
+diff --git a/common/src/util/system-reminder.ts b/common/src/util/system-reminder.ts
+new file mode 100644
+index 000000000..6ddadf61f
+--- /dev/null
++++ b/common/src/util/system-reminder.ts
+@@ -0,0 +1,40 @@
++import { BASE3_BATCHING_STEP_PROMPT } from '../constants/base3-step-prompt'
++
++/**
++ * How the agent runtime frames an agent's step prompt: a user message of its
++ * own, wrapped so the model does not read it as the user speaking again
++ * (packages/agent-runtime/src/templates/strings.ts).
++ */
++export function withSystemReminderTags(text: string): string {
++  return `<system_reminder>${text}</system_reminder>`
++}
++
++/** Our roots' step reminders, as they arrive. */
++const ROOT_STEP_REMINDERS: ReadonlySet<string> = new Set([
++  withSystemReminderTags(BASE3_BATCHING_STEP_PROMPT),
++])
++
++/**
++ * A user message that is exactly one of our roots' step reminders: the last
++ * message of every request on base3 batching (agents/base3.ts), and never the
++ * user's own words. Matched by its whole text, never by its tags alone, so a
++ * prompt cannot pass for one by wrapping itself in them.
++ */
++export function isRootStepReminderMessage(message: unknown): boolean {
++  const { role, content } = (message ?? {}) as {
++    role?: unknown
++    content?: unknown
++  }
++  if (role !== 'user') return false
++  let text: string
++  if (typeof content === 'string') {
++    text = content
++  } else if (Array.isArray(content)) {
++    const parts = content as { type?: unknown; text?: unknown }[]
++    if (!parts.every((part) => part?.type === 'text')) return false
++    text = parts.map((part) => String(part.text ?? '')).join('')
++  } else {
++    return false
++  }
++  return ROOT_STEP_REMINDERS.has(text.trim())
++}
+diff --git a/packages/agent-runtime/src/templates/strings.ts b/packages/agent-runtime/src/templates/strings.ts
+index a133f32d3..fe36bb587 100644
+--- a/packages/agent-runtime/src/templates/strings.ts
++++ b/packages/agent-runtime/src/templates/strings.ts
+@@ -1,30 +1,31 @@
+ import {
+   KNOWLEDGE_FILE_NAMES_LOWERCASE,
+   PROJECT_INSTRUCTIONS_HEADER,
+ } from '@codebuff/common/constants/knowledge'
+ import { escapeString } from '@codebuff/common/util/string'
++import { withSystemReminderTags } from '@codebuff/common/util/system-reminder'
+ import { z } from 'zod/v4'
+ 
+ import { getAgentTemplate } from './agent-registry'
+ import { buildFullSpawnableAgentsSpec, modelSpawnableAgents } from './prompts'
+ import { PLACEHOLDER, placeholderValues } from './types'
+ import {
+   getGitChangesPrompt,
+   getProjectFileTreePrompt,
+   getSystemInfoPrompt,
+ } from '../system-prompt/prompts'
+ import { parseUserMessage, unwrapSteeringText } from '../util/messages'
+ 
+ import type { AgentTemplate, PlaceholderValue } from './types'
+ import type { Logger } from '@codebuff/common/types/contracts/logger'
+ import type { ParamsExcluding } from '@codebuff/common/types/function-params'
+ import type {
+   Message,
+   UserMessage,
+ } from '@codebuff/common/types/messages/codebuff-message'
+ import type { TextPart } from '@codebuff/common/types/messages/content-part'
+ import type {
+   AgentState,
+   AgentTemplateType,
+ } from '@codebuff/common/types/session-state'
+ import type {
+@@ -205,51 +206,51 @@ export async function getAgentPrompt<T extends StringField>(
+     if (agents.length === 0) return ''
+     const agentDescriptions = await Promise.all(
+       agents.map(async (agentType) => {
+         const template = await getAgentTemplate({
+           ...params,
+           agentId: agentType,
+           localAgentTemplates: agentTemplates,
+         })
+         if (template?.spawnerPrompt) {
+           return `- ${agentType}: ${template.spawnerPrompt}`
+         }
+         return `- ${agentType}`
+       }),
+     )
+     return `\n\n${heading}\n\n${agentDescriptions.join('\n')}`
+   }
+   // The list goes once at the end of the system prompt of an agent that asks
+   // for it, and otherwise into the instructions sent after every user prompt.
+   // An agent that inherits its parent's system prompt cannot carry it there.
+   const listInSystemPrompt =
+     agentTemplate.spawnableAgentsInSystemPrompt &&
+     !agentTemplate.inheritParentSystemPrompt
+ 
+   if (promptType.type === 'stepPrompt' && agentState.agentType && prompt) {
+     // Put step prompt within a system_reminder tag so agent doesn't think the user just spoke again.
+-    prompt = `<system_reminder>${prompt}</system_reminder>`
++    prompt = withSystemReminderTags(prompt)
+   }
+ 
+   if (promptType.type === 'systemPrompt' && listInSystemPrompt) {
+     addendum += await spawnableAgentsList('# Agents you can spawn')
+   }
+ 
+   // Add tool instructions, spawnable agents, and output schema prompts to instructionsPrompt
+   if (promptType.type === 'instructionsPrompt' && agentState.agentType) {
+     // Add subagent tools message when using parent's tools for prompt caching
+     if (useParentTools) {
+       addendum += `\n\nYou are a subagent that only has access to the following tools: ${toolNames.length > 0 ? toolNames.join(', ') : 'none'}. Previously referenced tools in the conversation may have only been available to the parent agent. Do not attempt to use any other tools besides these listed here. You will only get tool errors if you do.`
+ 
+       // For subagents with inheritSystemPrompt, include full spawnable agents spec
+       // since the parent's system prompt may not have these agents listed
+       if (spawnableAgents.length > 0) {
+         const spawnableAgentsSpec = await buildFullSpawnableAgentsSpec({
+           ...params,
+           spawnableAgents,
+           agentTemplates,
+         })
+         addendum += `\n\n${spawnableAgentsSpec}`
+       }
+     } else if (!listInSystemPrompt) {
+       addendum += await spawnableAgentsList(
+         'You can spawn the following agents:',
