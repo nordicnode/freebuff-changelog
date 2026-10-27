@@ -1,0 +1,133 @@
+diff --git a/common/src/util/__tests__/error-api-details.test.ts b/common/src/util/__tests__/error-api-details.test.ts
+index 1518c34de..e0a56b11f 100644
+--- a/common/src/util/__tests__/error-api-details.test.ts
++++ b/common/src/util/__tests__/error-api-details.test.ts
+@@ -159,50 +159,65 @@ describe('isTransientNetworkError', () => {
+ 
+   it('detects transient network error codes', () => {
+     const error = new Error('request failed') as Error & { code: string }
+     error.code = 'ECONNRESET'
+     expect(isTransientNetworkError(error)).toBe(true)
+ 
+     const bunError = new Error('request failed') as Error & { code: string }
+     bunError.code = 'ConnectionClosed'
+     expect(isTransientNetworkError(bunError)).toBe(true)
+   })
+ 
+   it("detects Bun's error for a compressed body cut mid-stream", () => {
+     // The exact shapes Bun 1.3.14's fetch throws (see the sdk test
+     // compressed-stream-cut.test.ts for the live reproduction).
+     for (const code of ['ZlibError', 'BrotliDecompressionError']) {
+       const error = Object.assign(
+         new Error(
+           `${code} fetching "https://www.codebuff.com/api/v1/chat/completions". For more information, pass \`verbose: true\` in the second argument to fetch()`,
+         ),
+         { code },
+       )
+       expect(isTransientNetworkError(error)).toBe(true)
+     }
+   })
+ 
++  it('detects DNS failures, keeping ETIMEOUT apart from ETIMEDOUT', () => {
++    // Bun's shape for a host that will not resolve (COD-965).
++    for (const code of ['ENOTFOUND', 'EAI_AGAIN', 'ETIMEOUT']) {
++      const error = Object.assign(
++        new Error(`getaddrinfo ${code} www.codebuff.com`),
++        { code },
++      )
++      expect(isTransientNetworkError(error)).toBe(true)
++    }
++    expect(isTransientNetworkError({ code: 'ENOTFOUND' })).toBe(true)
++    expect(
++      isTransientNetworkError(Object.assign(new Error('x'), { code: 'ETIME' })),
++    ).toBe(false)
++  })
++
+   it('detects the undici "fetch failed" TypeError', () => {
+     expect(isTransientNetworkError(new TypeError('fetch failed'))).toBe(true)
+   })
+ 
+   it('detects a socket error nested inside an AI SDK RetryError wrapper', () => {
+     const socketError = new Error(
+       'The socket connection was closed unexpectedly. For more information, pass `verbose: true` in the second argument to fetch()',
+     ) as Error & { code: string }
+     socketError.code = 'ECONNRESET'
+     const retryError = new Error('Failed after 3 attempts.') as Error & {
+       errors: unknown[]
+     }
+     retryError.errors = [socketError]
+     expect(isTransientNetworkError(retryError)).toBe(true)
+   })
+ 
+   it('detects a socket error in a cause chain', () => {
+     const inner = new Error('read ECONNRESET') as Error & { code: string }
+     inner.code = 'ECONNRESET'
+     const outer = new Error('Cannot connect to API')
+     ;(outer as Error & { cause: unknown }).cause = inner
+     expect(isTransientNetworkError(outer)).toBe(true)
+   })
+ 
+   it("detects undici's body-read failure on a closed socket", () => {
+diff --git a/common/src/util/error.ts b/common/src/util/error.ts
+index a9372e927..03c8100a6 100644
+--- a/common/src/util/error.ts
++++ b/common/src/util/error.ts
+@@ -407,50 +407,58 @@ export function isFetchIdleTimeoutError(error: unknown): boolean {
+  * sent them chasing their own VPN. See grace-flush.ts on the server.
+  */
+ export const FETCH_IDLE_TIMEOUT_USER_MESSAGE =
+   'Connection timed out: no data was received from the server for 5 minutes, so the request was aborted.\n\n' +
+   'This can be a slow model start on our side, or a connection dropped in transit (VPN, proxy, firewall, or flaky network).\n\n' +
+   'Retrying your message usually works. If it keeps happening, try a different model, or check your network/VPN/proxy.'
+ 
+ /**
+  * Substrings of error messages that indicate the TCP connection died in
+  * transit (as opposed to the server returning an error response). Bun's fetch
+  * throws a plain Error with "The socket connection was closed unexpectedly..."
+  * and code ECONNRESET/ConnectionClosed; undici throws TypeError "fetch failed".
+  */
+ const TRANSIENT_NETWORK_ERROR_MESSAGE_PATTERNS = [
+   'socket connection was closed unexpectedly',
+   'fetch failed',
+   'failed to fetch',
+   'network connection was lost',
+ ]
+ 
+ const TRANSIENT_NETWORK_ERROR_CODES = new Set([
+   'ECONNRESET',
+   'ECONNREFUSED',
+   'EPIPE',
+   'ETIMEDOUT',
++  // DNS: the host could not be resolved (ENOTFOUND), the resolver had no
++  // answer yet (EAI_AGAIN), or the resolver itself timed out (c-ares's
++  // ETIMEOUT, which is NOT the socket's ETIMEDOUT above). A laptop changing
++  // networks throws these for a few seconds; on 10-26/27 they ended 7
++  // sponsored runs mid-work, each after 14-104 model calls (COD-965).
++  'ENOTFOUND',
++  'EAI_AGAIN',
++  'ETIMEOUT',
+   // Bun-specific fetch error codes
+   'ConnectionClosed',
+   'ConnectionRefused',
+   'FailedToOpenSocket',
+   // Bun's fetch, when a compressed body ends before its compressed stream
+   // does: the same cut connection as above, on a gzip/br response (the
+   // chat-completions SSE body is gzipped, COD-764). Reproduced on Bun 1.3.14:
+   // a gzip SSE body whose HTTP framing ends cleanly mid-stream throws
+   // "ZlibError fetching <url>", code ZlibError; br gives
+   // BrotliDecompressionError. On 2026-10-08 every web deploy turned these
+   // into failed turns (545 in 15 minutes at 2pm PT). The same cut on an
+   // identity body is a clean end, and Node's fetch treats a truncated gzip
+   // body as one too, so both already recover.
+   'ZlibError',
+   'BrotliDecompressionError',
+   // undici (Node's fetch): the peer closed the socket. It rides as the cause
+   // of the body-read TypeError below.
+   'UND_ERR_SOCKET',
+ ])
+ 
+ /**
+  * undici's error when a response body is cut after the headers arrived:
+  * `TypeError: terminated`, cause `SocketError: other side closed`
+  * (UND_ERR_SOCKET). Bun reports the same cut as "The socket connection was
+  * closed unexpectedly". Matched on the exact message and type, because
