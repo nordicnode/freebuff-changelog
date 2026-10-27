@@ -1,0 +1,210 @@
+diff --git a/sdk/src/__tests__/run-terminal-command.test.ts b/sdk/src/__tests__/run-terminal-command.test.ts
+index 1fb9f2b72..f90431126 100644
+--- a/sdk/src/__tests__/run-terminal-command.test.ts
++++ b/sdk/src/__tests__/run-terminal-command.test.ts
+@@ -647,50 +647,81 @@ describe('managed background commands', () => {
+         new Response(parent.stderr).text(),
+         parent.exited,
+       ])
+       if (exitCode !== 0) {
+         throw new Error(`SDK subprocess exited ${exitCode}: ${stderr}`)
+       }
+       const value = JSON.parse(output.trim().split('\n').at(-1)!)
+       try {
+         if (transfer) expect(isProcessRunning(value.processId)).toBe(true)
+         else
+           expect(
+             await waitFor(() => !isProcessRunning(value.processId), 2000),
+           ).toBe(true)
+       } finally {
+         try {
+           process.kill(
+             process.platform === 'win32' ? value.processId : -value.processId,
+             'SIGKILL',
+           )
+         } catch {}
+         rmSync(join(value.stdoutPath, '..'), { recursive: true, force: true })
+       }
+     }
+   })
+ 
++  test('stops listing a detached background command once its group ends', async () => {
++    // Windows tracks the shell itself, so this shape is never retained there.
++    if (process.platform === 'win32') return
++    const { terminalCommandOutputSchema } =
++      await import('../../../common/src/tools/params/tool/run-terminal-command')
++    // The turn ends normally, so its signal never aborts.
++    const turn = new AbortController()
++    const result = await runTerminalCommand({
++      command: 'sleep 0.5 & echo started',
++      process_type: 'BACKGROUND',
++      cwd: tmpdir(),
++      timeout_seconds: 30,
++      signal: turn.signal,
++    })
++    const output = result[0]
++    if (output.type !== 'json') throw new Error('Expected JSON')
++    const value = terminalCommandOutputSchema.parse(output.value)
++    if (!('processId' in value) || !value.stdoutPath)
++      throw new Error('Missing process/log info')
++    const listed = () =>
++      getActiveTerminalCommandProcesses().some(
++        (child) => child.pid === value.processId,
++      )
++    try {
++      expect(listed()).toBe(true)
++      expect(await waitFor(() => !listed(), 3000)).toBe(true)
++    } finally {
++      rmSync(join(value.stdoutPath, '..'), { recursive: true, force: true })
++    }
++  })
++
+   test('never bypasses a failing background broker', async () => {
+     await expect(
+       runTerminalCommand({
+         command: 'echo must-not-run',
+         process_type: 'BACKGROUND',
+         cwd: tmpdir(),
+         timeout_seconds: 1,
+         terminalCommandBroker: {
+           start() {
+             throw new Error('broker denied')
+           },
+         },
+       }),
+     ).rejects.toThrow('broker denied')
+   })
+ 
+   test('reports background spawn errors instead of successful startup', async () => {
+     await expect(
+       runTerminalCommand({
+         command: 'echo impossible',
+         process_type: 'BACKGROUND',
+         cwd: '/nonexistent-codebuff-background-directory',
+         timeout_seconds: 1,
+       }),
+     ).rejects.toThrow()
+diff --git a/sdk/src/tools/run-terminal-command.ts b/sdk/src/tools/run-terminal-command.ts
+index 4736419be..db4fa6b7b 100644
+--- a/sdk/src/tools/run-terminal-command.ts
++++ b/sdk/src/tools/run-terminal-command.ts
+@@ -197,50 +197,51 @@ async function waitForProcessExit(
+       const pollTimer = setTimeout(resolve, PROCESS_EXIT_POLL_MS)
+       if (unref) pollTimer.unref?.()
+     })
+   }
+   return !isAlive()
+ }
+ 
+ // Children are spawned detached on POSIX (own process group) so that abort and
+ // timeout can kill the whole tree. That also detaches them from this process's
+ // lifetime, so sweep any still-running children when this process exits.
+ const liveChildren = new Set<TerminalCommandProcess>()
+ let exitSweepInstalled = false
+ 
+ export type ActiveTerminalCommandProcess = {
+   pid: number
+   processGroupId?: number
+ }
+ 
+ /**
+  * Return the process IDs owned by in-flight terminal tools. Commands are
+  * started in their own process group on POSIX, where the group ID matches the
+  * child PID. No command text or environment is exposed: diagnostics are often
+  * pasted into bug reports and those values may contain secrets.
+  */
+ export function getActiveTerminalCommandProcesses(): ActiveTerminalCommandProcess[] {
++  forgetEndedBackgroundCommands()
+   return Array.from(liveChildren).flatMap((child) => {
+     if (!child.pid) return []
+     return [
+       {
+         pid: child.pid,
+         ...(os.platform() === 'win32' ? {} : { processGroupId: child.pid }),
+       },
+     ]
+   })
+ }
+ 
+ function installExitSweep() {
+   if (exitSweepInstalled) return
+   exitSweepInstalled = true
+   process.on('exit', () => {
+     for (const child of liveChildren) {
+       try {
+         child.kill('SIGKILL')
+       } catch {}
+     }
+   })
+ }
+ 
+ /**
+  * Commands run under Git Bash on Windows, where `nul` is not the null device:
+@@ -646,50 +647,67 @@ export function runTerminalCommand({
+   })
+ }
+ 
+ const backgroundCommands = new Map<
+   TerminalCommandProcess,
+   {
+     signal?: AbortSignal
+     onAbort: () => void
+     transferable: boolean
+   }
+ >()
+ 
+ /** Transfer direct background processes to an isolated environment's owner.
+  * Use only after a successful run when that owner guarantees later teardown.
+  * Broker-owned processes cannot outlive their broker. Other runs are untouched.
+  */
+ export function releaseBackgroundTerminalCommands(signal: AbortSignal): void {
+   for (const [child, entry] of backgroundCommands) {
+     if (entry.signal !== signal || !entry.transferable) continue
+     signal.removeEventListener('abort', entry.onAbort)
+     liveChildren.delete(child)
+     backgroundCommands.delete(child)
+   }
+ }
+ 
++/**
++ * A background command whose shell exits while its process group lives on
++ * (`nohup server &`, how agents start dev servers) stays tracked past `finish`,
++ * and nothing looks at it again once that group ends. Desktop's helper census
++ * counted every such command ever started as live, so about 3% of macOS and
++ * Linux installs reported a process flood each day. Forget the ones whose
++ * group is gone.
++ */
++function forgetEndedBackgroundCommands(): void {
++  for (const [child, entry] of backgroundCommands) {
++    if (child.isAlive()) continue
++    entry.signal?.removeEventListener('abort', entry.onAbort)
++    liveChildren.delete(child)
++    backgroundCommands.delete(child)
++  }
++}
++
+ async function startBackgroundCommand(
+   request: TerminalCommandSpawnRequest,
+   command: string,
+   signal?: AbortSignal,
+   broker?: TerminalCommandBroker,
+ ): Promise<CodebuffToolOutput<'run_terminal_command'>> {
+   const logDirectory = mkdtempSync(path.join(os.tmpdir(), 'codebuff-process-'))
+   const stdoutPath = path.join(logDirectory, 'stdout.log')
+   const stderrPath = path.join(logDirectory, 'stderr.log')
+   let child: TerminalCommandProcess
+   if (broker) {
+     // Keep the host's execution boundary, including sponsored-run guards.
+     writeFileSync(stdoutPath, '', { mode: 0o600 })
+     writeFileSync(stderrPath, '', { mode: 0o600 })
+     child = broker.start(request)
+     for (const [stream, file] of [
+       [child.stdout, stdoutPath],
+       [child.stderr, stderrPath],
+     ] as const) {
+       const output = new BoundedOutputBuffer(COMMAND_OUTPUT_LIMIT)
+       stream.on('data', (data: Buffer) => {
+         output.append(data.toString())
+         try {
+           writeFileSync(file, output.format())
+         } catch {
