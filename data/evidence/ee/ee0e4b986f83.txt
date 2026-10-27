@@ -1,0 +1,1298 @@
+Date: 2026-10-27T07:33:51Z
+Category: SDK
+Areas: SDK
+Commit nature: production
+Stats: +51 / -0
+Analysis notes: SDK changes across 1 file(s) (+51/−0).
+Modified files: sdk/src/tools/run-terminal-command.ts
+Key facts (ground the WHY and DETAIL sentences in these): - Linux installs reported a process flood each day. Forget the ones whose group is gone.
+Structured facts (extracted mechanically from the diff; copy names and values verbatim, never round or rename):
+- Behavior asserted by new tests (test titles, verbatim; the hunks themselves are omitted): "stops listing a detached background command once its group ends"
+Subsystem Architecture Documentation (from nearby package guides):
+- From `sdk/README.md`:
+```markdown
+# @codebuff/sdk
+
+Official SDK for Codebuff - AI coding agent and framework
+
+## Installation
+
+```bash
+npm install @codebuff/sdk
+```
+
+## Prerequisites
+
+- Create a Codebuff account and get your [Codebuff API key here](https://www.codebuff.com/api-keys).
+
+## Usage
+
+### Basic Example
+
+```typescript
+import { CodebuffClient } from '@codebuff/sdk'
+
+async function main() {
+  const client = new CodebuffClient({
+    //[freebuff product prompt text omitted]
+    // Get one here: https://www.codebuff.com/api-keys
+    apiKey: process.env.CODEBUFF_API_KEY,
+    cwd: process.cwd(),
+  })
+
+  // First run
+  const runState1 = await client.run({
+    // The agent id. Any agent on the store (https://codebuff.com/store)
+    agent: 'codebuff/base@0.0.16',
+    prompt: 'Create a simple calculator class',
+    handleEvent: (event) => {
+      // All events that happen during the run: agent start/finish, tool calls/results, text responses, errors.
+      console.log('Codebuff Event', JSON.stringify(event))
+    },
+  })
+
+  // Continue the same session with a follow-up
+  const runOrError2 = await client.run({
+    agent: 'codebuff/base@0.0.16',
+    prompt: 'Add unit tests for the calculator',
+    previousRun: runState1, // <-- this is where your next run differs from the previous run
+    handleEvent: (event) => {
+      console.log('Codebuff Event', JSON.stringify(event))
+    },
+  })
+}
+
+main()
+```
+
+### Example 2: Custom Agents and Tools
+
+Here, we create a full agent and custom tools that can be reused between runs.
+
+```typescript
+import { z } from 'zod/v4'
+
+import { CodebuffClient, getCustomToolDefinition } from '@codebuff/sdk'
+
+import type { AgentDefinition } from '@codebuff/sdk'
+
+async function main() {
+  const client = new CodebuffClient({
+    //[freebuff product prompt text omitted]
+    // Get it here: https://www.codebuff.com/profile?tab=api-keys
+    apiKey: process.env.CODEBUFF_API_KEY,
+    // Optional directory agent runs from (if applicable).
+    cwd: process.cwd(),
+  })
+
+  // Define your own custom agents!
+  const myCustomAgent: AgentDefinition = {
+    id: 'my-custom-agent',
+    model: 'google/gemini-3.1-flash-lite',
+    displayName: 'Sentiment analyzer',
+    toolNames: ['fetch_api_data'], // Defined below!
+```
+Complete Source of Modified Files (for complete module context):
+- File `sdk/src/tools/run-terminal-command.ts` (816 lines):
+```
+import { spawn, spawnSync } from 'child_process'
+import { closeSync, mkdtempSync, openSync, statSync, writeFileSync } from 'fs'
+import { Readable as NodeReadable } from 'stream'
+import * as os from 'os'
+import * as path from 'path'
+
+import type {
+  ChildProcess,
+  ChildProcessWithoutNullStreams,
+} from 'child_process'
+import type { Readable } from 'stream'
+
+import { stripColors } from '../../../common/src/util/string'
+import { getSystemProcessEnv } from '../env'
+import { createWindowsBashNotFoundError, findWindowsBash } from './windows-bash'
+
+import type { CodebuffToolOutput } from '../../../common/src/tools/list'
+
+const COMMAND_OUTPUT_LIMIT = 50_000
+const TRUNCATION_MARKER = '\n[...TRUNCATED DUE TO LENGTH...]\n'
+const MAX_PENDING_COLOR_SEQUENCE_LENGTH = 32
+const INCOMPLETE_COLOR_SEQUENCE_REGEX = /\x1B\[[0-9;]*$/
+// Grace period between SIGTERM and SIGKILL for commands that trap or ignore
+// SIGTERM.
+const KILL_ESCALATION_MS = 1500
+const PROCESS_EXIT_POLL_MS = 25
+
+export type TerminalCommandSpawnRequest = {
+  executable: string
+  args: string[]
+  cwd: string
+  env: NodeJS.ProcessEnv
+  /**
+   * The command text, exactly as the tool received it. Present ONLY for a
+   * broker that {@link TerminalCommandBroker.ownsShell}: that broker runs this
+   * through its own shell, and `executable`/`args` are then empty. Absent for
+   * every other broker, whose request is unchanged.
+   */
+  command?: string
+}
+
+/** A command process whose complete descendant tree has one owner. */
+export interface TerminalCommandProcess {
+  pid?: number
+  stdout: Readable
+  stderr: Readable
+  /** Settles after stdout/stderr drain; brokers also finish tree cleanup. */
+  completion: Promise<number | null>
+  kill(signal: NodeJS.Signals): void
+  isAlive(): boolean
+}
+
+/**
+ * Host-provided process boundary for interactive applications.
+ *
+ * A broker must start the requested executable without attaching it to the
+ * host's console and return a handle that owns the complete process tree.
+ * Headless SDK consumers can omit this and use the direct process runner.
+ */
+export interface TerminalCommandBroker {
+  start(request: TerminalCommandSpawnRequest): TerminalCommandProcess
+  /**
+   * Set by a broker that runs {@link TerminalCommandSpawnRequest.command}
+   * through a shell of its own choosing (the sponsored Windows floor uses
+   * PowerShell). The SDK then neither looks for Git Bash nor rewrites the
+   * command for bash, and hands the broker the command text instead of a
+   * bash invocation. Unset, the request is the bash one, as always.
+   */
+  readonly ownsShell?: boolean
+}
+
+/**
+ * Retains a bounded prefix and suffix while continuing to drain a child
+ * process's output. This keeps noisy commands from growing the CLI process to
+ * multiple gigabytes before the result is truncated.
+ */
+export class BoundedOutputBuffer {
+  private head = ''
+  private tail = ''
+  private truncated = false
+  private pendingColorSequence = ''
+  private readonly headLimit: number
+  private readonly tailLimit: number
+
+  constructor(private readonly maxLength: number) {
+    if (maxLength < TRUNCATION_MARKER.length) {
+      throw new Error('Output limit must fit the truncation marker')
+    }
+    const retainedLength = Math.max(0, maxLength - TRUNCATION_MARKER.length)
+    this.headLimit = Math.ceil(retainedLength / 2)
+    this.tailLimit = Math.floor(retainedLength / 2)
+  }
+
+  append(value: string): void {
+    if (!value) return
+
+    let normalized = this.pendingColorSequence + value
+    this.pendingColorSequence = ''
+    const incompleteColorSequence = normalized.match(
+      INCOMPLETE_COLOR_SEQUENCE_REGEX,
+    )?.[0]
+    if (
+      incompleteColorSequence &&
+      incompleteColorSequence.length <= MAX_PENDING_COLOR_SEQUENCE_LENGTH
+    ) {
+      this.pendingColorSequence = incompleteColorSequence
+      normalized = normalized.slice(0, -incompleteColorSequence.length)
+    }
+    normalized = stripColors(normalized)
+    if (!normalized) return
+
+    if (!this.truncated) {
+      const combined = this.head + normalized
+      if (combined.length <= this.maxLength) {
+        this.head = combined
+        return
+      }
+
+      this.truncated = true
+      this.head = combined.slice(0, this.headLimit)
+      this.tail = this.tailLimit === 0 ? '' : combined.slice(-this.tailLimit)
+      return
+    }
+
+    this.tail =
+      this.tailLimit === 0
+        ? ''
+        : (this.tail + normalized).slice(-this.tailLimit)
+  }
+
+  get retainedLength(): number {
+    return this.head.length + this.tail.length
+  }
+
+  format(): string {
+    if (!this.truncated) {
+      return this.head
+    }
+    return this.head + TRUNCATION_MARKER + this.tail
+  }
+}
+
+function killProcessGroup(child: ChildProcess, signal: NodeJS.Signals) {
+  if (os.platform() === 'win32' && child.pid) {
+    // Node's child.kill() only terminates the direct process on Windows. Since
+    // the direct process is Git Bash, killing it first can orphan Bun/Node
+    // grandchildren before the later SIGKILL escalation has a tree to find.
+    // taskkill snapshots and force-terminates the complete descendant tree.
+    const result = spawnSync(
+      'taskkill.exe',
+      ['/pid', String(child.pid), '/t', '/f'],
+      {
+        stdio: 'ignore',
+        windowsHide: true,
+        timeout: 5_000,
+      },
+    )
+    if (!result.error && result.status === 0) return
+  }
+
+  if (os.platform() !== 'win32' && child.pid) {
+    try {
+      // Negative pid signals the whole process group.
+      process.kill(-child.pid, signal)
+      return
+    } catch {
+      // Process group may already be gone; fall back to a direct kill.
+    }
+  }
+  try {
+    child.kill(signal)
+  } catch {}
+}
+
+function isProcessGroupAlive(child: ChildProcess): boolean {
+  if (!child.pid) return false
+  if (os.platform() === 'win32') {
+    return child.exitCode === null && child.signalCode === null
+  }
+  try {
+    // Signal 0 checks for any remaining member without changing its state.
+    process.kill(-child.pid, 0)
+    return true
+  } catch {
+    return false
+  }
+}
+
+async function waitForProcessExit(
+  isAlive: () => boolean,
+  timeoutMs: number,
+  { unref = false }: { unref?: boolean } = {},
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs
+  while (isAlive() && Date.now() < deadline) {
+    await new Promise<void>((resolve) => {
+      const pollTimer = setTimeout(resolve, PROCESS_EXIT_POLL_MS)
+      if (unref) pollTimer.unref?.()
+    })
+  }
+  return !isAlive()
+}
+
+// Children are spawned detached on POSIX (own process group) so that abort and
+// timeout can kill the whole tree. That also detaches them from this process's
+// lifetime, so sweep any still-running children when this process exits.
+const liveChildren = new Set<TerminalCommandProcess>()
+let exitSweepInstalled = false
+
+export type ActiveTerminalCommandProcess = {
+  pid: number
+  processGroupId?: number
+}
+
+/**
+ * Return the process IDs owned by in-flight terminal tools. Commands are
+ * started in their own process group on POSIX, where the group ID matches the
+ * child PID. No command text or environment is exposed: diagnostics are often
+ * pasted into bug reports and those values may contain secrets.
+ */
+export function getActiveTerminalCommandProcesses(): ActiveTerminalCommandProcess[] {
+  forgetEndedBackgroundCommands()
+  return Array.from(liveChildren).flatMap((child) => {
+    if (!child.pid) return []
+    return [
+      {
+        pid: child.pid,
+        ...(os.platform() === 'win32' ? {} : { processGroupId: child.pid }),
+      },
+    ]
+  })
+}
+
+function installExitSweep() {
+  if (exitSweepInstalled) return
+  exitSweepInstalled = true
+  process.on('exit', () => {
+    for (const child of liveChildren) {
+      try {
+        child.kill('SIGKILL')
+      } catch {}
+    }
+  })
+}
+
+/**
+ * Commands run under Git Bash on Windows, where `nul` is not the null device:
+ * redirecting to it creates a literal file named "nul" (via an NT path that
+ * bypasses the reserved-name check) that Windows tools then refuse to delete.
+ * Models frequently emit cmd-style `> nul 2>&1`, so rewrite `nul` redirection
+ * targets to /dev/null.
+ */
+export function rewriteWindowsNulRedirects(command: string): string {
+  return command.replace(/([<>]\s*)nul(?![\w.])/gi, '$1/dev/null')
+}
+
+/**
+ * The error to report for a spawn that failed because `directory` is missing
+ * or not a directory, or null for any other failure.
+ *
+ * Such a spawn fails with an ENOENT that names the executable (`uv_spawn
+ * 'C:\Program Files\Git\bin\bash.exe'`, `posix_spawn 'bash'`, ripgrep's path).
+ * That reads as the program being missing, and models retried the same call
+ * hundreds of times instead of fixing the directory. Checked only after a
+ * failure, so a broker's own refusals (a sponsored run's containment) pass
+ * through unchanged.
+ */
+export function missingDirectoryError(
+  error: unknown,
+  directory: string,
+  label: string,
+): string | null {
+  const code = (error as NodeJS.ErrnoException | null)?.code
+  const message = error instanceof Error ? error.message : String(error)
+  if (
+    code !== 'ENOENT' &&
+    code !== 'ENOTDIR' &&
+    !/\b(ENOENT|ENOTDIR)\b/.test(message)
+  ) {
+    return null
+  }
+  try {
+    return statSync(directory).isDirectory()
+      ? null
+      : `${label} "${directory}" is not a directory.`
+  } catch (statError) {
+    const statCode = (statError as NodeJS.ErrnoException).code
+    return statCode === 'ENOENT' || statCode === 'ENOTDIR'
+      ? `${label} "${directory}" does not exist.`
+      : null
+  }
+}
+
+function spawnDirectTerminalCommand(
+  request: TerminalCommandSpawnRequest,
+): TerminalCommandProcess {
+  const child: ChildProcessWithoutNullStreams = spawn(
+    request.executable,
+    request.args,
+    {
+      cwd: request.cwd,
+      env: request.env,
+      stdio: 'pipe',
+      // The direct SDK runner owns a process group. Interactive hosts should
+      // provide a broker instead, so the shell never shares their console.
+      detached: true,
+      windowsHide: true,
+    },
+  )
+  const closed = new Promise<number | null>((resolve, reject) => {
+    child.once('error', reject)
+    child.once('close', resolve)
+  })
+  const completion = closed.then(async (exitCode) => {
+    if (os.platform() === 'win32' || !isProcessGroupAlive(child)) {
+      return exitCode
+    }
+
+    // SYNC commands do not transfer ownership of background descendants. Reap
+    // anything the shell detached after it reported successful completion,
+    // without making an infinite-timeout terminal tool wait forever.
+    killProcessGroup(child, 'SIGTERM')
+    if (
+      await waitForProcessExit(
+        () => isProcessGroupAlive(child),
+        KILL_ESCALATION_MS,
+      )
+    )
+      return exitCode
+
+    killProcessGroup(child, 'SIGKILL')
+    await waitForProcessExit(
+      () => isProcessGroupAlive(child),
+      KILL_ESCALATION_MS,
+    )
+    return exitCode
+  })
+
+  return {
+    pid: child.pid,
+    stdout: child.stdout,
+    stderr: child.stderr,
+    completion,
+    kill: (signal) => killProcessGroup(child, signal),
+    isAlive: () => isProcessGroupAlive(child),
+  }
+}
+
+export function runTerminalCommand({
+  command,
+  process_type,
+  cwd,
+  timeout_seconds,
+  env,
+  scrubEnvironmentKeys,
+  scrubEnvironmentValues,
+  signal,
+  terminalCommandBroker,
+}: {
+  command: string
+  process_type: 'SYNC' | 'BACKGROUND'
+  cwd: string
+  timeout_seconds: number
+  env?: NodeJS.ProcessEnv
+  /** Keys removed after merging the host environment. Used for run-only keys. */
+  scrubEnvironmentKeys?: readonly string[]
+  scrubEnvironmentValues?: readonly string[]
+  signal?: AbortSignal
+  terminalCommandBroker?: TerminalCommandBroker
+}): Promise<CodebuffToolOutput<'run_terminal_command'>> {
+  return new Promise((resolve, reject) => {
+    const isWindows = os.platform() === 'win32'
+    const processEnv = {
+      ...getSystemProcessEnv(),
+      ...(env ?? {}),
+    } as NodeJS.ProcessEnv
+    for (const key of scrubEnvironmentKeys ?? []) delete processEnv[key]
+    for (const [key, value] of Object.entries(processEnv)) {
+      if (
+        value !== undefined &&
+        scrubEnvironmentValues?.some((secret) => value.trim() === secret.trim())
+      ) {
+        delete processEnv[key]
+      }
+    }
+    if (isWindows) {
+      // Preserve other MSYS options while preventing Git Bash descendants from
+      // allocating a ConPTY despite the detached/hidden process flags.
+      processEnv.MSYS = [processEnv.MSYS, 'disable_pcon']
+        .filter(Boolean)
+        .join(' ')
+    }
+
+    const resolveAbortedBeforeSpawn = () => {
+      resolve([
+        {
+          type: 'json',
+          value: {
+            command,
+            message: 'Command cancelled: the run was aborted by the user.',
+          },
+        },
+      ])
+    }
+
+    if (signal?.aborted) {
+      resolveAbortedBeforeSpawn()
+      return
+    }
+
+    let shell: string
+    let shellArgs: string[]
+    const brokerOwnsShell = terminalCommandBroker?.ownsShell === true
+
+    if (brokerOwnsShell) {
+      // The broker picks the shell and gets the command text itself. Nothing
+      // here may run: an empty executable is what a broker that forgot it
+      // owns the shell would try to spawn, and that fails rather than runs.
+      shell = ''
+      shellArgs = []
+    } else if (isWindows) {
+      command = rewriteWindowsNulRedirects(command)
+      const bashPath = findWindowsBash(processEnv)
+      if (!bashPath) {
+        reject(createWindowsBashNotFoundError())
+        return
+      }
+      shell = bashPath
+      shellArgs = ['-c']
+    } else {
+      shell = 'bash'
+      shellArgs = ['-c']
+    }
+
+    // Resolve cwd to absolute path
+    const resolvedCwd = path.resolve(cwd)
+    const missingCwd = (error: unknown) =>
+      missingDirectoryError(error, resolvedCwd, 'Working directory')
+    const spawnFailure = (error: unknown, prefix: string) =>
+      new Error(
+        missingCwd(error) ??
+          `${prefix}: ${error instanceof Error ? error.message : String(error)}`,
+      )
+
+    let childProcess: TerminalCommandProcess
+    try {
+      const request: TerminalCommandSpawnRequest = brokerOwnsShell
+        ? {
+            executable: shell,
+            args: [],
+            cwd: resolvedCwd,
+            env: processEnv,
+            command,
+          }
+        : {
+            executable: shell,
+            args: [...shellArgs, command],
+            cwd: resolvedCwd,
+            env: processEnv,
+          }
+      if (process_type === 'BACKGROUND') {
+        startBackgroundCommand(
+          request,
+          command,
+          signal,
+          terminalCommandBroker,
+        ).then(resolve, (error) => {
+          const missing = missingCwd(error)
+          reject(missing ? new Error(missing) : error)
+        })
+        return
+      }
+      childProcess = terminalCommandBroker
+        ? terminalCommandBroker.start(request)
+        : spawnDirectTerminalCommand(request)
+    } catch (error) {
+      reject(
+        spawnFailure(
+          error,
+          terminalCommandBroker
+            ? 'Failed to start terminal command broker'
+            : 'Failed to spawn command',
+        ),
+      )
+      return
+    }
+
+    liveChildren.add(childProcess)
+    installExitSweep()
+
+    let childLifecycleFinished = false
+    const finishTrackingChild = () => {
+      if (childLifecycleFinished) return
+      childLifecycleFinished = true
+      liveChildren.delete(childProcess)
+    }
+
+    const stdout = new BoundedOutputBuffer(COMMAND_OUTPUT_LIMIT)
+    const stderr = new BoundedOutputBuffer(COMMAND_OUTPUT_LIMIT)
+    let timer: NodeJS.Timeout | null = null
+    let sigkillTimer: NodeJS.Timeout | null = null
+    let processFinished = false
+
+    const killChildProcess = () => {
+      try {
+        childProcess.kill('SIGTERM')
+      } catch {}
+      // Escalate in case the command traps or ignores SIGTERM.
+      sigkillTimer = setTimeout(async () => {
+        if (childProcess.isAlive()) {
+          try {
+            childProcess.kill('SIGKILL')
+          } catch {}
+        }
+        // A zombie-visible group or faulty broker can remain "alive" forever.
+        // Stop retaining it after a bounded post-kill observation window.
+        await waitForProcessExit(
+          () => childProcess.isAlive(),
+          KILL_ESCALATION_MS,
+          { unref: true },
+        )
+        sigkillTimer = null
+        finishTrackingChild()
+      }, KILL_ESCALATION_MS)
+      sigkillTimer.unref?.()
+    }
+
+    const onAbort = () => {
+      if (processFinished) return
+      processFinished = true
+
+      if (timer) {
+        clearTimeout(timer)
+      }
+      killChildProcess()
+
+      resolve([
+        {
+          type: 'json',
+          value: {
+            command,
+            stdout: stdout.format(),
+            ...(stderr.retainedLength > 0 ? { stderr: stderr.format() } : {}),
+            message:
+              'Command interrupted: the run was aborted by the user and the process was killed before it completed.',
+          },
+        },
+      ])
+
+      // The result is already settled; stop buffering output from a child
+      // that may linger through the SIGTERM grace period.
+      childProcess.stdout.destroy()
+      childProcess.stderr.destroy()
+    }
+    signal?.addEventListener('abort', onAbort, { once: true })
+    if (signal?.aborted) {
+      onAbort()
+    }
+
+    // Set up timeout if timeout_seconds >= 0 (infinite timeout when < 0)
+    if (timeout_seconds >= 0 && !processFinished) {
+      timer = setTimeout(() => {
+        if (!processFinished) {
+          processFinished = true
+          signal?.removeEventListener('abort', onAbort)
+          killChildProcess()
+          reject(
+            new Error(`Command timed out after ${timeout_seconds} seconds`),
+          )
+        }
+      }, timeout_seconds * 1000)
+    }
+
+    // Collect stdout
+    childProcess.stdout.on('data', (data: Buffer) => {
+      stdout.append(data.toString())
+    })
+
+    // Collect stderr
+    childProcess.stderr.on('data', (data: Buffer) => {
+      stderr.append(data.toString())
+    })
+
+    // Handle process completion
+    childProcess.completion
+      .then((exitCode) => {
+        if (sigkillTimer) {
+          // A process can exit while a descendant ignores SIGTERM. Preserve
+          // bounded escalation and tracking while cleanup is still active.
+          if (!childProcess.isAlive()) {
+            clearTimeout(sigkillTimer)
+            sigkillTimer = null
+            finishTrackingChild()
+          }
+        } else {
+          finishTrackingChild()
+        }
+
+        if (processFinished) return
+        processFinished = true
+
+        if (timer) {
+          clearTimeout(timer)
+        }
+        signal?.removeEventListener('abort', onAbort)
+
+        const truncatedStdout = stdout.format()
+        const truncatedStderr = stderr.format()
+
+        const combinedOutput = {
+          command,
+          stdout: truncatedStdout,
+          ...(truncatedStderr ? { stderr: truncatedStderr } : {}),
+          ...(exitCode !== null ? { exitCode } : {}),
+        }
+
+        resolve([{ type: 'json', value: combinedOutput }])
+      })
+      .catch((error: unknown) => {
+        const wasFinished = processFinished
+        processFinished = true
+
+        if (timer) {
+          clearTimeout(timer)
+        }
+        signal?.removeEventListener('abort', onAbort)
+
+        if (childProcess.isAlive()) {
+          if (!sigkillTimer) killChildProcess()
+        } else {
+          finishTrackingChild()
+        }
+
+        if (wasFinished) return
+
+        reject(
+          spawnFailure(
+            error,
+            terminalCommandBroker
+              ? 'Terminal command broker failed'
+              : childProcess.pid
+                ? 'Terminal command process failed'
+                : 'Failed to spawn command',
+          ),
+        )
+      })
+  })
+}
+
+const backgroundCommands = new Map<
+  TerminalCommandProcess,
+  {
+    signal?: AbortSignal
+    onAbort: () => void
+    transferable: boolean
+  }
+>()
+
+/** Transfer direct background processes to an isolated environment's owner.
+ * Use only after a successful run when that owner guarantees later teardown.
+ * Broker-owned processes cannot outlive their broker. Other runs are untouched.
+ */
+export function releaseBackgroundTerminalCommands(signal: AbortSignal): void {
+  for (const [child, entry] of backgroundCommands) {
+    if (entry.signal !== signal || !entry.transferable) continue
+    signal.removeEventListener('abort', entry.onAbort)
+    liveChildren.delete(child)
+    backgroundCommands.delete(child)
+  }
+}
+
+/**
+ * A background command whose shell exits while its process group lives on
+ * (`nohup server &`, how agents start dev servers) stays tracked past `finish`,
+ * and nothing looks at it again once that group ends. Desktop's helper census
+ * counted every such command ever started as live, so about 3% of macOS and
+ * Linux installs reported a process flood each day. Forget the ones whose
+ * group is gone.
+ */
+function forgetEndedBackgroundCommands(): void {
+  for (const [child, entry] of backgroundCommands) {
+    if (child.isAlive()) continue
+    entry.signal?.removeEventListener('abort', entry.onAbort)
+    liveChildren.delete(child)
+    backgroundCommands.delete(child)
+  }
+}
+
+async function startBackgroundCommand(
+  request: TerminalCommandSpawnRequest,
+  command: string,
+  signal?: AbortSignal,
+  broker?: TerminalCommandBroker,
+): Promise<CodebuffToolOutput<'run_terminal_command'>> {
+  const logDirectory = mkdtempSync(path.join(os.tmpdir(), 'codebuff-process-'))
+  const stdoutPath = path.join(logDirectory, 'stdout.log')
+  const stderrPath = path.join(logDirectory, 'stderr.log')
+  let child: TerminalCommandProcess
+  if (broker) {
+    // Keep the host's execution boundary, including sponsored-run guards.
+    writeFileSync(stdoutPath, '', { mode: 0o600 })
+    writeFileSync(stderrPath, '', { mode: 0o600 })
+    child = broker.start(request)
+    for (const [stream, file] of [
+      [child.stdout, stdoutPath],
+      [child.stderr, stderrPath],
+    ] as const) {
+      const output = new BoundedOutputBuffer(COMMAND_OUTPUT_LIMIT)
+      stream.on('data', (data: Buffer) => {
+        output.append(data.toString())
+        try {
+          writeFileSync(file, output.format())
+        } catch {
+          /* disk unavailable */
+        }
+      })
+    }
+  } else {
+    // Real files rather than pipes allow a sandbox owner to retain the service
+    // after the SDK exits. Logs are private and remain available for inspection.
+    const out = openSync(stdoutPath, 'w', 0o600)
+    let err: number | undefined
+    let process: ChildProcess
+    try {
+      err = openSync(stderrPath, 'w', 0o600)
+      process = spawn(request.executable, request.args, {
+        cwd: request.cwd,
+        env: request.env,
+        stdio: ['ignore', out, err],
+        detached: true,
+        windowsHide: true,
+      })
+    } finally {
+      closeSync(out)
+      if (err !== undefined) closeSync(err)
+    }
+    const completion = new Promise<number | null>((resolve, reject) => {
+      process.once('error', reject)
+      process.once('close', resolve)
+    })
+    // Install the rejection handler before awaiting spawn success.
+    completion.catch(() => {})
+    await new Promise<void>((resolve, reject) => {
+      process.once('spawn', resolve)
+      process.once('error', reject)
+    })
+    process.unref()
+    child = {
+      pid: process.pid,
+      stdout: NodeReadable.from([]),
+      stderr: NodeReadable.from([]),
+      completion,
+      kill: (signal) => killProcessGroup(process, signal),
+      isAlive: () => isProcessGroupAlive(process),
+    }
+  }
+  if (!child.pid) {
+    child.completion.catch(() => {})
+    child.kill('SIGKILL')
+    throw new Error('Background command started without a process ID')
+  }
+  const onAbort = () => {
+    try {
+      child.kill('SIGKILL')
+    } catch {
+      /* already exited */
+    }
+    liveChildren.delete(child)
+    backgroundCommands.delete(child)
+  }
+  liveChildren.add(child)
+  installExitSweep()
+  backgroundCommands.set(child, { signal, onAbort, transferable: !broker })
+  signal?.addEventListener('abort', onAbort, { once: true })
+  if (signal?.aborted) onAbort()
+  const finish = (exitCode: number | null, error?: unknown) => {
+    try {
+      writeFileSync(
+        path.join(logDirectory, 'exit.json'),
+        JSON.stringify({
+          exitCode,
+          ...(error ? { error: String(error) } : {}),
+        }),
+        { mode: 0o600 },
+      )
+    } catch {
+      /* diagnostic only */
+    }
+    // A shell can exit before descendants. Keep ownership until abort/exit.
+    if (!child.isAlive()) {
+      signal?.removeEventListener('abort', onAbort)
+      liveChildren.delete(child)
+      backgroundCommands.delete(child)
+    }
+  }
+  child.completion.then(
+    (code) => finish(code),
+    (error) => finish(null, error),
+  )
+  return [
+    {
+      type: 'json',
+      value: {
+        command,
+        processId: child.pid!,
+        backgroundProcessStatus: signal?.aborted ? 'error' : 'running',
+        stdoutPath,
+        stderrPath,
+        message: signal?.aborted
+          ? 'Background command cancelled: the run was aborted.'
+          : `Started background command. Check readiness and logs at ${stdoutPath} and ${stderrPath}; starting is not proof of success. Use subsequent terminal calls to inspect or stop PID ${child.pid}.`,
+      },
+    },
+  ]
+}
+```
+Where the symbols this change introduces are used elsewhere, at this same revision (the code that reads them; this is evidence for the WHAT and the WHY, and it is the only source for who consumes this change):
+- File `sdk/src/__tests__/run-terminal-command.test.ts` (10 matching lines):
+```
+rmSync(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  test('names a missing working directory instead of the shell', async () => {
+    // Spawning in a missing cwd fails with an ENOENT naming the shell
+    // ("uv_spawn 'C:\Program Files\Git\bin\bash.exe'"), which models read as
+    // bash being missing and retried for hundreds of calls.
+    const tempDir = mkdtempSync(join(tmpdir(), 'codebuff-missing-cwd-'))
+    const missing = join(tempDir, 'not-created-yet')
+
+    try {
+      for (const process_type of ['SYNC', 'BACKGROUND'] as const) {
+        await expect(
+          runTerminalCommand({
+            command: 'true',
+            process_type,
+            cwd: missing,
+            timeout_seconds: 5,
+          }),
+        ).rejects.toThrow(`Working directory "${missing}" does not exist.`)
+      }
+      // Only a failed spawn is diagnosed: a broker's own refusal (a sponsored
+      // run's containment) still reads the same for every path outside it.
+      await expect(
+…
+await import('../../../common/src/tools/params/tool/run-terminal-command')
+    const start = async (signal: AbortSignal) => {
+      const result = await runTerminalCommand({
+        command: 'printf ready; sleep 60',
+        process_type: 'BACKGROUND',
+        cwd: tmpdir(),
+        timeout_seconds: 0.01,
+        signal,
+      })
+      const output = result[0]
+      if (output.type !== 'json') throw new Error('Expected JSON')
+      const value = terminalCommandOutputSchema.parse(output.value)
+      if (!('processId' in value) || !value.stdoutPath)
+        throw new Error('Missing process/log info')
+      return value as typeof value & { stdoutPath: string }
+    }
+    const a = await start(first.signal)
+    const b = await start(second.signal)
+    try {
+      expect(
+        await waitFor(
+          () => readFileSync(a.stdoutPath, 'utf8').includes('ready'),
+          2000,
+        ),
+      ).toBe(true)
+      expect(isProcessRunning(a.processId)).toBe(true)
+      releaseBackgroundTerminalCommands(first.signal)
+      first.abort()
+      second.abort()
+      expect(await waitFor(() => !isProcessRunning(b.processId), 2000)).toBe(
+        true,
+      )
+      expect(isProcessRunning(a.processId)).toBe(true)
+    } finally {
+```
+- File `common/src/tools/params/tool/run-terminal-command.ts` (3 matching lines):
+```
+const toolName = 'run_terminal_command'
+const endsAgentStep = true
+const commandSchema = z
+  .object({
+    // Can be empty to use it for a timeout.
+    command: z
+      .string()
+      .min(1, 'Command cannot be empty')
+      .describe(
+        `[freebuff product prompt text omitted]`,
+      ),
+    process_type: z
+      .enum(['SYNC', 'BACKGROUND'])
+      .default('SYNC')
+      .describe(
+        `Either SYNC (waits, returns output) or BACKGROUND (runs in background). Default SYNC`,
+      ),
+    cwd: z
+      .string()
+      .optional()
+      .describe(
+        `The working directory to run the command in. Default is the project root.`,
+      ),
+    timeout_seconds: z
+      .number()
+      .default(30)
+      .optional()
+      .transform(clampTerminalTimeoutSeconds)
+      .describe(
+        `[freebuff product prompt text omitted]${MAX_TERMINAL_TIMEOUT_SECONDS}[freebuff product prompt text omitted]${MAX_TERMINAL_TIMEOUT_MINUTES}[freebuff product prompt text omitted]`,
+      ),
+  })
+  .describe(
+    `Execute a CLI command from the **project root** (different from the user's cwd).`,
+  )
+const inputSchema = repairInput(normalizeCommandInput, commandSchema)
+const buildDescription = (options: { attribution: boolean }) =>
+  `
+Execute commands needed to complete the user's task, including inspecting the environment, running scripts, installing task dependencies, building, testing, generating requested artifacts, and starting required services.
+
+Authorization:
+- The user's request authorizes the ordinary steps reasonably necessary to complete it. Carry that authorization through the task; do not ask again just because a step uses a script, creates a virtual environment, installs local dependencies, or starts a task-required process.
+```
+- File `common/src/templates/initial-agents-dir/types/tools.ts` (2 matching lines):
+```
+*/
+export interface RunFileChangeHooksParams {
+  /** List of file paths that were changed and should trigger file change hooks */
+  files: string[]
+}
+
+/**
+ * Execute a CLI command from the **project root** (different from the user's cwd).
+ */
+export interface RunTerminalCommandParams {
+  /** CLI command valid for user's OS. */
+  command: string
+  /** Either SYNC (waits, returns output) or BACKGROUND (runs in background). Default SYNC */
+  process_type?: 'SYNC' | 'BACKGROUND'
+  /** The working directory to run the command in. Default is the project root. */
+  cwd?: string
+  /** Set to -1 for no timeout. Does not apply for BACKGROUND commands. Default 30 */
+  timeout_seconds?: number
+}
+
+/**
+ * Set the conversation history to the provided messages.
+ */
+export interface SetMessagesParams {
+  messages: any
+}
+
+/**
+ * JSON object to set as the agent output. This completely replaces any previous output. If the agent was spawned, this value will be passed back to its parent. If the agent has an outputSchema defined, the output will be validated against it.
+```
+- File `common/src/ads/agentic-ad-lab-run.ts` (1 matching line):
+```
+// -------------------------------------------------------------- system prompt
+
+/** MIRRORED: Desktop's `SPONSORED_AGENT_JOB`. */
+export const LAB_SPONSORED_AGENT_JOB = `# The job
+
+-[freebuff product prompt text omitted]
+- Fit the procedure to this project. Before editing, read enough to know its framework, language, package manager, file layout and conventions, and put the integration where this project would put it, named and structured the way this project names and structures things. The procedure says what to build; the project decides how it looks here.
+- Make the fewest changes that complete the procedure. Prefer editing existing files over creating new ones, and do not touch anything the procedure does not need.
+- Do not stop to ask for confirmation or for a preference. Pick what fits the project best, carry on, and say what you chose in the report.`
+
+/**
+ * Desktop's `SPONSORED_AGENT_WORKING`, verbatim except its BACKGROUND
+ * bullet: a Cloud run's shell is `cloud_sandbox_exec`, whose commands time
+ * out after five minutes.
+ */
+export const LAB_SPONSORED_AGENT_WORKING = `# Working
+
+- Read the procedure for its acceptance criteria first: the files, environment variables, interfaces and behaviour it asks for. Check the finished change against them before you end.
+- Use write_todos for a procedure with several steps. The user watches the list as your live progress: each time you finish an item, call write_todos again with it marked completed before starting the next one.
+- The procedure usually brings in a package this project does not have yet. When it pins that package under "Pinned installs", install exactly that version with one plain command (\`npm install name@version\`, or \`pnpm add\` / \`bun add\`; for a Python package marked (pip), \`pip install --only-binary=:all: name==version\` or \`uv add --no-build name==version\`, wheels only); install scripts are skipped. Every other install is refused. Write the code against the package's documented API either way; do not replace it with a hand-rolled substitute or a different library. A check that fails only because an unpinned package is not installed is expected: say so in the report, and list the exact install command, in this project's package manager, as something the user must do.
+- Verify with what the project already has: its typecheck, lint, build and tests, where they exist and cover what you changed. A successful exit code alone does not prove the requested behaviour; check the delivered code does what the procedure asks.
+-[freebuff product prompt text omitted]
+- Report checks that failed or could not run as exactly that, never as passes.
+- Commands run through cloud_sandbox_exec and stop after five minutes. Start dev servers and long jobs in the background with nohup and a log file, check the log for readiness, and confirm they are still running when you rely on them.
+```
+- File `packages/agent-runtime/src/__tests__/tool-validation-error.test.ts` (1 matching line):
+```
+})
+
+  it('reads `cmd` as `command` and normalizes `process_type`', () => {
+    expect(
+      inputOf('run_terminal_command', {
+        cmd: 'git status',
+        process_type: 'SYNC',
+      }).command,
+    ).toBe('git status')
+    for (const [raw, expected] of [
+      ['SYNC\n', 'SYNC'],
+      ['SYNC\n### 600', 'SYNC'],
+      ['background', 'BACKGROUND'],
+    ]) {
+      expect(
+        inputOf('run_terminal_command', { command: 'ls', process_type: raw })
+          .process_type,
+      ).toBe(expected)
+    }
+    expect(
+      'error' in
+        parse('run_terminal_command', { command: 'ls', process_type: 'BG' }),
+    ).toBe(true)
+  })
+```
+- File `packages/agent-runtime/src/util/simplify-tool-results.ts` (1 matching line):
+```
+},
+  ]
+}
+
+export function simplifyTerminalCommandResults(params: {
+  messageContent: CodebuffToolOutput<'run_terminal_command'>
+  logger: Logger
+}): CodebuffToolOutput<'run_terminal_command'> {
+  const { messageContent, logger } = params
+  try {
+    const clone = cloneDeep(messageContent)
+    const content = clone[0].value
+    if ('processId' in content || 'errorMessage' in content) {
+      return clone
+    }
+    const { command, message, exitCode } = content
+    return [
+      {
+        type: 'json',
+        value: {
+          command,
+          ...(message && { message }),
+          stdoutOmittedForLength: true,
+          ...(exitCode !== undefined && { exitCode }),
+        },
+```
+Tests this commit changed (added lines only; the assertions are what the change is expected to do, not a description of the feature):
+- File `sdk/src/__tests__/run-terminal-command.test.ts`: "stops listing a detached background command once its group ends"
+```
+  test('stops listing a detached background command once its group ends', async () => {
+    // Windows tracks the shell itself, so this shape is never retained there.
+    if (process.platform === 'win32') return
+    const { terminalCommandOutputSchema } =
+      await import('../../../common/src/tools/params/tool/run-terminal-command')
+    // The turn ends normally, so its signal never aborts.
+    const turn = new AbortController()
+    const result = await runTerminalCommand({
+      command: 'sleep 0.5 & echo started',
+      process_type: 'BACKGROUND',
+      cwd: tmpdir(),
+      timeout_seconds: 30,
+      signal: turn.signal,
+    })
+    const output = result[0]
+    if (output.type !== 'json') throw new Error('Expected JSON')
+    const value = terminalCommandOutputSchema.parse(output.value)
+    if (!('processId' in value) || !value.stdoutPath)
+      throw new Error('Missing process/log info')
+    const listed = () =>
+      getActiveTerminalCommandProcesses().some(
+        (child) => child.pid === value.processId,
+      )
+    try {
+      expect(listed()).toBe(true)
+      expect(await waitFor(() => !listed(), 3000)).toBe(true)
+    } finally {
+      rmSync(join(value.stdoutPath, '..'), { recursive: true, force: true })
+    }
+  })
+```
+Diff (source hunks; lockfiles and pure test hunks omitted, except in a lockfile-only commit):
+```diff
+diff --git a/sdk/src/tools/run-terminal-command.ts b/sdk/src/tools/run-terminal-command.ts
+index 4736419be..db4fa6b7b 100644
+--- a/sdk/src/tools/run-terminal-command.ts
++++ b/sdk/src/tools/run-terminal-command.ts
+@@ -197,50 +197,51 @@ async function waitForProcessExit(
+       const pollTimer = setTimeout(resolve, PROCESS_EXIT_POLL_MS)
+       if (unref) pollTimer.unref?.()
+     })
+   }
+   return !isAlive()
+ }
+ 
+ // Children are spawned detached on POSIX (own process group) so that abort and
+ // timeout can kill the whole tree. That also detaches them from this process's
+ // lifetime, so sweep any still-running children when this process exits.
+ const liveChildren = new Set<TerminalCommandProcess>()
+ let exitSweepInstalled = false
+ 
+ export type ActiveTerminalCommandProcess = {
+   pid: number
+   processGroupId?: number
+ }
+ 
+ /**
+  * Return the process IDs owned by in-flight terminal tools. Commands are
+  * started in their own process group on POSIX, where the group ID matches the
+  * child PID. No command text or environment is exposed: diagnostics are often
+  * pasted into bug reports and those values may contain secrets.
+  */
+ export function getActiveTerminalCommandProcesses(): ActiveTerminalCommandProcess[] {
++  forgetEndedBackgroundCommands()
+   return Array.from(liveChildren).flatMap((child) => {
+     if (!child.pid) return []
+     return [
+       {
+         pid: child.pid,
+         ...(os.platform() === 'win32' ? {} : { processGroupId: child.pid }),
+       },
+     ]
+   })
+ }
+ 
+ function installExitSweep() {
+   if (exitSweepInstalled) return
+   exitSweepInstalled = true
+   process.on('exit', () => {
+     for (const child of liveChildren) {
+       try {
+         child.kill('SIGKILL')
+       } catch {}
+     }
+   })
+ }
+ 
+ /**
+  * Commands run under Git Bash on Windows, where `nul` is not the null device:
+@@ -646,50 +647,67 @@ export function runTerminalCommand({
+   })
+ }
+ 
+ const backgroundCommands = new Map<
+   TerminalCommandProcess,
+   {
+     signal?: AbortSignal
+     onAbort: () => void
+     transferable: boolean
+   }
+ >()
+ 
+ /** Transfer direct background processes to an isolated environment's owner.
+  * Use only after a successful run when that owner guarantees later teardown.
+  * Broker-owned processes cannot outlive their broker. Other runs are untouched.
+  */
+ export function releaseBackgroundTerminalCommands(signal: AbortSignal): void {
+   for (const [child, entry] of backgroundCommands) {
+     if (entry.signal !== signal || !entry.transferable) continue
+     signal.removeEventListener('abort', entry.onAbort)
+     liveChildren.delete(child)
+     backgroundCommands.delete(child)
+   }
+ }
+ 
++/**
++ * A background command whose shell exits while its process group lives on
++ * (`nohup server &`, how agents start dev servers) stays tracked past `finish`,
++ * and nothing looks at it again once that group ends. Desktop's helper census
++ * counted every such command ever started as live, so about 3% of macOS and
++ * Linux installs reported a process flood each day. Forget the ones whose
++ * group is gone.
++ */
++function forgetEndedBackgroundCommands(): void {
++  for (const [child, entry] of backgroundCommands) {
++    if (child.isAlive()) continue
++    entry.signal?.removeEventListener('abort', entry.onAbort)
++    liveChildren.delete(child)
++    backgroundCommands.delete(child)
++  }
++}
++
+ async function startBackgroundCommand(
+   request: TerminalCommandSpawnRequest,
+   command: string,
+   signal?: AbortSignal,
+   broker?: TerminalCommandBroker,
+ ): Promise<CodebuffToolOutput<'run_terminal_command'>> {
+   const logDirectory = mkdtempSync(path.join(os.tmpdir(), 'codebuff-process-'))
+   const stdoutPath = path.join(logDirectory, 'stdout.log')
+   const stderrPath = path.join(logDirectory, 'stderr.log')
+   let child: TerminalCommandProcess
+   if (broker) {
+     // Keep the host's execution boundary, including sponsored-run guards.
+     writeFileSync(stdoutPath, '', { mode: 0o600 })
+     writeFileSync(stderrPath, '', { mode: 0o600 })
+     child = broker.start(request)
+     for (const [stream, file] of [
+       [child.stdout, stdoutPath],
+       [child.stderr, stderrPath],
+     ] as const) {
+       const output = new BoundedOutputBuffer(COMMAND_OUTPUT_LIMIT)
+       stream.on('data', (data: Buffer) => {
+         output.append(data.toString())
+         try {
+           writeFileSync(file, output.format())
+         } catch {
+
+```
