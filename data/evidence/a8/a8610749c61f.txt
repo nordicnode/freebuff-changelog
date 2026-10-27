@@ -1,0 +1,2784 @@
+Date: 2026-10-27T03:44:01Z
+Category: CLI
+Areas: CLI
+Commit nature: production
+Stats: +268 / -64
+Analysis notes: CLI changes across 6 file(s) (+268/−64).
+Modified files: cli/src/index.tsx, cli/src/project-files.ts, cli/src/utils/config-dir.ts, cli/src/utils/message-history.ts, cli/src/utils/run-state-storage.ts, cli/src/utils/write-file-atomic.ts
+Key facts (ground the WHY and DETAIL sentences in these): - Transcripts, run state and prompt history live under the config dir; keep it owner-only even if it was first created without a mode. - Owner-only: chat directories hold transcripts and run state. - Owner-only, matching the mode `auth.ts` creates the directory with. - Best-effort: clamp an existing config directory to owner-only. - Resolved inside the try: a relative FREEBUFF_CONFIG_DIR throws here. - Not ours to fail startup over (e.g. a directory owned by another user).
+Structured facts (extracted mechanically from the diff; copy names and values verbatim, never round or rename):
+- Constants newly defined: PRIVATE_FILE_MODE = 0o600 (a definition alone changes nothing at runtime; if the diff shows no reader, say it is in place and does nothing yet)
+- Exports added: tightenConfigDirMode
+- Behavior asserted by new tests (test titles, verbatim; the hunks themselves are omitted): "creates the chat directory and its parents owner-only" ; "clamps an existing world-readable config dir to 0700" ; "does not create a missing config dir" ; "never throws, even when the config dir cannot be resolved" ; "creates the file owner read/write only" ; "replacing a world-readable file leaves it owner-only" ; "async: replacing a world-readable file leaves it owner-only"
+Module & File Purpose (ground-truth documentation from touched files):
+- File `cli/src/index.tsx`:
+```
+// Embed tree-sitter.wasm into the bun-compile binary at a bunfs path the runtime
+// can find. Without this, web-tree-sitter resolves the wasm via require.resolve,
+// which (since 0.25.10's split exports map) returns the build-time absolute path
+// of tree-sitter.cjs and fails on user machines. Must run before the SDK / code-map
+// import chain triggers Parser.init.
+```
+- File `cli/src/utils/config-dir.ts`:
+```
+/**
+ * Resolve the on-disk config directory for the CLI.
+ *
+ * Lives in its own module (depending only on `env`) so that low-level helpers
+ * — e.g. the persistent analytics id — can read the config dir without pulling
+ * in `auth.ts`, which transitively imports the logger and analytics and would
+ * otherwise create an import cycle.
+ */
+```
+- File `cli/src/utils/write-file-atomic.ts`:
+```
+// Unique per-write temp suffix. A plain `${pid}.tmp` collides when a sync
+// exit-flush and an async checkpoint write target the same file concurrently
+// (both share the pid): they'd write and rename the SAME temp path, tearing
+// each other's output. A random component makes every write self-contained.
+```
+Subsystem Architecture Documentation (from nearby package guides):
+- From `cli/README.md`:
+```markdown
+# @codebuff/cli
+
+A Terminal User Interface (TUI) package built with OpenTUI and React.
+
+## Installation
+
+```bash
+bun install
+```
+
+## Development
+
+Run the TUI in development mode:
+
+```bash
+bun run dev
+```
+
+## Testing
+
+Run the test suite:
+
+```bash
+bun test
+```
+
+### Interactive E2E Testing
+
+For testing interactive CLI features, install tmux:
+
+```bash
+# macOS
+brew install tmux
+
+# Ubuntu/Debian
+sudo apt-get install tmux
+
+# Windows (via WSL)
+wsl --install
+sudo apt-get install tmux
+```
+
+Then run the proof-of-concept:
+
+```bash
+bun run test:tmux-poc
+```
+
+[freebuff product prompt text omitted]
+
+```bash
+# ❌ Broken: tmux send-keys -t session "hello"
+# ✅ Works:  tmux send-keys -t session $'\e[200~hello\e[201~'
+```
+
+See [tmux.knowledge.md](tmux.knowledge.md) for comprehensive tmux documentation and [src/__tests__/README.md](src/__tests__/README.md) for testing documentation.
+
+## Build
+
+Build the package:
+
+```bash
+bun run build
+```
+
+## Run
+
+Run the built TUI:
+
+```bash
+bun run start
+```
+
+Or use the binary directly:
+
+```bash
+codebuff-tui
+```
+
+## Features
+```
+Complete Source of Modified Files (for complete module context):
+- File `cli/src/index.tsx` (592 lines):
+```
+#!/usr/bin/env bun
+
+// Embed tree-sitter.wasm into the bun-compile binary at a bunfs path the runtime
+// can find. Without this, web-tree-sitter resolves the wasm via require.resolve,
+// which (since 0.25.10's split exports map) returns the build-time absolute path
+// of tree-sitter.cjs and fails on user machines. Must run before the SDK / code-map
+// import chain triggers Parser.init.
+import './pre-init/tree-sitter-wasm'
+
+import fs from 'fs'
+import os from 'os'
+import path from 'path'
+
+import { AnalyticsEvent } from '@codebuff/common/constants/analytics-events'
+import { getProjectFileTree } from '@codebuff/common/project-file-tree'
+import { getDefaultAgentDirs, getWebsiteUrl } from '@codebuff/sdk'
+import {
+  createCliRenderer,
+  resolveRenderLib,
+  setRenderLibPath,
+} from '@opentui/core'
+import { createRoot } from '@opentui/react'
+import {
+  QueryClient,
+  QueryClientProvider,
+  focusManager,
+} from '@tanstack/react-query'
+import { cyan, green, red, yellow } from 'picocolors'
+import React from 'react'
+
+import { App } from './app'
+import { loadPackageVersion, parseArgs } from './cli-args'
+import { handlePublish } from './commands/publish'
+import { runPlainLogin } from './login/plain-login'
+import { initializeApp } from './init/init-app'
+import { getProjectRoot, setProjectRoot } from './project-files'
+import { trackEvent } from './utils/analytics'
+import { captureCliFunnel } from './utils/cli-product-funnel'
+import { installAiSdkWarningLogger } from './utils/ai-sdk-warnings'
+import {
+  getTrustStorePath,
+  isTruthyOptIn,
+  promptForAgentDirTrust,
+  resolveTrustedAgentDirs,
+} from './utils/agent-dir-trust'
+import {
+  getAuthToken,
+  getAuthTokenDetails,
+  loadStoredAuthToken,
+} from './utils/auth'
+import { resetCodebuffClient } from './utils/codebuff-client'
+import { setApiClientAuthToken } from './utils/codebuff-api'
+import { IS_FREEBUFF } from './utils/constants'
+import { getCliEnv } from './utils/env'
+import { getConfigDir, tightenConfigDirMode } from './utils/config-dir'
+import {
+  bunExtractionTempDir,
+  defaultRenderLibraryCacheDir,
+  ensureRenderLibrary,
+  findEmbeddedRenderLibrary,
+  sweepLeakedRenderLibraryCopies,
+} from './utils/opentui-native-library'
+import { initializeAgentRegistry } from './utils/local-agent-registry'
+import { trimOversizedChatLogs } from './utils/chat-history'
+import { clearLogFile, logger } from './utils/logger'
+import { drainClientLogs } from './utils/log-shipper'
+import { takePreviousFatalCrash } from './utils/fatal-crash-report'
+import { shouldShowProjectPicker } from './utils/project-picker'
+import { saveRecentProject } from './utils/recent-projects'
+import { startEngagementTracking } from './utils/engagement'
+import {
+  CLI_RENDERER_EXIT_SIGNALS,
+  exitCliWithFatalError,
+  installProcessCleanupHandlers,
+} from './utils/renderer-cleanup'
+import { startWindowsMachineProcessCensus } from './utils/helper-process-telemetry'
+import { startTerminalWatchdog } from './utils/terminal-watchdog'
+import { installTerminalProtocolController } from './utils/terminal-protocol-controller'
+import { initializeSkillRegistry } from './utils/skill-registry'
+import { detectTerminalTheme } from './utils/terminal-color-detection'
+import {
+  noteTerminalColorReply,
+  startClientEnvironmentProbe,
+} from './utils/client-environment'
+import { setOscDetectedTheme } from './utils/theme-system'
+
+import type { FileTreeNode } from '@codebuff/common/util/file'
+
+// Configure TanStack Query's focusManager for terminal environments
+// This is required because there's no browser visibility API in terminal apps
+// Without this, refetchInterval won't work because TanStack Query thinks the app is "unfocused"
+focusManager.setEventListener(() => {
+  // No-op: no event listeners in CLI environment (no window focus/visibility events)
+  return () => {}
+})
+focusManager.setFocused(true)
+
+function createQueryClient(): QueryClient {
+  return new QueryClient({
+    defaultOptions: {
+      queries: {
+        staleTime: 5 * 60 * 1000, // 5 minutes - auth tokens don't change frequently
+        gcTime: 10 * 60 * 1000, // 10 minutes - keep cached data a bit longer
+        retry: false, // Don't retry failed auth queries automatically
+        refetchOnWindowFocus: false, // CLI doesn't have window focus
+        refetchOnReconnect: true, // Refetch when network reconnects
+        refetchOnMount: false, // Don't refetch on every mount
+      },
+      mutations: {
+        retry: 1, // Retry mutations once on failure
+      },
+    },
+  })
+}
+
+async function main(): Promise<void> {
+  // CI gate: `<binary> --smoke-tree-sitter` proves the embedded wasm boots
+  // through Parser.init end-to-end. Has to live BEFORE commander.parse() —
+  // an earlier attempt put this in a pre-init module with top-level await,
+  // and on Windows that didn't actually pause module evaluation (commander
+  // still ran first and rejected the unknown flag).
+  if (process.argv.includes('--smoke-tree-sitter')) {
+    const wasmBinary = (
+      globalThis as { __CODEBUFF_TREE_SITTER_WASM_BINARY__?: Uint8Array }
+    ).__CODEBUFF_TREE_SITTER_WASM_BINARY__
+    const wasmPath = (
+      globalThis as { __CODEBUFF_TREE_SITTER_WASM_PATH__?: string }
+    ).__CODEBUFF_TREE_SITTER_WASM_PATH__
+
+    // Diagnostic dump so CI logs (and bug reports) show exactly what
+    // the runtime saw when smoke fails. process.execPath, the
+    // siblingPath we expect, and what's actually in that directory.
+    const fs = await import('fs')
+    const path = await import('path')
+    const execDir = path.dirname(process.execPath)
+    const siblingPath = path.join(execDir, 'tree-sitter.wasm')
+    let dirListing: string[] = []
+    try {
+      dirListing = fs.readdirSync(execDir)
+    } catch (err) {
+      dirListing = [
+        `<readdir failed: ${err instanceof Error ? err.message : err}>`,
+      ]
+    }
+    console.error(
+      `[smoke diag] execPath=${process.execPath}\n` +
+        `[smoke diag] execDir=${execDir}\n` +
+        `[smoke diag] siblingPath=${siblingPath}\n` +
+        `[smoke diag] siblingExists=${fs.existsSync(siblingPath)}\n` +
+        `[smoke diag] dir contents (${dirListing.length}): ${dirListing.slice(0, 30).join(', ')}\n` +
+        `[smoke diag] globalThis wasmPath=${wasmPath ?? '<unset>'}\n` +
+        `[smoke diag] globalThis wasmBinary bytes=${wasmBinary?.byteLength ?? 0}\n`,
+    )
+
+    try {
+      const { Parser } = await import('web-tree-sitter')
+      // Pick the best wasm source available, falling back to the
+      // sibling-of-execPath lookup if pre-init couldn't reach it. By
+      // main() time process.execPath has stabilized to the disk path
+      // even on Windows, where it was the bunfs path during pre-init.
+      let effectiveBinary = wasmBinary
+      let effectivePath = wasmPath
+      if (!effectiveBinary && !effectivePath && fs.existsSync(siblingPath)) {
+        effectivePath = siblingPath
+        effectiveBinary = new Uint8Array(fs.readFileSync(siblingPath))
+      }
+
+      if (effectiveBinary) {
+        await Parser.init({ wasmBinary: effectiveBinary })
+        // Marker grepped by cli/scripts/smoke-binary.ts — keep this exact text.
+        console.log(
+          `tree-sitter smoke ok (wasmBinary, ${effectiveBinary.byteLength} bytes)`,
+        )
+      } else if (effectivePath) {
+        await Parser.init({
+          locateFile: (name: string) =>
+            name === 'tree-sitter.wasm' ? effectivePath! : name,
+        })
+        console.log(`tree-sitter smoke ok (locateFile, path=${effectivePath})`)
+      } else {
+        console.error(
+          'tree-sitter smoke FAIL: no wasm available — pre-init published ' +
+            'nothing and the sibling-of-execPath fallback also missed. See ' +
+            'the diag above for paths.',
+        )
+        process.exit(1)
+      }
+      process.exit(0)
+    } catch (err) {
+      console.error('tree-sitter smoke FAIL:', err)
+      process.exit(1)
+    }
+  }
+
+  // CI gate: `<binary> --smoke-api-url` prints the backend URL the SDK resolved
+  // and exits, so cli/scripts/smoke-binary.ts can prove dotenv files in the CWD
+  // cannot steer it (see --no-compile-autoload-dotenv in build-binary.ts). Must
+  // precede commander.parse(), which rejects unknown flags.
+  if (process.argv.includes('--smoke-api-url')) {
+    // Marker parsed by cli/scripts/smoke-binary.ts — keep this exact prefix.
+    console.log(`api-url smoke: ${getWebsiteUrl()}`)
+    process.exit(0)
+  }
+
+  // Native-Windows release gate. The external harness starts the packaged
+  // binary inside winpty so this exercises a real console, OpenTUI renderer,
+  // console-free broker, Git Bash child, and SDK process lifecycle.
+  // Keep this before commander.parse(), which intentionally knows nothing
+  // about internal smoke-only flags.
+  const terminalBrokerSmokeIndex = process.argv.indexOf(
+    '--smoke-terminal-broker',
+  )
+  const endOfOptionsIndex = process.argv.indexOf('--')
+  const isTerminalBrokerSmoke =
+    terminalBrokerSmokeIndex !== -1 &&
+    (endOfOptionsIndex === -1 || terminalBrokerSmokeIndex < endOfOptionsIndex)
+  if (isTerminalBrokerSmoke) {
+    const resultPath = process.argv[terminalBrokerSmokeIndex + 1]
+    const exchangeDir = process.argv[terminalBrokerSmokeIndex + 2]
+    if (!resultPath || !exchangeDir) {
+      console.error(
+        'terminal broker smoke requires <result-path> <exchange-dir>',
+      )
+      process.exit(2)
+    }
+    const { runPackagedTerminalBrokerSmoke } =
+      await import('./smoke/terminal-command-broker')
+    const exitCode = await runPackagedTerminalBrokerSmoke({
+      resultPath,
+      exchangeDir,
+    })
+    process.exit(exitCode)
+  }
+
+  // Run OSC theme detection BEFORE anything else.
+  // This MUST happen before OpenTUI starts because OSC responses come through stdin,
+  // and OpenTUI also listens to stdin. Running detection here ensures stdin is clean.
+  if (process.stdin.isTTY && process.platform !== 'win32') {
+    try {
+      const oscTheme = await detectTerminalTheme()
+      noteTerminalColorReply(oscTheme !== null)
+      if (oscTheme) {
+        setOscDetectedTheme(oscTheme)
+      }
+    } catch {
+      // Silently ignore OSC detection failures
+    }
+  }
+
+  // Transcripts, run state and prompt history live under the config dir;
+  // keep it owner-only even if it was first created without a mode.
+  tightenConfigDirMode()
+
+  // The Freebuff auth token lives in the OS keychain (auth-token-store.ts):
+  // load it before anything reads the credentials. Bounded and never throws.
+  await loadStoredAuthToken()
+
+  const {
+    initialPrompt,
+    command,
+    agent,
+    clearLogs,
+    continue: continueChat,
+    continueId,
+    cwd,
+    initialMode,
+    trustAgents,
+  } = parseArgs()
+
+  const isLoginCommand = command === 'login'
+  const isPublishCommand = command === 'publish'
+  const hasAgentOverride = Boolean(agent?.trim())
+
+  await initializeApp({ cwd })
+
+  // Set the auth token for the API client
+  setApiClientAuthToken(getAuthToken())
+
+  captureCliFunnel(
+    'launch',
+    'started',
+    {
+      entry_account_state: getAuthToken() ? 'stored_credentials' : 'signed_out',
+    },
+    'launch',
+  )
+
+  // Handle login command before rendering the app
+  if (isLoginCommand) {
+    await runPlainLogin()
+    return
+  }
+
+  // Show project picker only when user starts at the home directory or an ancestor
+  const projectRoot = getProjectRoot()
+  const homeDir = os.homedir()
+  const startCwd = process.cwd()
+  const showProjectPicker = shouldShowProjectPicker(startCwd, homeDir)
+  if (!showProjectPicker)
+    captureCliFunnel(
+      'context',
+      'succeeded',
+      { project_kind: 'local' },
+      'initial',
+    )
+
+  // Requires analytics to be initialized, which is done in initializeApp
+  trackEvent(AnalyticsEvent.APP_LAUNCHED, {
+    version: loadPackageVersion(),
+    platform: process.platform,
+    arch: process.arch,
+    hasInitialPrompt: Boolean(initialPrompt),
+    hasAgentOverride: hasAgentOverride,
+    continueChat,
+    initialMode: initialMode ?? 'DEFAULT',
+    isFreeBuff: IS_FREEBUFF,
+    // The npm wrapper's version, null when not started by one. Wrappers never
+    // update themselves, and only newer ones adopt an update the terminal
+    // closed on, so this splits "pinned build" by install path.
+    launcherVersion:
+      getCliEnv().CODEBUFF_LAUNCHER_VERSION?.slice(0, 32) ?? null,
+  })
+  // The previous launch died on a fatal error and could only leave a local
+  // report on its way out; ship it now (fatal-crash-report.ts).
+  const previousCrash = takePreviousFatalCrash()
+  if (previousCrash) {
+    try {
+      trackEvent(AnalyticsEvent.CLI_FATAL_CRASH, previousCrash)
+      void drainClientLogs()
+    } catch {
+      // Crash telemetry must never block a launch.
+    }
+  }
+  // Start shipping the launch row now, well before the Windows watchdog is
+  // armed. If endpoint security terminates this process during that spawn, the
+  // next --continue launch still has a prior row for the health dashboard's
+  // rapid-resume and interruption joins.
+  if (IS_FREEBUFF && process.platform === 'win32') {
+    void drainClientLogs()
+  }
+
+  // Initialize agent registry (loads user agents via SDK).
+  // When --agent is provided, skip local .agents to avoid overrides.
+  // Repository-scoped .agents directories (cwd and its parent) execute code
+  // on import and spawn mcp.json servers, so they pass the trust gate first;
+  // ~/.agents is the user's own and is always loaded.
+  if (isPublishCommand || !hasAgentOverride) {
+    const { agentDirs, skippedDirs } = await resolveTrustedAgentDirs({
+      candidateDirs: getDefaultAgentDirs(),
+      homeAgentsDir: path.join(os.homedir(), '.agents'),
+      interactive: Boolean(process.stdin.isTTY && process.stdout.isTTY),
+      trustAll:
+        trustAgents || isTruthyOptIn(getCliEnv().CODEBUFF_TRUST_AGENT_DIRS),
+      storePath: getTrustStorePath(),
+      prompt: promptForAgentDirTrust,
+      notify: (message) => {
+        console.log(yellow(message))
+      },
+    })
+    if (skippedDirs.length > 0) {
+      logger.warn(
+        { skippedDirs },
+        '[agents] Untrusted repository .agents directories were not loaded',
+      )
+    }
+    await initializeAgentRegistry({ agentDirs })
+  }
+
+  // Initialize skill registry (loads skills from .agents/skills)
+  await initializeSkillRegistry()
+
+  // Handle publish command before rendering the app
+  if (isPublishCommand) {
+    const publishIndex = process.argv.indexOf('publish')
+    const agentIds = process.argv.slice(publishIndex + 1)
+    const result = await handlePublish(agentIds)
+
+    if (result.success && result.publisherId && result.agents) {
+      logger.info(green('✅ Successfully published:'))
+      for (const agent of result.agents) {
+        logger.info(
+          cyan(
+            `  - ${agent.displayName} (${result.publisherId}/${agent.id}@${agent.version})`,
+          ),
+        )
+      }
+      process.exit(0)
+    } else {
+      logger.error(red('❌ Publish failed'))
+      if (result.error) logger.error(red(`Error: ${result.error}`))
+      if (result.details) logger.error(red(result.details))
+      if (result.hint) logger.warn(yellow(`Hint: ${result.hint}`))
+      process.exit(1)
+    }
+  }
+
+  if (clearLogs) {
+    clearLogFile()
+  }
+
+  // Reclaim disk from oversized debug logs left by older versions that logged
+  // the full conversation to log.jsonl. Deferred to keep the stat sweep over
+  // chat directories off the startup path.
+  setTimeout(trimOversizedChatLogs, 0)
+
+  const queryClient = createQueryClient()
+
+  const AppWithAsyncAuth = () => {
+    const [requireAuth, setRequireAuth] = React.useState<boolean | null>(null)
+    const [hasInvalidCredentials, setHasInvalidCredentials] =
+      React.useState(false)
+    const [fileTree, setFileTree] = React.useState<FileTreeNode[]>([])
+    const [currentProjectRoot, setCurrentProjectRoot] =
+      React.useState(projectRoot)
+    const [showProjectPickerScreen, setShowProjectPickerScreen] =
+      React.useState(showProjectPicker)
+
+    React.useEffect(() => {
+      const apiKey = getAuthTokenDetails().token ?? ''
+
+      if (!apiKey) {
+        setRequireAuth(true)
+        setHasInvalidCredentials(false)
+        return
+      }
+
+      setHasInvalidCredentials(true)
+      setRequireAuth(false)
+    }, [])
+
+    const loadFileTree = React.useCallback(async (root: string) => {
+      try {
+        if (root) {
+          const tree = await getProjectFileTree({
+            projectRoot: root,
+            fs: fs.promises,
+          })
+          setFileTree(tree)
+        }
+      } catch (error) {
+        // Silently fail - fileTree is optional for @ menu
+      }
+    }, [])
+
+    React.useEffect(() => {
+      loadFileTree(currentProjectRoot)
+    }, [currentProjectRoot, loadFileTree])
+
+    // Callback for when user selects a new project from the picker
+    const handleProjectChange = React.useCallback(
+      async (newProjectPath: string) => {
+        // Change process working directory
+        process.chdir(newProjectPath)
+        captureCliFunnel('context', 'succeeded', { project_kind: 'folder' })
+
+        // Track directory change (avoid logging full paths for privacy)
+        const isGitRepo = fs.existsSync(path.join(newProjectPath, '.git'))
+        const pathDepth = newProjectPath.split(path.sep).filter(Boolean).length
+        trackEvent(AnalyticsEvent.CHANGE_DIRECTORY, {
+          isGitRepo,
+          pathDepth,
+          isHomeDir: newProjectPath === os.homedir(),
+        })
+        // Update the project root in the module state
+        setProjectRoot(newProjectPath)
+        // Reset client to ensure tools use the updated project root
+        resetCodebuffClient()
+        // Save to recent projects list
+        saveRecentProject(newProjectPath)
+        // Update local state
+        setCurrentProjectRoot(newProjectPath)
+        // Reset file tree state to trigger reload
+        setFileTree([])
+        // Hide the picker and show the chat
+        setShowProjectPickerScreen(false)
+      },
+      [],
+    )
+
+    return (
+      <App
+        initialPrompt={initialPrompt}
+        agentId={agent}
+        requireAuth={requireAuth}
+        hasInvalidCredentials={hasInvalidCredentials}
+        fileTree={fileTree}
+        continueChat={continueChat}
+        continueChatId={continueId ?? undefined}
+        initialMode={initialMode}
+        showProjectPicker={showProjectPickerScreen}
+        onProjectChange={handleProjectChange}
+      />
+    )
+  }
+
+  // Install early error handlers BEFORE renderer creation.
+  // If the renderer crashes during init, these ensure the error is visible
+  // by exiting the alternate screen buffer before printing the error.
+  const earlyFatalHandler = (error: unknown) =>
+    exitCliWithFatalError('Fatal error during startup', error)
+  process.on('uncaughtException', earlyFatalHandler)
+  process.on('unhandledRejection', earlyFatalHandler)
+
+  // Last line of defense for uncatchable deaths (SIGKILL, native crashes,
+  // kill sweeps that also take out the npm wrapper): a detached process
+  // (sh on POSIX, PowerShell on Windows) that resets the terminal when this
+  // process disappears. Started before the renderer begins enabling terminal
+  // modes; the clean-shutdown path (renderer-cleanup) disarms it.
+  startTerminalWatchdog()
+  // Windows only: count powershell/conhost/bash/cmd machine-wide every ten
+  // minutes and report a flood (cli.helper_process_flood) — the symptom users
+  // see in Task Manager, which nothing server-side can observe.
+  startWindowsMachineProcessCensus()
+  // Background, one-time; the descriptor reads `unknown` until it resolves.
+  if (IS_FREEBUFF) void startClientEnvironmentProbe()
+
+  // The SDK defaults to process.emitWarning(), which bypasses OpenTUI's
+  // console capture and overwrites whichever terminal rows were last drawn.
+  const restoreAiSdkWarnings = installAiSdkWarningLogger((warnings) =>
+    logger.warn(warnings, 'AI SDK warning'),
+  )
+  // Load the native renderer up front, so a temp directory that is full,
+  // read-only or noexec gets a fallback copy and, failing that, an actionable
+  // message instead of "Failed to initialize OpenTUI render library".
+  const renderLibrarySource = await ensureRenderLibrary({
+    resolve: resolveRenderLib,
+    setPath: setRenderLibPath,
+    embeddedFiles: () => Bun.embeddedFiles,
+    cacheDir: () => defaultRenderLibraryCacheDir(getConfigDir()),
+    tempDir: () => bunExtractionTempDir(),
+  })
+  if (renderLibrarySource === 'cache') {
+    logger.warn(
+      { tempDir: bunExtractionTempDir() },
+      'Loaded the terminal renderer from the config directory: the temp directory copy failed',
+    )
+  }
+  // Bun leaves a full copy of the renderer library in the temp directory on
+  // every launch; reclaim older ones off the startup path.
+  setTimeout(() => {
+    const library = findEmbeddedRenderLibrary(Bun.embeddedFiles)
+    if (!library) return
+    void sweepLeakedRenderLibraryCopies({
+      library,
+      tempDir: bunExtractionTempDir(),
+    })
+      .then(({ removed, bytes }) => {
+        if (removed > 0) {
+          logger.info(
+            { removed, bytes },
+            'Removed stale renderer library copies from the temp directory',
+          )
+        }
+      })
+      .catch(() => {})
+  }, 0)
+  const renderer = await createCliRenderer({
+    backgroundColor: 'transparent',
+    exitOnCtrlC: false,
+    exitSignals: CLI_RENDERER_EXIT_SIGNALS,
+    screenMode: 'alternate-screen',
+  })
+  renderer.once('destroy', restoreAiSdkWarnings)
+
+  // Install the renderer-aware handlers before removing the startup safety net
+  // so an installation failure still restores the terminal and reports itself.
+  installProcessCleanupHandlers(renderer)
+  const terminalProtocols = installTerminalProtocolController(renderer, {
+    onError: (error) =>
+      logger.debug(error, 'Terminal protocol transition failed'),
+  })
+  renderer.once('destroy', () => terminalProtocols.dispose())
+  process.removeListener('uncaughtException', earlyFatalHandler)
+  process.removeListener('unhandledRejection', earlyFatalHandler)
+
+  // Start the engaged-time heartbeat only once the interactive TUI is actually
+  // live — reaching renderer creation means this is a real session (the
+  // login/publish/smoke-test commands all exit earlier). Freebuff-only, matching
+  // the MESSAGE_SENT DAU signal. Stopped in exitCliCleanly().
+  if (IS_FREEBUFF) {
+    startEngagementTracking()
+  }
+
+  createRoot(renderer).render(
+    <QueryClientProvider client={queryClient}>
+      <AppWithAsyncAuth />
+    </QueryClientProvider>,
+  )
+}
+
+void main()
+```
+- File `cli/src/project-files.ts` (111 lines):
+```
+import { mkdirSync, readdirSync, statSync } from 'fs'
+import path from 'path'
+
+import { getConfigDir } from './utils/auth'
+import { IS_FREEBUFF } from './utils/constants'
+import { ensureSponsoredProjectIdentity } from './utils/sponsored-project-identity'
+
+let projectRoot: string | undefined
+let currentChatId: string | undefined
+
+function ensureChatDirectory(dir: string) {
+  // Owner-only: chat directories hold transcripts and run state.
+  mkdirSync(dir, { recursive: true, mode: 0o700 })
+}
+
+export function setProjectRoot(dir: string) {
+  projectRoot = dir
+  // Project selection is the normal lifecycle owner for the workspace
+  // identity. Sponsored polling only ever reads this marker. Freebuff writes
+  // it in every Git project, because an in-place sponsored offer is keyed to
+  // the folder rather than to `owner/repo` (#3989).
+  ensureSponsoredProjectIdentity(dir, { everyRepository: IS_FREEBUFF })
+  return projectRoot
+}
+
+export function getProjectRoot() {
+  if (!projectRoot) {
+    throw new Error('Project root not set')
+  }
+  return projectRoot
+}
+
+export function tryGetProjectRoot() {
+  return projectRoot
+}
+
+export function getCurrentChatId() {
+  if (!currentChatId) {
+    currentChatId = new Date().toISOString().replace(/:/g, '-')
+  }
+  return currentChatId
+}
+
+export function setCurrentChatId(chatId: string) {
+  currentChatId = chatId
+  return currentChatId
+}
+
+export function startNewChat() {
+  currentChatId = new Date().toISOString().replace(/:/g, '-')
+  return currentChatId
+}
+
+// Get the project-specific data directory
+export function getProjectDataDir(): string {
+  const root = getProjectRoot()
+  if (!root) {
+    throw new Error('Project root not set')
+  }
+
+  const baseName = path.basename(root)
+  const baseDir = path.join(getConfigDir(), 'projects', baseName)
+
+  return baseDir
+}
+
+/**
+ * Find the most recent chat directory based on modification time
+ * Returns null if no chat directories exist
+ */
+export function getMostRecentChatDir(): string | null {
+  try {
+    const chatsDir = path.join(getProjectDataDir(), 'chats')
+    if (!statSync(chatsDir, { throwIfNoEntry: false })) {
+      return null
+    }
+
+    const chatDirs = readdirSync(chatsDir)
+      .map((name) => {
+        const fullPath = path.join(chatsDir, name)
+        try {
+          const stat = statSync(fullPath)
+          return { name, fullPath, mtime: stat.mtime }
+        } catch {
+          return null
+        }
+      })
+      .filter(
+        (item): item is { name: string; fullPath: string; mtime: Date } =>
+          item !== null && statSync(item.fullPath).isDirectory(),
+      )
+
+    if (chatDirs.length === 0) {
+      return null
+    }
+
+    // Sort by modification time, most recent first
+    chatDirs.sort((a, b) => b.mtime.getTime() - a.mtime.getTime())
+    return chatDirs[0].fullPath
+  } catch {
+    return null
+  }
+}
+
+export function getCurrentChatDir(): string {
+  const chatId = getCurrentChatId()
+  const dir = path.join(getProjectDataDir(), 'chats', chatId)
+  ensureChatDirectory(dir)
+  return dir
+}
+```
+- File `cli/src/utils/config-dir.ts` (66 lines):
+```
+import fs from 'fs'
+import os from 'os'
+import path from 'path'
+
+import { env } from '@codebuff/common/env'
+
+import { getCliEnv } from './env'
+
+/**
+ * Resolve the on-disk config directory for the CLI.
+ *
+ * Lives in its own module (depending only on `env`) so that low-level helpers
+ * — e.g. the persistent analytics id — can read the config dir without pulling
+ * in `auth.ts`, which transitively imports the logger and analytics and would
+ * otherwise create an import cycle.
+ */
+export const getConfigDir = (): string => {
+  const configuredDir = getCliEnv().FREEBUFF_CONFIG_DIR
+  if (configuredDir) {
+    if (!path.isAbsolute(configuredDir)) {
+      throw new Error(
+        'FREEBUFF_CONFIG_DIR must be an absolute path so CLI settings cannot be written relative to the current project.',
+      )
+    }
+    return configuredDir
+  }
+
+  return path.join(
+    os.homedir(),
+    '.config',
+    'manicode' +
+      // on a development stack?
+      (env.NEXT_PUBLIC_CB_ENVIRONMENT !== 'prod'
+        ? `-${env.NEXT_PUBLIC_CB_ENVIRONMENT}`
+        : ''),
+  )
+}
+
+/** Owner-only, matching the mode `auth.ts` creates the directory with. */
+const CONFIG_DIR_MODE = 0o700
+
+/**
+ * Best-effort: clamp an existing config directory to owner-only.
+ *
+ * `mkdir` applies its mode only when it creates the directory, so a config
+ * dir first created by something other than login (prompt history, a chat
+ * directory, an older CLI) can be 0755, leaving transcripts, run state and
+ * prompt history under it readable by other users on a shared host. Run once
+ * at startup. Does not create the directory. Skipped on Windows, where POSIX
+ * mode bits do not apply. Never throws.
+ */
+export const tightenConfigDirMode = (configDir?: string): void => {
+  if (process.platform === 'win32') return
+  try {
+    // Resolved inside the try: a relative FREEBUFF_CONFIG_DIR throws here.
+    const dir = configDir ?? getConfigDir()
+    const stat = fs.statSync(dir, { throwIfNoEntry: false })
+    if (!stat?.isDirectory()) return
+    if ((stat.mode & 0o777) !== CONFIG_DIR_MODE) {
+      fs.chmodSync(dir, CONFIG_DIR_MODE)
+    }
+  } catch {
+    // Not ours to fail startup over (e.g. a directory owned by another user).
+  }
+}
+```
+- File `cli/src/utils/message-history.ts` (154 lines):
+```
+import { randomUUID } from 'crypto'
+import fs from 'fs'
+import path from 'path'
+
+import { getConfigDir } from './auth'
+import { formatTimestamp } from './helpers'
+import { logger } from './logger'
+
+import type {
+  ChatMessage,
+  ContentBlock,
+  FileAttachment,
+  ImageAttachment,
+  TextAttachment,
+} from '../types/chat'
+
+const MAX_HISTORY_SIZE = 1000
+
+export function getUserMessage(
+  message: string | ContentBlock[],
+  attachments?: ImageAttachment[],
+  textAttachments?: TextAttachment[],
+  fileAttachments?: FileAttachment[],
+): ChatMessage {
+  return {
+    id: `user-${Date.now()}`,
+    variant: 'user',
+    ...(typeof message === 'string'
+      ? {
+          content: message,
+        }
+      : {
+          content: '',
+          blocks: message,
+        }),
+    timestamp: formatTimestamp(),
+    ...(attachments && attachments.length > 0 ? { attachments } : {}),
+    ...(textAttachments && textAttachments.length > 0
+      ? { textAttachments }
+      : {}),
+    ...(fileAttachments && fileAttachments.length > 0
+      ? { fileAttachments }
+      : {}),
+  }
+}
+
+export function getSystemMessage(
+  content: string | ContentBlock[],
+): ChatMessage {
+  return {
+    id: `sys-${Date.now()}`,
+    variant: 'ai' as const,
+    ...(typeof content === 'string'
+      ? {
+          content,
+        }
+      : {
+          content: '',
+          blocks: content,
+        }),
+    timestamp: formatTimestamp(),
+  }
+}
+
+/**
+ * Get the message history file path
+ */
+export const getMessageHistoryPath = (): string => {
+  return path.join(getConfigDir(), 'message-history.json')
+}
+
+/**
+ * Load message history from file system
+ * @returns Array of previous messages, most recent last
+ */
+export const loadMessageHistory = (): string[] => {
+  const historyPath = getMessageHistoryPath()
+
+  if (!fs.existsSync(historyPath)) {
+    return []
+  }
+
+  try {
+    const historyFile = fs.readFileSync(historyPath, 'utf8')
+    const history = JSON.parse(historyFile)
+
+    if (!Array.isArray(history)) {
+      logger.warn('Message history file has invalid format, resetting')
+      return []
+    }
+
+    return history.filter((item) => typeof item === 'string')
+  } catch (error) {
+    logger.error(
+      {
+        error: error instanceof Error ? error.message : String(error),
+      },
+      'Error reading message history',
+    )
+    return []
+  }
+}
+
+/**
+ * Save message history to file system
+ */
+export const saveMessageHistory = (
+  history: string[],
+  fileSystem: Pick<
+    typeof fs,
+    'existsSync' | 'mkdirSync' | 'writeFileSync' | 'renameSync' | 'rmSync'
+  > = fs,
+): void => {
+  const configDir = getConfigDir()
+  const historyPath = getMessageHistoryPath()
+  const tempPath = `${historyPath}.${process.pid}.${randomUUID()}.tmp`
+
+  try {
+    // Ensure config directory exists
+    if (!fileSystem.existsSync(configDir)) {
+      fileSystem.mkdirSync(configDir, { recursive: true, mode: 0o700 })
+    }
+
+    // Limit history size to prevent file from growing too large
+    const limitedHistory =
+      history.length > MAX_HISTORY_SIZE
+        ? history.slice(history.length - MAX_HISTORY_SIZE)
+        : history
+
+    // Save history
+    fileSystem.writeFileSync(
+      tempPath,
+      JSON.stringify(limitedHistory, null, 2),
+      {
+        flag: 'wx',
+        // Owner-only: prompt history is everything the user has typed.
+        mode: 0o600,
+      },
+    )
+    fileSystem.renameSync(tempPath, historyPath)
+  } catch (error) {
+    try {
+      fileSystem.rmSync(tempPath, { force: true })
+    } catch {}
+    logger.error(
+      {
+        error: error instanceof Error ? error.message : String(error),
+      },
+      'Error saving message history',
+    )
+    // Don't throw - history persistence is not critical
+  }
+}
+```
+- File `cli/src/utils/run-state-storage.ts` (679 lines):
+```
+import * as fs from 'fs'
+import path from 'path'
+import { randomUUID } from 'node:crypto'
+
+import {
+  getCurrentChatDir,
+  getMostRecentChatDir,
+  getProjectDataDir,
+} from '../project-files'
+import {
+  CHAT_MESSAGES_FILENAME,
+  writeChatMeta,
+} from './chat-meta'
+import { logger } from './logger'
+import { classifyStringifyError, serializeForPersistence } from './safe-json'
+import { writeFileAtomic, writeFileAtomicAsync } from './write-file-atomic'
+
+import type { ChatMessage } from '../types/chat'
+import type { RunState } from '@codebuff/sdk'
+
+const RUN_STATE_FILENAME = 'run-state.json'
+
+type SavedChatState = {
+  runState: RunState
+  messages: ChatMessage[]
+  chatId?: string
+}
+
+type LiveChatState = {
+  runState: RunState
+  messages: ChatMessage[]
+}
+
+let liveChatStateProvider: {
+  ownerId: string
+  chatDir: string
+  provide: () => LiveChatState | null
+} | null = null
+
+/**
+ * Register a provider for the in-flight chat state. While a run is active,
+ * exit paths call flushLiveChatState() to persist the latest checkpoint so a
+ * quit/crash doesn't lose the turn. ownerId ties the provider to a specific
+ * run so a stale run can't clear a newer run's provider. The chat directory
+ * is captured at registration time so a later chat switch can't redirect the
+ * flush into a different chat's directory.
+ */
+export function setLiveChatStateProvider(
+  ownerId: string,
+  provide: () => LiveChatState | null,
+): void {
+  liveChatStateProvider = { ownerId, chatDir: resolveCurrentChatDir(), provide }
+}
+
+export function clearLiveChatStateProvider(ownerId: string): void {
+  if (liveChatStateProvider?.ownerId === ownerId) {
+    liveChatStateProvider = null
+  }
+}
+
+/**
+ * Synchronously persist the in-flight chat state, if any. Safe to call from
+ * process exit/signal handlers (saveChatState uses writeFileSync).
+ */
+export function flushLiveChatState(): void {
+  try {
+    // The process is exiting, so the async drain will never get to run:
+    // write any queued checkpoints synchronously first. Each is bound to the
+    // chat dir captured when it was scheduled. The live provider below may
+    // overwrite one of these with strictly newer state — that order is
+    // intentional.
+    for (const [chatDir, state] of pendingCheckpoints) {
+      saveChatState(state.runState, state.messages, chatDir)
+    }
+    pendingCheckpoints.clear()
+
+    const provider = liveChatStateProvider
+    if (!provider) {
+      return
+    }
+    // The provider reads live store state. Once the user has switched to a
+    // different chat (/new, resuming from /history), that state no longer
+    // matches the provider's chat directory — flushing would overwrite the
+    // run's chat with another conversation's messages. Skip instead; the
+    // run's last checkpoint was flushed from the queue above.
+    if (provider.chatDir !== resolveCurrentChatDir()) {
+      return
+    }
+    const state = provider.provide()
+    if (state) {
+      saveChatState(state.runState, state.messages, provider.chatDir)
+    }
+  } catch {
+    // Best-effort - never block process exit.
+  }
+}
+
+// Test-only escape hatch: persistence normally resolves the chat directory
+// through project-files (under the user's real config dir). Tests point it at
+// a temp directory instead of mocking module internals — mock.module leaks
+// across bun test files and os.homedir() ignores $HOME on macOS, so both of
+// those seams are unreliable (see docs/testing.md: DI over module mocking).
+let chatDirOverride: string | undefined
+
+export function setChatDirOverrideForTesting(dir: string | undefined): void {
+  chatDirOverride = dir
+}
+
+/**
+ * Resolve the directory of the currently active chat. Persistence callers
+ * must capture this at the moment the state is captured (run start, snapshot
+ * time) and pass it through to the save — resolving it again at write time
+ * races with chat switches (/new, resuming from /history) and would write one
+ * chat's transcript into another chat's directory.
+ */
+export function resolveCurrentChatDir(): string {
+  if (chatDirOverride) {
+    fs.mkdirSync(chatDirOverride, { recursive: true, mode: 0o700 })
+    return chatDirOverride
+  }
+  return getCurrentChatDir()
+}
+
+// Chat-state saves fail in prod for reasons that are chronic, not transient:
+// a transcript with a cyclic or over-string-limit payload fails identically on
+// every 5s checkpoint, and a full disk stays full. Logging each attempt at
+// error level made this a top-3 error by volume (~19k/day). Instead, each
+// distinct issue per chat dir is logged at most once per interval, and
+// environment/payload failures log as warnings — only genuinely unexpected
+// errors keep the error level.
+const SAVE_LOG_INTERVAL_MS = 5 * 60 * 1000
+const saveIssueLastLoggedAt = new Map<string, number>()
+
+function shouldLogSaveIssue(key: string): boolean {
+  const now = Date.now()
+  const last = saveIssueLastLoggedAt.get(key)
+  if (last !== undefined && now - last < SAVE_LOG_INTERVAL_MS) {
+    return false
+  }
+  saveIssueLastLoggedAt.set(key, now)
+  return true
+}
+
+/**
+ * Logging must never break persistence: these paths run inside checkpoint
+ * drains and exit flushes, where a throwing logger (e.g. analytics transport
+ * not initialized) would otherwise lose the save or reject the drain.
+ */
+function bestEffortLog(
+  level: 'warn' | 'error',
+  payload: Record<string, unknown>,
+  message: string,
+): void {
+  try {
+    logger[level](payload, message)
+  } catch {
+    // Best-effort only.
+  }
+}
+
+type SaveErrorClass = 'cyclic' | 'oom' | 'disk' | 'other'
+
+function classifySaveError(error: unknown): SaveErrorClass {
+  const fromStringify = classifyStringifyError(error)
+  if (fromStringify) return fromStringify
+  const msg = error instanceof Error ? error.message : String(error)
+  // Environmental filesystem failures: retrying won't help and there is
+  // nothing to fix server-side (full disk, AV holding a rename lock, etc.).
+  if (/ENOSPC|EDQUOT|EROFS|EPERM|EACCES|EBUSY|EMFILE|ENFILE/.test(msg)) {
+    return 'disk'
+  }
+  return 'other'
+}
+
+/** Cheap shape summary so a failure log says what the payload looked like.
+ *  Tolerates a non-array `messages`: this runs only when the state is already
+ *  suspect, and a diagnostic that throws on the shape it exists to describe
+ *  just replaces the real failure with its own. */
+function chatShapeSummary(runState: RunState, messages: ChatMessage[]) {
+  const list = Array.isArray(messages) ? messages : []
+  let blockCount = 0
+  for (const message of list) {
+    blockCount += message?.blocks?.length ?? 0
+  }
+  return {
+    messageCount: Array.isArray(messages) ? messages.length : null,
+    blockCount,
+    runStateKeys:
+      runState && typeof runState === 'object'
+        ? Object.keys(runState as object).slice(0, 20)
+        : [],
+  }
+}
+
+type SerializedChatState = {
+  runStateJson?: string
+  messagesJson?: string
+}
+
+/** The one character each file's JSON must start with. */
+const CHAT_STATE_JSON_PREFIX = { runState: '{', messages: '[' } as const
+
+/**
+ * Refuse to persist anything that is not the document the file is supposed to
+ * hold. `JSON.stringify` answers the four-byte string `null` for null, NaN and
+ * a value whose toJSON returns nothing, and `undefined` for undefined — and
+ * `'null'` is *truthy*, so it sailed through the `if (serialized.messagesJson)`
+ * guard below and replaced a user's whole transcript with the literal text
+ * `null`, with no crash involved. On the next load that parses to null and
+ * reads as "no transcript". Writing nothing leaves the previous good file in
+ * place, which is always the better of the two outcomes.
+ */
+// Returns a plain boolean, not a `json is string` predicate: the caller's
+// `json` is already typed `string`, so a predicate narrows the negative branch
+// to `never` and the defensive `typeof` checks in the refusal log stop
+// compiling. The runtime check stays, because SerializeResult's `string` comes
+// from JSON.stringify's lib type, which answers `undefined` for undefined.
+function isPersistableJson(
+  json: unknown,
+  part: 'runState' | 'messages',
+): boolean {
+  return (
+    typeof json === 'string' && json.startsWith(CHAT_STATE_JSON_PREFIX[part])
+  )
+}
+
+/**
+ * Serialize the two chat-state files independently, so a poisoned run state
+ * cannot block persisting the transcript (and vice versa). Cyclic and
+ * over-limit payloads are rescued by serializeForPersistence's fallback pass;
+ * the fallback diagnostics (cycle paths, truncation counts) are logged so the
+ * source of a bad payload can be found from prod logs.
+ */
+function serializeChatState(
+  runState: RunState,
+  messages: ChatMessage[],
+  chatDir: string,
+): SerializedChatState {
+  const result: SerializedChatState = {}
+  for (const part of ['runState', 'messages'] as const) {
+    const value = part === 'runState' ? runState : messages
+    try {
+      const { json, fallback } = serializeForPersistence(value)
+      if (!isPersistableJson(json, part)) {
+        // Rate-limited like every other save issue, but logged at error level:
+        // this is a bug in whatever handed us the state, and until ticket #180
+        // nothing reported it.
+        if (shouldLogSaveIssue(`${chatDir}|nonpersistable|${part}`)) {
+          bestEffortLog(
+            'error',
+            {
+              part,
+              // The first character and the length only. Anything more could
+              // be the user's prompt text, and this is a diagnostic.
+              jsonType: typeof json,
+              jsonPrefix: typeof json === 'string' ? json.slice(0, 1) : null,
+              jsonBytes: typeof json === 'string' ? json.length : null,
+              ...chatShapeSummary(runState, messages),
+            },
+            'Refusing to persist non-document chat state (keeping the file on disk)',
+          )
+        }
+        continue
+      }
+      if (part === 'runState') {
+        result.runStateJson = json
+      } else {
+        result.messagesJson = json
+      }
+      if (fallback && shouldLogSaveIssue(`${chatDir}|fallback|${part}`)) {
+        bestEffortLog(
+          'warn',
+          {
+            part,
+            reason: fallback.reason,
+            cyclePaths: fallback.cyclePaths,
+            truncatedStrings: fallback.truncatedStrings,
+            jsonBytes: json.length,
+            ...chatShapeSummary(runState, messages),
+          },
+          'Chat state serialized via fallback (broke cycles or truncated oversized strings)',
+        )
+      }
+    } catch (error) {
+      const errorClass = classifySaveError(error)
+      if (shouldLogSaveIssue(`${chatDir}|serialize|${part}|${errorClass}`)) {
+        bestEffortLog(
+          errorClass === 'other' ? 'error' : 'warn',
+          {
+            part,
+            errorClass,
+            error: error instanceof Error ? error.message : String(error),
+            ...chatShapeSummary(runState, messages),
+          },
+          'Failed to serialize chat state',
+        )
+      }
+    }
+  }
+  return result
+}
+
+function logSaveWriteFailure(
+  error: unknown,
+  chatDir: string,
+  message: string,
+): void {
+  const errorClass = classifySaveError(error)
+  if (!shouldLogSaveIssue(`${chatDir}|write|${errorClass}`)) {
+    return
+  }
+  bestEffortLog(
+    errorClass === 'other' ? 'error' : 'warn',
+    {
+      errorClass,
+      error: error instanceof Error ? error.message : String(error),
+    },
+    message,
+  )
+}
+
+/**
+ * Save both the RunState and ChatMessage[] to disk.
+ *
+ * `chatDir` should be captured when the state itself is captured (e.g. at run
+ * start) and passed through. Defaulting to the current chat dir is only safe
+ * when the caller knows no chat switch can have happened in between.
+ */
+export function saveChatState(
+  runState: RunState,
+  messages: ChatMessage[],
+  chatDir: string = resolveCurrentChatDir(),
+): void {
+  // Compact JSON: these files are rewritten on every checkpoint and grow to
+  // multiple MB; pretty-printing roughly doubles the write.
+  const serialized = serializeChatState(runState, messages, chatDir)
+  if (!serialized.runStateJson && !serialized.messagesJson) {
+    return
+  }
+  try {
+    // The dir existed when the save was captured, but may have been removed
+    // since (e.g. the chat deleted from /history mid-run).
+    fs.mkdirSync(chatDir, { recursive: true, mode: 0o700 })
+    if (serialized.runStateJson) {
+      writeFileAtomic(
+        path.join(chatDir, RUN_STATE_FILENAME),
+        serialized.runStateJson,
+      )
+    }
+    if (serialized.messagesJson) {
+      writeFileAtomic(
+        path.join(chatDir, CHAT_MESSAGES_FILENAME),
+        serialized.messagesJson,
+      )
+      // Sidecar summary so /history can list this chat without parsing the
+      // (unbounded) chat-messages.json. Must be written after the messages
+      // file: it records the file's size/mtime to detect staleness.
+      writeChatMeta(chatDir, messages)
+    }
+  } catch (error) {
+    logSaveWriteFailure(error, chatDir, 'Failed to save chat state')
+  }
+}
+
+/**
+ * Async counterpart to saveChatState. Serializes and writes off the caller's
+ * tick so a multi-MB transcript doesn't block the CLI's render/input thread.
+ */
+async function saveChatStateAsync(
+  runState: RunState,
+  messages: ChatMessage[],
+  chatDir: string,
+): Promise<void> {
+  const serialized = serializeChatState(runState, messages, chatDir)
+  if (!serialized.runStateJson && !serialized.messagesJson) {
+    return
+  }
+  try {
+    await fs.promises.mkdir(chatDir, { recursive: true })
+    if (serialized.runStateJson) {
+      await writeFileAtomicAsync(
+        path.join(chatDir, RUN_STATE_FILENAME),
+        serialized.runStateJson,
+      )
+    }
+    if (serialized.messagesJson) {
+      await writeFileAtomicAsync(
+        path.join(chatDir, CHAT_MESSAGES_FILENAME),
+        serialized.messagesJson,
+      )
+      // Sidecar summary so /history can list this chat without parsing the
+      // (unbounded) chat-messages.json. Written after the messages file: it
+      // records that file's size/mtime to detect staleness. The meta write is
+      // tiny, so keeping it synchronous here is fine.
+      writeChatMeta(chatDir, messages)
+    }
+  } catch (error) {
+    logSaveWriteFailure(error, chatDir, 'Failed to save chat state (async)')
+  }
+}
+
+// In-flight checkpoint writer. The SDK emits an onStateSnapshot roughly every
+// 5s at step boundaries while a run streams; the CLI used to persist each one
+// synchronously (cloneDeep in the SDK + two multi-MB JSON.stringify + two
+// blocking disk writes on the CLI), all on the render/input thread. In long
+// sessions that periodic stall is what users experience as "freezes". Instead,
+// schedule the write asynchronously and collapse bursts to a single in-flight
+// write, always persisting the latest state.
+// Coalesced per chat directory: a burst of checkpoints for the same chat
+// collapses to the latest, but a checkpoint for one chat can never displace a
+// still-queued checkpoint for another (e.g. the final flush of a chat the
+// user just switched away from).
+const pendingCheckpoints = new Map<string, LiveChatState>()
+let checkpointDrain: Promise<void> | null = null
+
+async function drainCheckpoints(): Promise<void> {
+  while (pendingCheckpoints.size > 0) {
+    // Yield first so serialization never runs on the same tick that scheduled
+    // us (that tick is often mid-render or handling a keystroke). Entries stay
+    // in the map while we yield, so the synchronous exit flush can still write
+    // them if the process quits before we resume.
+    await new Promise<void>((resolve) => setImmediate(resolve))
+    const entry = pendingCheckpoints.entries().next()
+    if (entry.done) {
+      break
+    }
+    const [chatDir, state] = entry.value
+    pendingCheckpoints.delete(chatDir)
+    // Write to the chat dir captured at schedule time: the current chat may
+    // have rotated (/new, /history resume) while this write sat in the queue,
+    // and resolving the dir here would dump this state into the wrong chat.
+    await saveChatStateAsync(state.runState, state.messages, chatDir)
+  }
+}
+
+/**
+ * Schedule an asynchronous, coalescing checkpoint save. Safe to call at a high
+ * rate: only one write runs at a time and intermediate states are dropped in
+ * favor of the latest (per chat). Use this for periodic in-flight checkpoints;
+ * use the synchronous saveChatState for one-shot authoritative saves (turn
+ * completion, exit flush).
+ */
+export function scheduleCheckpointSave(
+  runState: RunState,
+  messages: ChatMessage[],
+  chatDir: string = resolveCurrentChatDir(),
+): void {
+  pendingCheckpoints.set(chatDir, { runState, messages })
+  if (!checkpointDrain) {
+    checkpointDrain = drainCheckpoints().finally(() => {
+      checkpointDrain = null
+    })
+  }
+}
+
+/**
+ * Wait until all queued/in-flight checkpoint writes have flushed. Call this
+ * before an authoritative synchronous save (turn completion / error) so that a
+ * still-running async write can't land after — and clobber — the final state.
+ * Relies on the run having stopped scheduling checkpoints (the SDK's snapshot
+ * timer stops once the run settles), so the queue reaches idle.
+ */
+export async function settleCheckpointSave(): Promise<void> {
+  await checkpointDrain
+}
+
+type PersistedChatFile = {
+  /** The parsed document, or null when there was nothing usable to restore. */
+  value: unknown
+  outcome: 'ok' | 'missing' | 'damaged' | 'unpreserved' | 'unreadable'
+}
+
+/**
+ * Read one chat-state file, and set its bytes aside before anything can
+ * replace them.
+ *
+ * Substituting an empty transcript for an unreadable one used to be a one-way
+ * door: the load returned `messages: []`, the next turn's save wrote that empty
+ * array straight back over the file, and a transcript that a human (or a later
+ * fix) could still have read was gone. A partial write, a half-flushed file or
+ * a shape we simply do not recognise are all recoverable by hand — but only
+ * while the bytes exist. So quarantine first, exactly as
+ * freebuff-desktop's session journal and state file do, and only then let the
+ * caller carry on with a fallback.
+ *
+ * Quarantining happens on the read, not the write: the writer would have to
+ * re-read and re-parse a multi-MB transcript on every 5s checkpoint to notice,
+ * and the read is already the moment we know the file is unusable.
+ *
+ * A file that parses but is not the right kind of document counts as damaged.
+ * Four bytes of `null` parse perfectly well into `null`, and that is the exact
+ * artifact support ticket #180 reported — it must be preserved too, not nodded
+ * through as "no messages".
+ */
+function readPersistedChatFile(
+  filePath: string,
+  part: 'runState' | 'messages',
+): PersistedChatFile {
+  let raw: string
+  try {
+    raw = fs.readFileSync(filePath, 'utf8')
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code
+    if (code === 'ENOENT') {
+      return { value: null, outcome: 'missing' }
+    }
+    // EACCES, EISDIR, EIO: there may be perfectly good bytes behind this, and
+    // we cannot even copy them. Do not touch the file.
+    logger.warn({ filePath, part, code }, 'Could not open persisted chat state')
+    return { value: null, outcome: 'unreadable' }
+  }
+
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(raw)
+  } catch (error) {
+    return quarantinePersistedChatFile(filePath, part, {
+      reason: 'unparseable',
+      bytes: raw.length,
+      error: error instanceof Error ? error.message : String(error),
+    })
+  }
+
+  const shapeOk =
+    part === 'messages'
+      ? Array.isArray(parsed)
+      : !!parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+  if (!shapeOk) {
+    return quarantinePersistedChatFile(filePath, part, {
+      reason: 'wrong-shape',
+      bytes: raw.length,
+      parsedType: parsed === null ? 'null' : typeof parsed,
+    })
+  }
+
+  return { value: parsed, outcome: 'ok' }
+}
+
+function quarantinePersistedChatFile(
+  filePath: string,
+  part: 'runState' | 'messages',
+  detail: Record<string, unknown>,
+): PersistedChatFile {
+  const quarantine = `${filePath}.corrupt-${randomUUID()}`
+  try {
+    fs.renameSync(filePath, quarantine)
+  } catch (error) {
+    logger.error(
+      {
+        filePath,
+        part,
+        ...detail,
+        error: error instanceof Error ? error.message : String(error),
+      },
+      'Damaged chat state could not be set aside; leaving it untouched',
+    )
+    return { value: null, outcome: 'unpreserved' }
+  }
+  // Kept, not deleted: the user's transcript is in there, and a later fix or a
+  // support request can still get it back.
+  logger.warn(
+    { filePath, part, quarantine, ...detail },
+    'Damaged chat state moved aside; restoring what is left',
+  )
+  return { value: null, outcome: 'damaged' }
+}
+
+/**
+ * Load both RunState and ChatMessage[] from a specific chat directory or the most recent one.
+ * When chatId is provided, it is used to locate the chat directory; otherwise the most
+ * recently modified chat directory is used.
+ * Returns null if no previous chat exists or files can't be parsed.
+ */
+export function loadMostRecentChatState(
+  chatId?: string,
+): SavedChatState | null {
+  try {
+    let chatDir: string | null = chatDirOverride ?? null
+
+    if (!chatDir && chatId && chatId.trim().length > 0) {
+      const baseDir = path.join(getProjectDataDir(), 'chats')
+      const candidateDir = path.join(baseDir, chatId.trim())
+      if (
+        fs.existsSync(candidateDir) &&
+        fs.statSync(candidateDir).isDirectory()
+      ) {
+        chatDir = candidateDir
+      } else {
+        logger.debug(
+          { candidateDir, chatId },
+          'Requested chatId directory not found, falling back to most recent chat directory',
+        )
+      }
+    }
+
+    if (!chatDir) {
+      chatDir = getMostRecentChatDir()
+    }
+
+    if (!chatDir) {
+      logger.debug('No previous chat directory found')
+      return null
+    }
+
+    const runStatePath = path.join(chatDir, RUN_STATE_FILENAME)
+    const messagesPath = path.join(chatDir, CHAT_MESSAGES_FILENAME)
+
+    // Parse the two files independently: a missing or torn run-state.json
+    // must not lose the transcript, and vice versa. Restore whatever is
+    // readable and fall back for the rest.
+    const loadedRunState = readPersistedChatFile(runStatePath, 'runState')
+    const loadedMessages = readPersistedChatFile(messagesPath, 'messages')
+
+    // Either file holds bytes we could neither read nor move aside. We must
+    // not hand back a state whose next save would land on top of them: a
+    // rename replaces a file the process cannot read, so "unreadable" is not
+    // "unwritable". Refusing the whole chat sends the session to a fresh chat
+    // directory, which leaves this one exactly as the user found it.
+    const unsafe = (outcome: PersistedChatFile['outcome']) =>
+      outcome === 'unpreserved' || outcome === 'unreadable'
+    if (unsafe(loadedRunState.outcome) || unsafe(loadedMessages.outcome)) {
+      logger.error(
+        {
+          runStatePath,
+          messagesPath,
+          runStateOutcome: loadedRunState.outcome,
+          messagesOutcome: loadedMessages.outcome,
+        },
+        'Refusing to resume a chat whose state could not be read or set aside',
+      )
+      return null
+    }
+
+    let runState: RunState | null = loadedRunState.value as RunState | null
+    let messages: ChatMessage[] | null = loadedMessages.value as
+      | ChatMessage[]
+      | null
+
+    if (!runState && !messages) {
+      logger.debug(
+        { runStatePath, messagesPath },
+        'No readable state files in chat directory',
+      )
+      return null
+    }
+
+    runState ??= {
+      output: {
+        type: 'error',
+        message: 'Previous run state could not be restored.',
+      },
+    } as RunState
+    runState.traceSessionId ??= randomUUID()
+    messages ??= []
+
+    const resolvedChatId = path.basename(chatDir)
+
+    logger.info(
+      {
+        runStatePath,
+        messagesPath,
+        messageCount: messages.length,
+        chatId: resolvedChatId,
+      },
+      'Loaded chat state from chat directory',
+    )
+
+    return { runState, messages, chatId: resolvedChatId }
+  } catch (error) {
+    logger.error(
+      {
+        error: error instanceof Error ? error.message : String(error),
+      },
+      'Failed to load chat state',
+    )
+    return null
+  }
+}
+```
+- File `cli/src/utils/write-file-atomic.ts` (172 lines):
+```
+import * as fs from 'fs'
+import { randomUUID } from 'node:crypto'
+import * as path from 'path'
+
+// Unique per-write temp suffix. A plain `${pid}.tmp` collides when a sync
+// exit-flush and an async checkpoint write target the same file concurrently
+// (both share the pid): they'd write and rename the SAME temp path, tearing
+// each other's output. A random component makes every write self-contained.
+function tempPathFor(filePath: string): string {
+  return `${filePath}.${process.pid}.${randomUUID()}.tmp`
+}
+
+/**
+ * Owner read/write only: these files are chat transcripts and run state. The
+ * temp file is created with this mode and the rename carries the inode, so
+ * every rewrite also replaces an older world-readable file with a private one.
+ */
+const PRIVATE_FILE_MODE = 0o600
+
+/**
+ * Every filesystem call an atomic write makes, as one seam.
+ *
+ * A successful fsync leaves no trace in the resulting file: the only way to
+ * tell a durable write from a non-durable one, short of cutting the machine's
+ * power, is the sequence of syscalls it makes. Tests substitute a recording
+ * delegate here to assert that sequence. Modelled on freebuff-desktop's
+ * `JournalStore` (server/repo/session-journal.ts), which exists for the same
+ * reason.
+ */
+export type AtomicWriteFs = {
+  openSync: typeof fs.openSync
+  writeFileSync: typeof fs.writeFileSync
+  fsyncSync: typeof fs.fsyncSync
+  closeSync: typeof fs.closeSync
+  renameSync: typeof fs.renameSync
+  unlinkSync: typeof fs.unlinkSync
+  promises: {
+    open: typeof fs.promises.open
+    rename: typeof fs.promises.rename
+    unlink: typeof fs.promises.unlink
+  }
+}
+
+const nodeAtomicWriteFs: AtomicWriteFs = fs
+
+let activeFs: AtomicWriteFs = nodeAtomicWriteFs
+
+/**
+ * Test-only seam, in the style of `setChatDirOverrideForTesting`: bun's
+ * `mock.module` leaks across test files, so the durability tests inject a
+ * recording delegate instead (see docs/testing.md: DI over module mocking).
+ */
+export function setAtomicWriteFsForTesting(
+  override: AtomicWriteFs | undefined,
+): void {
+  activeFs = override ?? nodeAtomicWriteFs
+}
+
+/**
+ * Flush the directory entry itself, so the *name* created by the rename is on
+ * disk too. Best-effort: by the time this runs the rename has already
+ * succeeded, so an fsync a filesystem refuses for a directory (win32 cannot
+ * open one through node:fs at all; some network and fuse mounts answer EINVAL)
+ * must not turn a completed write into a thrown error.
+ */
+function syncDirectory(directory: string): void {
+  if (process.platform === 'win32') return
+  try {
+    const handle = activeFs.openSync(directory, 'r')
+    try {
+      activeFs.fsyncSync(handle)
+    } finally {
+      activeFs.closeSync(handle)
+    }
+  } catch {
+    // See above: the data and the new name are already published.
+  }
+}
+
+async function syncDirectoryAsync(directory: string): Promise<void> {
+  if (process.platform === 'win32') return
+  try {
+    const handle = await activeFs.promises.open(directory, 'r')
+    try {
+      await handle.sync()
+    } finally {
+      await handle.close()
+    }
+  } catch {
+    // See syncDirectory.
+  }
+}
+
+/**
+ * Write a file atomically *and durably*: write to a temp file in the same
+ * directory, flush it, then rename over the target and flush the directory.
+ * Chat files grow to multiple MB and are rewritten on every agent step, so a
+ * plain writeFileSync interrupted by a crash/kill leaves truncated JSON that
+ * hides the chat from /history.
+ *
+ * The fsync is not optional. Rename is atomic, not durable: flush the contents
+ * before publishing the new name, or a power loss can leave a correctly-sized
+ * file of NUL bytes — which is what a user whose machine was hard-crashed
+ * mid-session got, in place of their whole transcript. Same reasoning, same
+ * discipline, as freebuff-desktop's session journal and state file.
+ *
+ * The cost is deliberate. Every caller writes session state a user cannot
+ * reproduce, at human rates — a few writes per turn, plus a checkpoint drain
+ * that coalesces to one in-flight write per chat — so none of them pays an
+ * fsync per keystroke or per token.
+ */
+export function writeFileAtomic(filePath: string, data: string): void {
+  const tmpPath = tempPathFor(filePath)
+  try {
+    // 'wx' so a temp path that somehow already exists is a loud error rather
+    // than a silent clobber of another write's bytes.
+    const fd = activeFs.openSync(tmpPath, 'wx', PRIVATE_FILE_MODE)
+    try {
+      // Given an fd, writeFileSync loops until every byte is written; a bare
+      // writeSync may not.
+      activeFs.writeFileSync(fd, data)
+      activeFs.fsyncSync(fd)
+    } finally {
+      activeFs.closeSync(fd)
+    }
+    activeFs.renameSync(tmpPath, filePath)
+    syncDirectory(path.dirname(filePath))
+  } catch (error) {
+    try {
+      activeFs.unlinkSync(tmpPath)
+    } catch {
+      // Ignore cleanup errors; the original error is what matters
+    }
+    throw error
+  }
+}
+
+/**
+ * Async counterpart to writeFileAtomic. Used by the in-flight checkpoint writer
+ * so serializing + flushing a multi-MB transcript doesn't block the CLI's
+ * render/input thread. Same tmp-flush-rename-flush guarantee; the flushes run
+ * on the libuv threadpool, not the render thread.
+ */
+export async function writeFileAtomicAsync(
+  filePath: string,
+  data: string,
+): Promise<void> {
+  const tmpPath = tempPathFor(filePath)
+  try {
+    const handle = await activeFs.promises.open(
+      tmpPath,
+      'wx',
+      PRIVATE_FILE_MODE,
+    )
+    try {
+      await handle.writeFile(data)
+      await handle.sync()
+    } finally {
+      await handle.close()
+    }
+    await activeFs.promises.rename(tmpPath, filePath)
+    await syncDirectoryAsync(path.dirname(filePath))
+  } catch (error) {
+    try {
+      await activeFs.promises.unlink(tmpPath)
+    } catch {
+      // Ignore cleanup errors; the original error is what matters
+    }
+    throw error
+  }
+}
+```
+Where the symbols this change introduces are used elsewhere, at this same revision (the code that reads them; this is evidence for the WHAT and the WHY, and it is the only source for who consumes this change):
+- File `cli/src/utils/__tests__/config-dir.test.ts` (22 matching lines):
+```
+import fs from 'fs'
+import os from 'os'
+import path from 'path'
+
+import { afterEach, describe, expect, test } from 'bun:test'
+
+import { ensureCliTestEnv } from '../../__tests__/test-utils'
+
+ensureCliTestEnv()
+
+const { getConfigDir, tightenConfigDirMode } = await import('../config-dir')
+
+const originalConfigDir = process.env.FREEBUFF_CONFIG_DIR
+
+afterEach(() => {
+  if (originalConfigDir === undefined) {
+    delete process.env.FREEBUFF_CONFIG_DIR
+  } else {
+    process.env.FREEBUFF_CONFIG_DIR = originalConfigDir
+  }
+})
+
+describe('getConfigDir', () => {
+  test('uses an absolute FREEBUFF_CONFIG_DIR override', () => {
+    const isolatedDir = path.join(os.tmpdir(), 'freebuff-cli-config-test')
+    process.env.FREEBUFF_CONFIG_DIR = isolatedDir
+
+    expect(getConfigDir()).toBe(isolatedDir)
+```
+- File `cli/src/__tests__/project-files-chat-dir-mode.test.ts` (10 matching lines):
+```
+import path from 'path'
+
+import { afterEach, describe, expect, test } from 'bun:test'
+
+import { ensureCliTestEnv } from './test-utils'
+
+ensureCliTestEnv()
+
+const { getCurrentChatDir, setCurrentChatId, setProjectRoot } = await import(
+  '../project-files'
+)
+
+const originalConfigDir = process.env.FREEBUFF_CONFIG_DIR
+let tempRoot = ''
+
+afterEach(() => {
+  if (originalConfigDir === undefined) {
+    delete process.env.FREEBUFF_CONFIG_DIR
+  } else {
+    process.env.FREEBUFF_CONFIG_DIR = originalConfigDir
+  }
+  if (tempRoot) fs.rmSync(tempRoot, { recursive: true, force: true })
+  tempRoot = ''
+})
+
+// POSIX mode bits only; Windows has no owner/group/other split to assert.
+describe.skipIf(process.platform === 'win32')('chat directory mode', () => {
+  test('creates the chat directory and its parents owner-only', () => {
+    tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cli-chat-dir-mode-'))
+```
+- File `sdk/src/__tests__/load-skills.test.ts` (8 matching lines):
+```
+'utf8',
+  )
+
+  return skillFile
+}
+
+describe('loadSkills', () => {
+  let tempRoot: string
+  let homeDir: string
+  let projectDir: string
+
+  beforeEach(() => {
+    tempRoot = mkdtempSync(path.join(os.tmpdir(), 'codebuff-sdk-load-skills-'))
+    homeDir = path.join(tempRoot, 'home')
+    projectDir = path.join(tempRoot, 'project')
+
+    mkdirSync(homeDir, { recursive: true })
+    mkdirSync(projectDir, { recursive: true })
+
+    spyOn(os, 'homedir').mockReturnValue(homeDir)
+  })
+
+  afterEach(() => {
+    mock.restore()
+    rmSync(tempRoot, { recursive: true, force: true })
+  })
+```
+- File `cli/src/utils/__tests__/run-state-storage.test.ts` (7 matching lines):
+```
+.filter((name) => name.endsWith('.tmp'))
+    expect(leftovers).toHaveLength(0)
+    expect(
+      JSON.parse(
+        fs.readFileSync(path.join(chatDir, 'chat-messages.json'), 'utf8'),
+      ),
+    ).toHaveLength(1)
+  })
+
+  test.skipIf(process.platform === 'win32')(
+    'saveChatState creates the chat dir and its files owner-only',
+    () => {
+      const freshDir = path.join(chatDir, 'fresh-chat')
+
+      saveChatState(runState, messages, freshDir)
+
+      expect(fs.statSync(freshDir).mode & 0o777).toBe(0o700)
+      for (const name of fs.readdirSync(freshDir)) {
+        expect(fs.statSync(path.join(freshDir, name)).mode & 0o777).toBe(
+          0o600,
+        )
+      }
+      expect(fs.readdirSync(freshDir)).toContain('run-state.json')
+      expect(fs.readdirSync(freshDir)).toContain('chat-messages.json')
+    },
+  )
+
+  test('torn run-state.json still restores the transcript', () => {
+    saveChatState(runState, messages)
+```
+- File `cli/src/utils/__tests__/message-history.test.ts` (6 matching lines):
+```
+getMessageHistoryPath,
+  loadMessageHistory,
+  saveMessageHistory,
+} from '../message-history'
+
+describe('message history persistence', () => {
+  let originalConfigDir: string | undefined
+  let tempRoot: string
+
+  // FREEBUFF_CONFIG_DIR, not HOME: os.homedir() ignores $HOME on macOS, so a
+  // HOME override sent these writes to the developer's real config dir.
+  beforeEach(() => {
+    originalConfigDir = process.env.FREEBUFF_CONFIG_DIR
+    tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cli-message-history-'))
+    // Not created yet, so saveMessageHistory creates it.
+    process.env.FREEBUFF_CONFIG_DIR = path.join(tempRoot, 'config')
+  })
+
+  afterEach(() => {
+    if (originalConfigDir === undefined) {
+      delete process.env.FREEBUFF_CONFIG_DIR
+    } else {
+      process.env.FREEBUFF_CONFIG_DIR = originalConfigDir
+    }
+    fs.rmSync(tempRoot, { recursive: true, force: true })
+  })
+
+  test('saves and loads history, replacing the previous file whole', () => {
+```
+- File `cli/src/utils/__tests__/auth-atomic-write.test.ts` (3 matching lines):
+```
+id: 'test-user-123',
+  name: 'Test User',
+  email: 'test@example.com',
+  authToken: 'test-session-token-abc',
+}
+
+describe('credentials.json is replaced atomically', () => {
+  let tempRoot: string
+  let configDir: string
+  let credentialsPath: string
+
+  beforeEach(() => {
+    tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'freebuff-cred-atomic-'))
+    configDir = path.join(tempRoot, 'config')
+    credentialsPath = path.join(configDir, 'credentials.json')
+    setProjectRoot(tempRoot)
+    spyOn(authModule, 'getConfigDir').mockReturnValue(configDir)
+    spyOn(authModule, 'getCredentialsPath').mockReturnValue(credentialsPath)
+  })
+
+  afterEach(() => {
+    fs.rmSync(tempRoot, { recursive: true, force: true })
+    mock.restore()
+  })
+
+  test('a concurrent reader never sees a half-written file on save', () => {
+    fs.mkdirSync(configDir, { recursive: true })
+    const previous = { default: { ...TEST_USER, email: 'old@example.com' } }
+```
+Tests this commit changed (added lines only; the assertions are what the change is expected to do, not a description of the feature):
+- File `cli/src/__tests__/project-files-chat-dir-mode.test.ts`: "creates the chat directory and its parents owner-only"
+```
+import fs from 'fs'
+import os from 'os'
+import path from 'path'
+import { afterEach, describe, expect, test } from 'bun:test'
+import { ensureCliTestEnv } from './test-utils'
+ensureCliTestEnv()
+const { getCurrentChatDir, setCurrentChatId, setProjectRoot } = await import(
+  '../project-files'
+)
+const originalConfigDir = process.env.FREEBUFF_CONFIG_DIR
+let tempRoot = ''
+afterEach(() => {
+  if (originalConfigDir === undefined) {
+    delete process.env.FREEBUFF_CONFIG_DIR
+  } else {
+    process.env.FREEBUFF_CONFIG_DIR = originalConfigDir
+  }
+  if (tempRoot) fs.rmSync(tempRoot, { recursive: true, force: true })
+  tempRoot = ''
+})
+// POSIX mode bits only; Windows has no owner/group/other split to assert.
+describe.skipIf(process.platform === 'win32')('chat directory mode', () => {
+  test('creates the chat directory and its parents owner-only', () => {
+    tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cli-chat-dir-mode-'))
+    const configDir = path.join(tempRoot, 'config')
+    const project = path.join(tempRoot, 'my-project')
+    // Not a git repo, so setProjectRoot writes no project marker.
+    fs.mkdirSync(project)
+    process.env.FREEBUFF_CONFIG_DIR = configDir
+    setProjectRoot(project)
+    setCurrentChatId('2026-10-26T00-00-00.000Z')
+    const chatDir = getCurrentChatDir()
+    expect(chatDir.startsWith(configDir)).toBe(true)
+    for (
+      let dir = chatDir;
+      dir.length >= configDir.length;
+      dir = path.dirname(dir)
+    ) {
+      expect(fs.statSync(dir).mode & 0o777).toBe(0o700)
+    }
+  })
+})
+```
+- File `cli/src/utils/__tests__/config-dir.test.ts`: "clamps an existing world-readable config dir to 0700"; "does not create a missing config dir"; "never throws, even when the config dir cannot be resolved"
+```
+import fs from 'fs'
+const { getConfigDir, tightenConfigDirMode } = await import('../config-dir')
+describe.skipIf(process.platform === 'win32')('tightenConfigDirMode', () => {
+  let tempRoot = ''
+  afterEach(() => {
+    if (tempRoot) fs.rmSync(tempRoot, { recursive: true, force: true })
+    tempRoot = ''
+  })
+  test('clamps an existing world-readable config dir to 0700', () => {
+    tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cli-config-mode-'))
+    const configDir = path.join(tempRoot, 'manicode')
+    fs.mkdirSync(configDir)
+    fs.chmodSync(configDir, 0o755)
+    process.env.FREEBUFF_CONFIG_DIR = configDir
+    tightenConfigDirMode()
+    expect(fs.statSync(configDir).mode & 0o777).toBe(0o700)
+  })
+  test('does not create a missing config dir', () => {
+    tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cli-config-mode-'))
+    const configDir = path.join(tempRoot, 'missing')
+    tightenConfigDirMode(configDir)
+    expect(fs.existsSync(configDir)).toBe(false)
+  })
+  test('never throws, even when the config dir cannot be resolved', () => {
+    process.env.FREEBUFF_CONFIG_DIR = 'relative-settings'
+    expect(() => tightenConfigDirMode()).not.toThrow()
+  })
+})
+```
+- File `cli/src/utils/__tests__/message-history.test.ts`
+```
+  let originalConfigDir: string | undefined
+  let tempRoot: string
+  // FREEBUFF_CONFIG_DIR, not HOME: os.homedir() ignores $HOME on macOS, so a
+  // HOME override sent these writes to the developer's real config dir.
+    originalConfigDir = process.env.FREEBUFF_CONFIG_DIR
+    tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cli-message-history-'))
+    // Not created yet, so saveMessageHistory creates it.
+    process.env.FREEBUFF_CONFIG_DIR = path.join(tempRoot, 'config')
+    if (originalConfigDir === undefined) {
+      delete process.env.FREEBUFF_CONFIG_DIR
+      process.env.FREEBUFF_CONFIG_DIR = originalConfigDir
+    fs.rmSync(tempRoot, { recursive: true, force: true })
+  test.skipIf(process.platform === 'win32')(
+    'writes history owner-only and creates the config dir owner-only',
+    () => {
+      saveMessageHistory(['a private prompt'])
+      const historyPath = getMessageHistoryPath()
+      expect(fs.statSync(historyPath).mode & 0o777).toBe(0o600)
+      expect(fs.statSync(path.dirname(historyPath)).mode & 0o777).toBe(0o700)
+    },
+  )
+```
+- File `cli/src/utils/__tests__/run-state-storage.test.ts`
+```
+  test.skipIf(process.platform === 'win32')(
+    'saveChatState creates the chat dir and its files owner-only',
+    () => {
+      const freshDir = path.join(chatDir, 'fresh-chat')
+      saveChatState(runState, messages, freshDir)
+      expect(fs.statSync(freshDir).mode & 0o777).toBe(0o700)
+      for (const name of fs.readdirSync(freshDir)) {
+        expect(fs.statSync(path.join(freshDir, name)).mode & 0o777).toBe(
+          0o600,
+        )
+      }
+      expect(fs.readdirSync(freshDir)).toContain('run-state.json')
+      expect(fs.readdirSync(freshDir)).toContain('chat-messages.json')
+    },
+  )
+```
+- File `cli/src/utils/__tests__/write-file-atomic.test.ts`: "creates the file owner read/write only"; "replacing a world-readable file leaves it owner-only"; "async: replacing a world-readable file leaves it owner-only"
+```
+// POSIX mode bits only; Windows has no owner/group/other split to assert.
+describe.skipIf(process.platform === 'win32')('private file mode', () => {
+  const modeOf = (file: string) => fs.statSync(file).mode & 0o777
+  beforeEach(() => {
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codebuff-atomic-mode-'))
+  })
+  afterEach(() => {
+    fs.rmSync(tempDir, { recursive: true, force: true })
+  })
+  test('creates the file owner read/write only', () => {
+    const target = path.join(tempDir, 'chat-messages.json')
+    writeFileAtomic(target, '[]')
+    expect(modeOf(target)).toBe(0o600)
+  })
+  test('replacing a world-readable file leaves it owner-only', () => {
+    const target = path.join(tempDir, 'run-state.json')
+    fs.writeFileSync(target, 'old', { mode: 0o644 })
+    fs.chmodSync(target, 0o644)
+    writeFileAtomic(target, 'new')
+    expect(modeOf(target)).toBe(0o600)
+  })
+  test('async: replacing a world-readable file leaves it owner-only', async () => {
+    const target = path.join(tempDir, 'chat-messages.json')
+    fs.writeFileSync(target, 'old', { mode: 0o644 })
+    fs.chmodSync(target, 0o644)
+    await writeFileAtomicAsync(target, '[]')
+    expect(modeOf(target)).toBe(0o600)
+  })
+})
+```
+Diff (source hunks; lockfiles and pure test hunks omitted, except in a lockfile-only commit):
+```diff
+diff --git a/cli/src/index.tsx b/cli/src/index.tsx
+index 3ab968644..bda62297e 100644
+--- a/cli/src/index.tsx
++++ b/cli/src/index.tsx
+@@ -30,51 +30,51 @@ import React from 'react'
+ 
+ import { App } from './app'
+ import { loadPackageVersion, parseArgs } from './cli-args'
+ import { handlePublish } from './commands/publish'
+ import { runPlainLogin } from './login/plain-login'
+ import { initializeApp } from './init/init-app'
+ import { getProjectRoot, setProjectRoot } from './project-files'
+ import { trackEvent } from './utils/analytics'
+ import { captureCliFunnel } from './utils/cli-product-funnel'
+ import { installAiSdkWarningLogger } from './utils/ai-sdk-warnings'
+ import {
+   getTrustStorePath,
+   isTruthyOptIn,
+   promptForAgentDirTrust,
+   resolveTrustedAgentDirs,
+ } from './utils/agent-dir-trust'
+ import {
+   getAuthToken,
+   getAuthTokenDetails,
+   loadStoredAuthToken,
+ } from './utils/auth'
+ import { resetCodebuffClient } from './utils/codebuff-client'
+ import { setApiClientAuthToken } from './utils/codebuff-api'
+ import { IS_FREEBUFF } from './utils/constants'
+ import { getCliEnv } from './utils/env'
+-import { getConfigDir } from './utils/config-dir'
++import { getConfigDir, tightenConfigDirMode } from './utils/config-dir'
+ import {
+   bunExtractionTempDir,
+   defaultRenderLibraryCacheDir,
+   ensureRenderLibrary,
+   findEmbeddedRenderLibrary,
+   sweepLeakedRenderLibraryCopies,
+ } from './utils/opentui-native-library'
+ import { initializeAgentRegistry } from './utils/local-agent-registry'
+ import { trimOversizedChatLogs } from './utils/chat-history'
+ import { clearLogFile, logger } from './utils/logger'
+ import { drainClientLogs } from './utils/log-shipper'
+ import { takePreviousFatalCrash } from './utils/fatal-crash-report'
+ import { shouldShowProjectPicker } from './utils/project-picker'
+ import { saveRecentProject } from './utils/recent-projects'
+ import { startEngagementTracking } from './utils/engagement'
+ import {
+   CLI_RENDERER_EXIT_SIGNALS,
+   exitCliWithFatalError,
+   installProcessCleanupHandlers,
+ } from './utils/renderer-cleanup'
+ import { startWindowsMachineProcessCensus } from './utils/helper-process-telemetry'
+ import { startTerminalWatchdog } from './utils/terminal-watchdog'
+ import { installTerminalProtocolController } from './utils/terminal-protocol-controller'
+ import { initializeSkillRegistry } from './utils/skill-registry'
+ import { detectTerminalTheme } from './utils/terminal-color-detection'
+@@ -225,50 +225,54 @@ async function main(): Promise<void> {
+     }
+     const { runPackagedTerminalBrokerSmoke } =
+       await import('./smoke/terminal-command-broker')
+     const exitCode = await runPackagedTerminalBrokerSmoke({
+       resultPath,
+       exchangeDir,
+     })
+     process.exit(exitCode)
+   }
+ 
+   // Run OSC theme detection BEFORE anything else.
+   // This MUST happen before OpenTUI starts because OSC responses come through stdin,
+   // and OpenTUI also listens to stdin. Running detection here ensures stdin is clean.
+   if (process.stdin.isTTY && process.platform !== 'win32') {
+     try {
+       const oscTheme = await detectTerminalTheme()
+       noteTerminalColorReply(oscTheme !== null)
+       if (oscTheme) {
+         setOscDetectedTheme(oscTheme)
+       }
+     } catch {
+       // Silently ignore OSC detection failures
+     }
+   }
+ 
++  // Transcripts, run state and prompt history live under the config dir;
++  // keep it owner-only even if it was first created without a mode.
++  tightenConfigDirMode()
++
+   // The Freebuff auth token lives in the OS keychain (auth-token-store.ts):
+   // load it before anything reads the credentials. Bounded and never throws.
+   await loadStoredAuthToken()
+ 
+   const {
+     initialPrompt,
+     command,
+     agent,
+     clearLogs,
+     continue: continueChat,
+     continueId,
+     cwd,
+     initialMode,
+     trustAgents,
+   } = parseArgs()
+ 
+   const isLoginCommand = command === 'login'
+   const isPublishCommand = command === 'publish'
+   const hasAgentOverride = Boolean(agent?.trim())
+ 
+   await initializeApp({ cwd })
+ 
+   // Set the auth token for the API client
+   setApiClientAuthToken(getAuthToken())
+ 
+diff --git a/cli/src/project-files.ts b/cli/src/project-files.ts
+index c7d378335..85a802e42 100644
+--- a/cli/src/project-files.ts
++++ b/cli/src/project-files.ts
+@@ -1,37 +1,38 @@
+ import { mkdirSync, readdirSync, statSync } from 'fs'
+ import path from 'path'
+ 
+ import { getConfigDir } from './utils/auth'
+ import { IS_FREEBUFF } from './utils/constants'
+ import { ensureSponsoredProjectIdentity } from './utils/sponsored-project-identity'
+ 
+ let projectRoot: string | undefined
+ let currentChatId: string | undefined
+ 
+ function ensureChatDirectory(dir: string) {
+-  mkdirSync(dir, { recursive: true })
++  // Owner-only: chat directories hold transcripts and run state.
++  mkdirSync(dir, { recursive: true, mode: 0o700 })
+ }
+ 
+ export function setProjectRoot(dir: string) {
+   projectRoot = dir
+   // Project selection is the normal lifecycle owner for the workspace
+   // identity. Sponsored polling only ever reads this marker. Freebuff writes
+   // it in every Git project, because an in-place sponsored offer is keyed to
+   // the folder rather than to `owner/repo` (#3989).
+   ensureSponsoredProjectIdentity(dir, { everyRepository: IS_FREEBUFF })
+   return projectRoot
+ }
+ 
+ export function getProjectRoot() {
+   if (!projectRoot) {
+     throw new Error('Project root not set')
+   }
+   return projectRoot
+ }
+ 
+ export function tryGetProjectRoot() {
+   return projectRoot
+ }
+ 
+ export function getCurrentChatId() {
+   if (!currentChatId) {
+diff --git a/cli/src/utils/config-dir.ts b/cli/src/utils/config-dir.ts
+index 7da8c4c2a..fb7c28b3d 100644
+--- a/cli/src/utils/config-dir.ts
++++ b/cli/src/utils/config-dir.ts
+@@ -1,36 +1,65 @@
++import fs from 'fs'
+ import os from 'os'
+ import path from 'path'
+ 
+ import { env } from '@codebuff/common/env'
+ 
+ import { getCliEnv } from './env'
+ 
+ /**
+  * Resolve the on-disk config directory for the CLI.
+  *
+  * Lives in its own module (depending only on `env`) so that low-level helpers
+  * — e.g. the persistent analytics id — can read the config dir without pulling
+  * in `auth.ts`, which transitively imports the logger and analytics and would
+  * otherwise create an import cycle.
+  */
+ export const getConfigDir = (): string => {
+   const configuredDir = getCliEnv().FREEBUFF_CONFIG_DIR
+   if (configuredDir) {
+     if (!path.isAbsolute(configuredDir)) {
+       throw new Error(
+         'FREEBUFF_CONFIG_DIR must be an absolute path so CLI settings cannot be written relative to the current project.',
+       )
+     }
+     return configuredDir
+   }
+ 
+   return path.join(
+     os.homedir(),
+     '.config',
+     'manicode' +
+       // on a development stack?
+       (env.NEXT_PUBLIC_CB_ENVIRONMENT !== 'prod'
+         ? `-${env.NEXT_PUBLIC_CB_ENVIRONMENT}`
+         : ''),
+   )
+ }
++
++/** Owner-only, matching the mode `auth.ts` creates the directory with. */
++const CONFIG_DIR_MODE = 0o700
++
++/**
++ * Best-effort: clamp an existing config directory to owner-only.
++ *
++ * `mkdir` applies its mode only when it creates the directory, so a config
++ * dir first created by something other than login (prompt history, a chat
++ * directory, an older CLI) can be 0755, leaving transcripts, run state and
++ * prompt history under it readable by other users on a shared host. Run once
++ * at startup. Does not create the directory. Skipped on Windows, where POSIX
++ * mode bits do not apply. Never throws.
++ */
++export const tightenConfigDirMode = (configDir?: string): void => {
++  if (process.platform === 'win32') return
++  try {
++    // Resolved inside the try: a relative FREEBUFF_CONFIG_DIR throws here.
++    const dir = configDir ?? getConfigDir()
++    const stat = fs.statSync(dir, { throwIfNoEntry: false })
++    if (!stat?.isDirectory()) return
++    if ((stat.mode & 0o777) !== CONFIG_DIR_MODE) {
++      fs.chmodSync(dir, CONFIG_DIR_MODE)
++    }
++  } catch {
++    // Not ours to fail startup over (e.g. a directory owned by another user).
++  }
++}
+diff --git a/cli/src/utils/message-history.ts b/cli/src/utils/message-history.ts
+index 7ffa2300a..2293f6e2c 100644
+--- a/cli/src/utils/message-history.ts
++++ b/cli/src/utils/message-history.ts
+@@ -96,56 +96,58 @@ export const loadMessageHistory = (): string[] => {
+         error: error instanceof Error ? error.message : String(error),
+       },
+       'Error reading message history',
+     )
+     return []
+   }
+ }
+ 
+ /**
+  * Save message history to file system
+  */
+ export const saveMessageHistory = (
+   history: string[],
+   fileSystem: Pick<
+     typeof fs,
+     'existsSync' | 'mkdirSync' | 'writeFileSync' | 'renameSync' | 'rmSync'
+   > = fs,
+ ): void => {
+   const configDir = getConfigDir()
+   const historyPath = getMessageHistoryPath()
+   const tempPath = `${historyPath}.${process.pid}.${randomUUID()}.tmp`
+ 
+   try {
+     // Ensure config directory exists
+     if (!fileSystem.existsSync(configDir)) {
+-      fileSystem.mkdirSync(configDir, { recursive: true })
++      fileSystem.mkdirSync(configDir, { recursive: true, mode: 0o700 })
+     }
+ 
+     // Limit history size to prevent file from growing too large
+     const limitedHistory =
+       history.length > MAX_HISTORY_SIZE
+         ? history.slice(history.length - MAX_HISTORY_SIZE)
+         : history
+ 
+     // Save history
+     fileSystem.writeFileSync(
+       tempPath,
+       JSON.stringify(limitedHistory, null, 2),
+       {
+         flag: 'wx',
++        // Owner-only: prompt history is everything the user has typed.
++        mode: 0o600,
+       },
+     )
+     fileSystem.renameSync(tempPath, historyPath)
+   } catch (error) {
+     try {
+       fileSystem.rmSync(tempPath, { force: true })
+     } catch {}
+     logger.error(
+       {
+         error: error instanceof Error ? error.message : String(error),
+       },
+       'Error saving message history',
+     )
+     // Don't throw - history persistence is not critical
+   }
+ }
+diff --git a/cli/src/utils/run-state-storage.ts b/cli/src/utils/run-state-storage.ts
+index 64eecce16..986bce3ce 100644
+--- a/cli/src/utils/run-state-storage.ts
++++ b/cli/src/utils/run-state-storage.ts
+@@ -93,51 +93,51 @@ export function flushLiveChatState(): void {
+   } catch {
+     // Best-effort - never block process exit.
+   }
+ }
+ 
+ // Test-only escape hatch: persistence normally resolves the chat directory
+ // through project-files (under the user's real config dir). Tests point it at
+ // a temp directory instead of mocking module internals — mock.module leaks
+ // across bun test files and os.homedir() ignores $HOME on macOS, so both of
+ // those seams are unreliable (see docs/testing.md: DI over module mocking).
+ let chatDirOverride: string | undefined
+ 
+ export function setChatDirOverrideForTesting(dir: string | undefined): void {
+   chatDirOverride = dir
+ }
+ 
+ /**
+  * Resolve the directory of the currently active chat. Persistence callers
+  * must capture this at the moment the state is captured (run start, snapshot
+  * time) and pass it through to the save — resolving it again at write time
+  * races with chat switches (/new, resuming from /history) and would write one
+  * chat's transcript into another chat's directory.
+  */
+ export function resolveCurrentChatDir(): string {
+   if (chatDirOverride) {
+-    fs.mkdirSync(chatDirOverride, { recursive: true })
++    fs.mkdirSync(chatDirOverride, { recursive: true, mode: 0o700 })
+     return chatDirOverride
+   }
+   return getCurrentChatDir()
+ }
+ 
+ // Chat-state saves fail in prod for reasons that are chronic, not transient:
+ // a transcript with a cyclic or over-string-limit payload fails identically on
+ // every 5s checkpoint, and a full disk stays full. Logging each attempt at
+ // error level made this a top-3 error by volume (~19k/day). Instead, each
+ // distinct issue per chat dir is logged at most once per interval, and
+ // environment/payload failures log as warnings — only genuinely unexpected
+ // errors keep the error level.
+ const SAVE_LOG_INTERVAL_MS = 5 * 60 * 1000
+ const saveIssueLastLoggedAt = new Map<string, number>()
+ 
+ function shouldLogSaveIssue(key: string): boolean {
+   const now = Date.now()
+   const last = saveIssueLastLoggedAt.get(key)
+   if (last !== undefined && now - last < SAVE_LOG_INTERVAL_MS) {
+     return false
+   }
+   saveIssueLastLoggedAt.set(key, now)
+   return true
+ }
+ 
+@@ -318,51 +318,51 @@ function logSaveWriteFailure(
+     message,
+   )
+ }
+ 
+ /**
+  * Save both the RunState and ChatMessage[] to disk.
+  *
+  * `chatDir` should be captured when the state itself is captured (e.g. at run
+  * start) and passed through. Defaulting to the current chat dir is only safe
+  * when the caller knows no chat switch can have happened in between.
+  */
+ export function saveChatState(
+   runState: RunState,
+   messages: ChatMessage[],
+   chatDir: string = resolveCurrentChatDir(),
+ ): void {
+   // Compact JSON: these files are rewritten on every checkpoint and grow to
+   // multiple MB; pretty-printing roughly doubles the write.
+   const serialized = serializeChatState(runState, messages, chatDir)
+   if (!serialized.runStateJson && !serialized.messagesJson) {
+     return
+   }
+   try {
+     // The dir existed when the save was captured, but may have been removed
+     // since (e.g. the chat deleted from /history mid-run).
+-    fs.mkdirSync(chatDir, { recursive: true })
++    fs.mkdirSync(chatDir, { recursive: true, mode: 0o700 })
+     if (serialized.runStateJson) {
+       writeFileAtomic(
+         path.join(chatDir, RUN_STATE_FILENAME),
+         serialized.runStateJson,
+       )
+     }
+     if (serialized.messagesJson) {
+       writeFileAtomic(
+         path.join(chatDir, CHAT_MESSAGES_FILENAME),
+         serialized.messagesJson,
+       )
+       // Sidecar summary so /history can list this chat without parsing the
+       // (unbounded) chat-messages.json. Must be written after the messages
+       // file: it records the file's size/mtime to detect staleness.
+       writeChatMeta(chatDir, messages)
+     }
+   } catch (error) {
+     logSaveWriteFailure(error, chatDir, 'Failed to save chat state')
+   }
+ }
+ 
+ /**
+  * Async counterpart to saveChatState. Serializes and writes off the caller's
+  * tick so a multi-MB transcript doesn't block the CLI's render/input thread.
+  */
+diff --git a/cli/src/utils/write-file-atomic.ts b/cli/src/utils/write-file-atomic.ts
+index c96c06054..913f4ccd7 100644
+--- a/cli/src/utils/write-file-atomic.ts
++++ b/cli/src/utils/write-file-atomic.ts
+@@ -1,37 +1,44 @@
+ import * as fs from 'fs'
+ import { randomUUID } from 'node:crypto'
+ import * as path from 'path'
+ 
+ // Unique per-write temp suffix. A plain `${pid}.tmp` collides when a sync
+ // exit-flush and an async checkpoint write target the same file concurrently
+ // (both share the pid): they'd write and rename the SAME temp path, tearing
+ // each other's output. A random component makes every write self-contained.
+ function tempPathFor(filePath: string): string {
+   return `${filePath}.${process.pid}.${randomUUID()}.tmp`
+ }
+ 
++/**
++ * Owner read/write only: these files are chat transcripts and run state. The
++ * temp file is created with this mode and the rename carries the inode, so
++ * every rewrite also replaces an older world-readable file with a private one.
++ */
++const PRIVATE_FILE_MODE = 0o600
++
+ /**
+  * Every filesystem call an atomic write makes, as one seam.
+  *
+  * A successful fsync leaves no trace in the resulting file: the only way to
+  * tell a durable write from a non-durable one, short of cutting the machine's
+  * power, is the sequence of syscalls it makes. Tests substitute a recording
+  * delegate here to assert that sequence. Modelled on freebuff-desktop's
+  * `JournalStore` (server/repo/session-journal.ts), which exists for the same
+  * reason.
+  */
+ export type AtomicWriteFs = {
+   openSync: typeof fs.openSync
+   writeFileSync: typeof fs.writeFileSync
+   fsyncSync: typeof fs.fsyncSync
+   closeSync: typeof fs.closeSync
+   renameSync: typeof fs.renameSync
+   unlinkSync: typeof fs.unlinkSync
+   promises: {
+     open: typeof fs.promises.open
+     rename: typeof fs.promises.rename
+     unlink: typeof fs.promises.unlink
+   }
+ }
+ 
+ const nodeAtomicWriteFs: AtomicWriteFs = fs
+@@ -85,76 +92,80 @@ async function syncDirectoryAsync(directory: string): Promise<void> {
+ }
+ 
+ /**
+  * Write a file atomically *and durably*: write to a temp file in the same
+  * directory, flush it, then rename over the target and flush the directory.
+  * Chat files grow to multiple MB and are rewritten on every agent step, so a
+  * plain writeFileSync interrupted by a crash/kill leaves truncated JSON that
+  * hides the chat from /history.
+  *
+  * The fsync is not optional. Rename is atomic, not durable: flush the contents
+  * before publishing the new name, or a power loss can leave a correctly-sized
+  * file of NUL bytes — which is what a user whose machine was hard-crashed
+  * mid-session got, in place of their whole transcript. Same reasoning, same
+  * discipline, as freebuff-desktop's session journal and state file.
+  *
+  * The cost is deliberate. Every caller writes session state a user cannot
+  * reproduce, at human rates — a few writes per turn, plus a checkpoint drain
+  * that coalesces to one in-flight write per chat — so none of them pays an
+  * fsync per keystroke or per token.
+  */
+ export function writeFileAtomic(filePath: string, data: string): void {
+   const tmpPath = tempPathFor(filePath)
+   try {
+     // 'wx' so a temp path that somehow already exists is a loud error rather
+     // than a silent clobber of another write's bytes.
+-    const fd = activeFs.openSync(tmpPath, 'wx')
++    const fd = activeFs.openSync(tmpPath, 'wx', PRIVATE_FILE_MODE)
+     try {
+       // Given an fd, writeFileSync loops until every byte is written; a bare
+       // writeSync may not.
+       activeFs.writeFileSync(fd, data)
+       activeFs.fsyncSync(fd)
+     } finally {
+       activeFs.closeSync(fd)
+     }
+     activeFs.renameSync(tmpPath, filePath)
+     syncDirectory(path.dirname(filePath))
+   } catch (error) {
+     try {
+       activeFs.unlinkSync(tmpPath)
+     } catch {
+       // Ignore cleanup errors; the original error is what matters
+     }
+     throw error
+   }
+ }
+ 
+ /**
+  * Async counterpart to writeFileAtomic. Used by the in-flight checkpoint writer
+  * so serializing + flushing a multi-MB transcript doesn't block the CLI's
+  * render/input thread. Same tmp-flush-rename-flush guarantee; the flushes run
+  * on the libuv threadpool, not the render thread.
+  */
+ export async function writeFileAtomicAsync(
+   filePath: string,
+   data: string,
+ ): Promise<void> {
+   const tmpPath = tempPathFor(filePath)
+   try {
+-    const handle = await activeFs.promises.open(tmpPath, 'wx')
++    const handle = await activeFs.promises.open(
++      tmpPath,
++      'wx',
++      PRIVATE_FILE_MODE,
++    )
+     try {
+       await handle.writeFile(data)
+       await handle.sync()
+     } finally {
+       await handle.close()
+     }
+     await activeFs.promises.rename(tmpPath, filePath)
+     await syncDirectoryAsync(path.dirname(filePath))
+   } catch (error) {
+     try {
+       await activeFs.promises.unlink(tmpPath)
+     } catch {
+       // Ignore cleanup errors; the original error is what matters
+     }
+     throw error
+   }
+ }
+
+```
