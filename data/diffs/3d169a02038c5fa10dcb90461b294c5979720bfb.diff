@@ -1,0 +1,159 @@
+diff --git a/common/src/constants/__tests__/sandbox-jobs-runner.test.ts b/common/src/constants/__tests__/sandbox-jobs-runner.test.ts
+index 6f43b28b7..819d56375 100644
+--- a/common/src/constants/__tests__/sandbox-jobs-runner.test.ts
++++ b/common/src/constants/__tests__/sandbox-jobs-runner.test.ts
+@@ -1,30 +1,32 @@
+ import { describe, expect, test } from 'bun:test'
+ 
+ import {
++  POOL_JOB_STORE,
+   SANDBOX_JOB_NAMES,
+   SANDBOX_JOB_RUNNERS,
++  poolJobsOnPostgres,
+   sandboxJobOwnedBy,
+ } from '../sandbox-jobs-runner'
+ 
+ import type { SandboxJobRunners } from '../sandbox-jobs-runner'
+ 
+ describe('sandbox job runners (COD-742 E1)', () => {
+   // Flipped one at a time on Owen's go (2026-10-14): storage sweep, run leases, errored sweep, pool reconcile, pool provisioning, idle sleep.
+   const FLIPPED: readonly string[] = ['sweep_storage', 'sweep_run_leases', 'sweep_errored', 'reconcile_pool', 'provision_pool', 'sleep_idle']
+ 
+   test('only the flipped jobs run on graphile; Convex runs the rest', () => {
+     for (const job of SANDBOX_JOB_NAMES) {
+       expect({ job, runner: SANDBOX_JOB_RUNNERS[job] }).toEqual({
+         job,
+         runner: FLIPPED.includes(job) ? 'graphile' : 'convex',
+       })
+     }
+   })
+ 
+   test('the table names every job and nothing else', () => {
+     expect(Object.keys(SANDBOX_JOB_RUNNERS).sort()).toEqual(
+       [...SANDBOX_JOB_NAMES].sort(),
+     )
+   })
+ 
+   test('exactly one runner owns each job, in either position of the switch', () => {
+@@ -40,25 +42,43 @@ describe('sandbox job runners (COD-742 E1)', () => {
+       }
+     }
+   })
+ 
+   test('a mixed table hands each job to its own runner only', () => {
+     const runners: SandboxJobRunners = {
+       ...SANDBOX_JOB_RUNNERS,
+       sweep_errored: 'graphile',
+       reconcile_pool: 'convex',
+     }
+     expect(sandboxJobOwnedBy('sweep_errored', 'graphile', runners)).toBe(true)
+     expect(sandboxJobOwnedBy('sweep_errored', 'convex', runners)).toBe(false)
+     expect(sandboxJobOwnedBy('reconcile_pool', 'convex', runners)).toBe(true)
+     expect(sandboxJobOwnedBy('reconcile_pool', 'graphile', runners)).toBe(false)
+   })
+ 
+   test('a corrupt value stops the job on both sides rather than running it twice', () => {
+     const runners = {
+       ...SANDBOX_JOB_RUNNERS,
+       sweep_errored: 'both',
+     } as unknown as SandboxJobRunners
+     expect(sandboxJobOwnedBy('sweep_errored', 'convex', runners)).toBe(false)
+     expect(sandboxJobOwnedBy('sweep_errored', 'graphile', runners)).toBe(false)
+   })
+ })
++
++describe('pool job store (COD-742)', () => {
++  test('the queue is on Postgres, with both pool jobs on graphile', () => {
++    expect(POOL_JOB_STORE).toBe('postgres')
++    expect(poolJobsOnPostgres()).toBe(true)
++  })
++
++  test('refused while either pool job still runs on Convex', () => {
++    for (const job of ['reconcile_pool', 'provision_pool'] as const) {
++      const runners = {
++        ...SANDBOX_JOB_RUNNERS,
++        [job]: 'convex',
++      } as SandboxJobRunners
++      expect(poolJobsOnPostgres('postgres', runners)).toBe(false)
++    }
++    expect(poolJobsOnPostgres('convex')).toBe(false)
++  })
++})
+diff --git a/common/src/constants/sandbox-jobs-runner.ts b/common/src/constants/sandbox-jobs-runner.ts
+index c41704aab..7059406f7 100644
+--- a/common/src/constants/sandbox-jobs-runner.ts
++++ b/common/src/constants/sandbox-jobs-runner.ts
+@@ -43,43 +43,73 @@ export const SANDBOX_JOB_NAMES = [
+    *  its triage DELETES a VM (convex/erroredSandboxTriage.ts). */
+   'sweep_errored',
+   /** Convex cron `sweep daytona storage watermarks` (30 min). */
+   'sweep_storage',
+   /** Convex cron `sweep sandbox run leases` (15 min): stops idle sandboxes. */
+   'sweep_run_leases',
+   /** Convex cron `sleep idle provider sandboxes` (5 min): parks E2B and
+    *  Modal sandboxes with no recent presence (Modal snapshots, then
+    *  terminates). Needs the E2B and Modal keys on whichever host runs it. */
+   'sleep_idle',
+ ] as const
+ 
+ export type SandboxJobName = (typeof SANDBOX_JOB_NAMES)[number]
+ 
+ export type SandboxJobRunners = Readonly<Record<SandboxJobName, SandboxJobRunner>>
+ 
+ export const SANDBOX_JOB_RUNNERS: SandboxJobRunners = {
+   reconcile_pool: 'graphile',
+   provision_pool: 'graphile',
+   sweep_errored: 'graphile',
+   sweep_storage: 'graphile',
+   sweep_run_leases: 'graphile',
+   sleep_idle: 'graphile',
+ }
+ 
++/**
++ * Where the warm-pool QUEUE (`daytona_pool_job`) lives (COD-742,
++ * docs/freebuff-project-pool.md "Reconciliation"):
++ *
++ * - `convex`   Convex's table, through `pool_management`'s mutations.
++ * - `postgres` Postgres `daytona_pool_job`: freebuff-web's reconcile inserts
++ *              the deficit, the dispatcher lists it and the provisioner claims
++ *              and settles rows there. Convex's `replenishPoolIfEmpty` and
++ *              its schedulers step aside.
++ *
++ * Only honoured while both `reconcile_pool` and `provision_pool` run on
++ * graphile: the Convex reconciler and the Convex fallback batch only know
++ * Convex's rows. A flip back is this one line; rows left in either store are
++ * an abandoned queue (the next reconcile refills from the other), never data.
++ */
++export type PoolJobStore = 'convex' | 'postgres'
++
++export const POOL_JOB_STORE: PoolJobStore = 'postgres'
++
++export function poolJobsOnPostgres(
++  store: PoolJobStore = POOL_JOB_STORE,
++  runners: SandboxJobRunners = SANDBOX_JOB_RUNNERS,
++): boolean {
++  return (
++    store === 'postgres' &&
++    sandboxJobOwnedBy('reconcile_pool', 'graphile', runners) &&
++    sandboxJobOwnedBy('provision_pool', 'graphile', runners)
++  )
++}
++
+ /**
+  * Whether `runner` owns `job`. The ONLY question either side asks: the Convex
+  * cron asks `sandboxJobOwnedBy(job, 'convex')` and no-ops on false; the
+  * graphile task asks `sandboxJobOwnedBy(job, 'graphile')` and no-ops on false.
+  * Because the table holds exactly one runner per job, exactly one answers
+  * true. An unknown runner value (a bad edit) answers false for both — the job
+  * stops rather than runs twice, which for a sweep that deletes VMs is the
+  * safe failure.
+  */
+ export function sandboxJobOwnedBy(
+   job: SandboxJobName,
+   runner: SandboxJobRunner,
+   runners: SandboxJobRunners = SANDBOX_JOB_RUNNERS,
+ ): boolean {
+   const owner = runners[job]
+   if (owner !== 'convex' && owner !== 'graphile') return false
+   return owner === runner
+ }
