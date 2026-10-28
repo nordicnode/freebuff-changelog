@@ -1,0 +1,828 @@
+Date: 2026-10-28T21:39:11Z
+Category: Core
+Areas: Shared/Core
+Commit nature: production
+Stats: +65 / -51
+Analysis notes: Shared/Core changes across 1 file(s) (+65/−51).
+Modified files: common/src/reddit-capi.ts
+Key facts (ground the WHY and DETAIL sentences in these): - Internal event name; acquisition events map to Reddit's standard types. - Deliver one conversion, retrying one transient failure. - Conversion access token from Reddit Events Manager (env-provided; no-op when unset).
+Structured facts (extracted mechanically from the diff; copy names and values verbatim, never round or rename):
+- Behavior asserted by new tests (test titles, verbatim; the hunks themselves are omitted): "canonical signup and coding activation use standard SIGN_UP and LEAD types"
+Complete Source of Modified Files (for complete module context):
+- File `common/src/reddit-capi.ts` (268 lines):
+```
+import { createHash } from 'node:crypto'
+
+import { IS_PROD } from '@codebuff/common/env'
+import type { Logger } from '@codebuff/common/types/contracts/logger'
+import type { RedditAcquisitionEvent } from '@codebuff/common/util/reddit-acquisition'
+import type { RedditCapiEventName } from '@codebuff/common/util/reddit-capi-events'
+
+export type { RedditCapiEventName }
+
+/** Reddit Ads pixel ID (public, also used for CAPI endpoint). */
+export const REDDIT_PIXEL_ID = 'a2_j6o59svbxzzn'
+
+const REDDIT_CAPI_ENDPOINT = `https://ads-api.reddit.com/api/v3/pixels/${REDDIT_PIXEL_ID}/conversion_events`
+
+export type RedditActionSource = 'WEBSITE' | 'APP' | 'PHYSICAL_STORE' | 'OTHER'
+
+export type RedditCapiUser = {
+  email?: string | null
+  externalId?: string | null
+  ipAddress?: string | null
+  userAgent?: string | null
+  clickId?: string | null
+  uuid?: string | null
+}
+
+function sha256(value: string): string {
+  return createHash('sha256').update(value).digest('hex')
+}
+
+function normalizeEmail(email: string): string {
+  const normalized = email.trim().toLowerCase()
+  const atIndex = normalized.lastIndexOf('@')
+  if (atIndex <= 0 || atIndex === normalized.length - 1) {
+    return normalized
+  }
+  const local = normalized.slice(0, atIndex)
+  const domain = normalized.slice(atIndex + 1)
+  return `${local.split('+')[0]?.replaceAll('.', '')}@${domain}`
+}
+
+export function buildRedditCapiUserPayload(user: RedditCapiUser) {
+  const payload: Record<string, string> = {}
+
+  if (user.email) {
+    payload.email = sha256(normalizeEmail(user.email))
+  }
+  if (user.externalId) {
+    payload.external_id = sha256(user.externalId.trim())
+  }
+  if (user.ipAddress) {
+    payload.ip_address = user.ipAddress
+  }
+  if (user.userAgent) {
+    payload.user_agent = user.userAgent
+  }
+  if (user.uuid) {
+    payload.uuid = user.uuid
+  }
+
+  return Object.keys(payload).length > 0 ? payload : undefined
+}
+
+export type SendRedditCustomConversionParams = {
+  /** Conversion access token from Reddit Events Manager (env-provided; no-op when unset). */
+  accessToken: string | undefined
+  /** Internal event name; acquisition events map to Reddit's standard types. */
+  customEventName: RedditCapiEventName | RedditAcquisitionEvent
+  conversionId: string
+  actionSource: RedditActionSource
+  eventAt?: number
+  eventSourceUrl?: string
+  testId?: string
+  user: RedditCapiUser
+  fetchImpl?: typeof fetch
+  logger?: Logger
+  enabled?: boolean
+  sleepImpl?: (ms: number) => Promise<void>
+}
+
+export type RedditCapiDeliveryResult = 'sent' | 'disabled'
+
+export class RedditCapiDeliveryError extends Error {
+  constructor(
+    message: string,
+    readonly status?: number,
+  ) {
+    super(message)
+    this.name = 'RedditCapiDeliveryError'
+  }
+}
+
+function eventSourceUrlWithClickId(
+  eventSourceUrl: string | undefined,
+  clickId: string | null | undefined,
+): string | undefined {
+  if (!eventSourceUrl || !clickId) return eventSourceUrl
+  try {
+    const url = new URL(eventSourceUrl)
+    if (!url.searchParams.has('rdt_cid')) {
+      url.searchParams.set('rdt_cid', clickId)
+    }
+    return url.toString()
+  } catch {
+    return eventSourceUrl
+  }
+}
+
+export function buildRedditCustomConversionBody(
+  params: Pick<
+    SendRedditCustomConversionParams,
+    | 'customEventName'
+    | 'conversionId'
+    | 'actionSource'
+    | 'eventAt'
+    | 'eventSourceUrl'
+    | 'testId'
+    | 'user'
+  >,
+) {
+  const user = buildRedditCapiUserPayload(params.user)
+  const eventSourceUrl = eventSourceUrlWithClickId(
+    params.eventSourceUrl,
+    params.user.clickId,
+  )
+
+  return {
+    data: {
+      ...(params.testId ? { test_id: params.testId } : {}),
+      events: [
+        {
+          event_at: params.eventAt ?? Date.now(),
+          action_source: params.actionSource,
+          ...(eventSourceUrl ? { event_source_url: eventSourceUrl } : {}),
+          type: {
+            ...(params.customEventName === 'SignUp'
+              ? { tracking_type: 'SIGN_UP' }
+              : params.customEventName === 'CodingActivation'
+                ? { tracking_type: 'LEAD' }
+                : {
+                    tracking_type: 'CUSTOM',
+                    custom_event_name: params.customEventName,
+                  }),
+          },
+          ...(params.user.clickId ? { click_id: params.user.clickId } : {}),
+          metadata: {
+            conversion_id: params.conversionId,
+          },
+          ...(user ? { user } : {}),
+        },
+      ],
+    },
+  }
+}
+
+function isRetryableStatus(status: number): boolean {
+  return status === 408 || status === 429 || status >= 500
+}
+
+const sleep = (ms: number) =>
+  new Promise<void>((resolve) => setTimeout(resolve, ms))
+
+/** Deliver one conversion, retrying one transient failure. */
+export async function sendRedditCustomConversion(
+  params: SendRedditCustomConversionParams,
+): Promise<RedditCapiDeliveryResult> {
+  if (!(params.enabled ?? IS_PROD) || !params.accessToken) {
+    return 'disabled'
+  }
+
+  const fetchImpl = params.fetchImpl ?? fetch
+  const body = buildRedditCustomConversionBody(params)
+  const sleepImpl = params.sleepImpl ?? sleep
+
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    try {
+      const response = await fetchImpl(REDDIT_CAPI_ENDPOINT, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${params.accessToken}`,
+          'Content-Type': 'application/json',
+          'User-Agent': 'freebuff/1.0 (reddit-capi)',
+        },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(3_000),
+      })
+      if (response.ok) {
+        params.logger?.info(
+          {
+            customEventName: params.customEventName,
+            trackingType: body.data.events[0]?.type.tracking_type,
+            conversionId: params.conversionId,
+            attempt,
+          },
+          'Reddit CAPI conversion delivered',
+        )
+        return 'sent'
+      }
+
+      if (attempt === 1 && isRetryableStatus(response.status)) {
+        await sleepImpl(100)
+        continue
+      }
+      throw new RedditCapiDeliveryError(
+        `Reddit CAPI rejected ${params.customEventName} (${response.status})`,
+        response.status,
+      )
+    } catch (error) {
+      if (
+        attempt === 1 &&
+        (!(error instanceof RedditCapiDeliveryError) ||
+          (error.status !== undefined && isRetryableStatus(error.status)))
+      ) {
+        await sleepImpl(100)
+        continue
+      }
+      params.logger?.warn(
+        {
+          error,
+          customEventName: params.customEventName,
+          trackingType: body.data.events[0]?.type.tracking_type,
+          conversionId: params.conversionId,
+          attempt,
+        },
+        'Reddit CAPI conversion request failed',
+      )
+      if (error instanceof RedditCapiDeliveryError) throw error
+      throw new RedditCapiDeliveryError(
+        `Reddit CAPI request failed for ${params.customEventName}`,
+      )
+    }
+  }
+
+  throw new RedditCapiDeliveryError(
+    `Reddit CAPI request failed for ${params.customEventName}`,
+  )
+}
+
+export function redditConversionId(
+  event: RedditCapiEventName | RedditAcquisitionEvent,
+  userId: string,
+): string {
+  return sha256(`${event}:${userId}`)
+}
+
+/**
+ * Identity fields shared by every server-side Reddit conversion call, built
+ * from the incoming request's headers. Surface-specific attribution (click id,
+ * uuid) is layered on by callers that have it.
+ *
+ * The IP is resolved by the caller, from an edge-verified source, and passed
+ * in. It is never read from `x-real-ip` or the leftmost `x-forwarded-for`
+ * entry here: both pass through Cloudflare from the caller, so they would let
+ * a caller choose what we tell Reddit about them.
+ */
+export function redditUserFromRequestHeaders(params: {
+  userId: string
+  email?: string | null
+  ipAddress?: string | null
+  headers: { get(name: string): string | null }
+}): RedditCapiUser {
+  return {
+    email: params.email,
+    externalId: params.userId,
+    ipAddress: params.ipAddress || undefined,
+    userAgent: params.headers.get('user-agent')?.trim() || undefined,
+  }
+}
+```
+Where the symbols this change introduces are used elsewhere, at this same revision (the code that reads them; this is evidence for the WHAT and the WHY, and it is the only source for who consumes this change):
+- File `common/src/__tests__/reddit-capi.test.ts` (12 matching lines):
+```
+import { createHash } from 'node:crypto'
+
+import { describe, expect, test } from 'bun:test'
+
+import {
+  buildRedditCustomConversionBody,
+  redditConversionId,
+  RedditCapiDeliveryError,
+  sendRedditCustomConversion,
+} from '../reddit-capi'
+
+const sha256 = (value: string) =>
+  createHash('sha256').update(value).digest('hex')
+
+describe('Reddit CAPI', () => {
+  test('builds a documented v3 custom-event payload', () => {
+    const body = buildRedditCustomConversionBody({
+      customEventName: 'FirstPrompt',
+      conversionId: 'conversion-1',
+…
+user_agent: 'Browser',
+              uuid: 'pixel-uuid',
+            },
+          },
+        ],
+      },
+    })
+    expect(body.data.events[0]?.user).not.toHaveProperty('click_id')
+    expect(body.data).not.toHaveProperty('partner')
+  })
+
+  test('uses a stable opaque conversion id per user and event', () => {
+    expect(redditConversionId('FirstPrompt', 'user-123')).toBe(
+      sha256('FirstPrompt:user-123'),
+    )
+    expect(redditConversionId('Retention1d', 'user-123')).not.toBe(
+      redditConversionId('FirstPrompt', 'user-123'),
+    )
+  })
+
+  test('retries one transient failure', async () => {
+    let attempts = 0
+    const result = await sendRedditCustomConversion({
+      enabled: true,
+      accessToken: 'secret',
+      customEventName: 'Retention1d',
+      conversionId: 'conversion-1',
+      actionSource: 'OTHER',
+```
+- File `common/src/paid-social-capi.ts` (4 matching lines):
+```
+.sort(([a], [b]) => a.localeCompare(b))
+    .map(([key, value]) => `${encode(key)}="${encode(value)}"`)
+    .join(', ')}`
+}
+
+export type SendPaidSocialConversionParams = {
+  config: PaidSocialConfig
+  eventName: PaidSocialEvent
+  eventId: string
+  eventAt: Date
+  userId: string
+  attribution: PaidSocialAttribution
+  /** Where the claim was made; decides the page TikTok is told an activation happened on. */
+  surface?: 'web' | 'desktop' | 'cli'
+  fetchImpl?: typeof fetch
+  sleepImpl?: (ms: number) => Promise<void>
+  canSend?: () => Promise<boolean>
+}
+
+/**
+ * The page TikTok is told the event happened on. Registration completes on
+ * the public authentication endpoint the user actually hit. Activation happens inside
+ * Desktop or the CLI, off the site, so it is reported as a CUSTOM web event on
+ * that surface's public product page — decided 2026-09-19, because cost per
+ * activation is the campaign's primary metric and TikTok can only see what it
+ * is sent. Never a private URL, query or token.
+ */
+function tikTokEventPage(
+  eventName: PaidSocialEvent,
+  signupPath: string | undefined,
+  surface: SendPaidSocialConversionParams['surface'],
+): string | undefined {
+  if (eventName === 'CompleteRegistration')
+    return signupPath ? `https://freebuff.com${signupPath}` : undefined
+  return surface === 'desktop' || surface === 'cli'
+    ? `https://freebuff.com/${surface}`
+    : undefined
+```
+- File `common/src/__tests__/paid-social-capi.test.ts` (3 matching lines):
+```
+'not-email',
+      'a@@b.com',
+      'a b@c.com',
+      `${'x'.repeat(255)}@x.com`,
+    ])
+      expect(hashPaidSocialEmail(value)).toBeUndefined()
+  })
+  test.each([x, xPixelToken])(
+    'X accepts genuine signup and native email matching without a click',
+    (config) => {
+      for (const eventName of [
+        'CompleteRegistration',
+        'CodingActivation',
+      ] as const) {
+        const request = buildPaidSocialRequest({
+          ...base,
+          config,
+          eventName,
+          attribution: { userAgent: 'Browser', hashedEmail: emailHash },
+        })
+        expect(request.body).toEqual({
+          conversions: [
+            {
+              conversion_time: '2026-09-18T12:00:00.000Z',
+              event_id: `${config.pixelToken ? 'tw-abc-' : ''}${eventName === 'CompleteRegistration' ? 'signup' : 'activation'}`,
+…
+buildPaidSocialRequest({
+        ...base,
+        config: { ...xPixelToken, signupEventId: 'tw-other-signup' },
+      }),
+    ).toThrow('Invalid X conversion event configuration')
+  })
+  test('native X events have no fabricated website context', () => {
+    const request = buildPaidSocialRequest({
+      ...base,
+      config: x,
+      eventName: 'CodingActivation',
+    })
+    expect(JSON.stringify(request.body)).toContain('activation')
+    expect(JSON.stringify(request.body)).not.toContain('url')
+  })
+  test('TikTok uses the exact server schema and only the allowlisted actual callback', () => {
+    const request = buildPaidSocialRequest({ ...base, config: tiktok })
+    expect(request.url).toBe(
+      'https://business-api.tiktok.com/open_api/v1.3/event/track/',
+    )
+    expect(request.headers['Access-Token']).toBe('token')
+    expect(request.body).toEqual({
+      event_source: 'web',
+      event_source_id: 'TIKTOK1',
+      data: [
+…
+ttp: 'CiXyZ.tt.1',
+            external_id: paidSocialId('tiktok', 'internal-account'),
+            ip: '203.0.113.9',
+            user_agent: 'Browser',
+          },
+          page: { url: 'https://freebuff.com/api/auth/callback/github' },
+        },
+      ],
+    })
+    expect(JSON.stringify(request.body)).not.toContain('internal-only-campaign')
+    expect(JSON.stringify(request.body)).not.toContain('internal-account')
+  })
+  test('TikTok reports native activation as a custom event on the product page of its surface', () => {
+    for (const surface of ['desktop', 'cli'] as const) {
+      const request = buildPaidSocialRequest({
+        ...base,
+        config: tiktok,
+        eventName: 'CodingActivation',
+        surface,
+      })
+      expect(request.body.data).toMatchObject([
+        {
+          event: 'CodingActivation',
+          event_id: 'stable-occurrence',
+          page: { url: `https://freebuff.com/${surface}` },
+```
+- File `common/src/constants/freebuff-placements.ts` (3 matching lines):
+```
+* This set was `20/48/60` — every behavioural breakpoint, including the
+ * renderer's 20-column floor. In practice nobody runs a 20-column terminal
+ * and plenty run wider than 60, so the preview showed the case nobody sees
+ * and stopped short of the ones most people do. The 20-column floor is still
+ * a real renderer fact (`MIN_INLINE_AD_WIDTH`), and the house-ad width budget
+ * still enforces titles there — it is just no longer a preview the console
+ * offers an advertiser.
+ */
+export const PLACEMENT_PREVIEW_WIDTHS = [48, 80, 100] as const
+
+/**
+ * Days after a click within which saving the advertised service's env var
+ * still counts as that campaign's activation.
+ *
+ * This must be printed on screen next to the activation count. Without a
+ * shared rule the advertiser's install count and ours differ and no dispute
+ * can be settled — see {@link ATTRIBUTION_WINDOW_COPY}.
+ */
+export const ACTIVATION_ATTRIBUTION_WINDOW_DAYS = 30
+
+export const ATTRIBUTION_WINDOW_COPY = `Activation counts within ${ACTIVATION_ATTRIBUTION_WINDOW_DAYS} days of the click`
+
+/**
+ * How a placement RENDERS, which is a different question from where it lives.
+ *
+ * `inline` is every slot that shipped before sponsor breaks: a card in the
+ * flow of a transcript or a waiting room, text-first, with an optional small
+…
+/** Conversion attribution is not part of the CPC MVP. Kept for broad types. */
+export function costPerActivation(totals: PlacementTotals): number | null {
+  const perActivation = ratio(totals.spendCents, totals.activations)
+  return perActivation === null ? null : perActivation / 100
+}
+
+/** Spend per billable click. Billable, not raw — the invoice uses billable. */
+export function avgCpc(totals: PlacementTotals): number | null {
+  const perClick = ratio(totals.spendCents, totals.billableClicks)
+  return perClick === null ? null : perClick / 100
+}
+
+/** Spend per verified, payable activation. */
+export function avgCpa(totals: PlacementTotals): number | null {
+  return costPerActivation(totals)
+}
+
+/**
+ * Effective CPM — yield per thousand viewed impressions.
+ *
+ * Derived only. It is what lets an advertiser compare us against the
+ * CPM-priced inventory they already buy, and it must never be a field they can
+ * type into: we do not sell impressions.
+ */
+export function ecpm(totals: PlacementTotals): number | null {
+```
+- File `cli/src/components/ask-user/__tests__/multiple-choice-form.test.ts` (2 matching lines):
+```
+customText: previousAnswer.customText || '',
+          }
+        : {
+            selectedIndex: optionIndex,
+            selectedIndices: undefined,
+            isCustom: false,
+          }
+
+      expect(newAnswer.selectedIndex).toBe(1)
+      expect(newAnswer.isCustom).toBe(false)
+    })
+
+    it('selecting CUSTOM clears selectedIndex and enables isCustom', () => {
+      const previousAnswer: AccordionAnswer = {
+        selectedIndex: 1,
+      }
+
+      const optionIndex = CUSTOM_OPTION_INDEX
+      const isCustomOption = optionIndex === CUSTOM_OPTION_INDEX
+
+      const newAnswer: AccordionAnswer = isCustomOption
+        ? {
+            selectedIndex: undefined,
+            selectedIndices: undefined,
+            isCustom: true,
+…
+if (newIndices.has(optionIndex)) {
+        newIndices.delete(optionIndex)
+      } else {
+        newIndices.add(optionIndex)
+      }
+
+      expect(newIndices.has(0)).toBe(true)
+      expect(newIndices.has(1)).toBe(false)
+      expect(newIndices.has(2)).toBe(true)
+      expect(newIndices.size).toBe(2)
+    })
+
+    it('toggling CUSTOM toggles isCustom flag', () => {
+      const currentAnswer: AccordionAnswer = {
+        selectedIndices: new Set([0]),
+        isCustom: false,
+      }
+
+      const optionIndex = CUSTOM_OPTION_INDEX
+      const toggledCustomOn =
+        optionIndex === CUSTOM_OPTION_INDEX && !currentAnswer.isCustom
+
+      expect(toggledCustomOn).toBe(true)
+    })
+  })
+```
+- File `common/src/constants/analytics-events.ts` (2 matching lines):
+```
+// Freebuff - Chat
+  // Emitted once per new-thread title generation attempt (server-side). The
+  // `outcome` property is one of: generated | empty | unknown_model | error |
+  // aborted. Carries `latencyMs`, `model`, and `titleLength` so the failure/
+  // fallback rate and added latency are queryable.
+  FREEBUFF_CHAT_TITLE_GENERATED = 'freebuff.chat_title_generated',
+  FREEBUFF_TITLE_RATE_LIMITED = 'api.freebuff_title_rate_limited',
+
+  // Freebuff - CLI landing page (/cli). Fired when the install command is
+  // copied; `location` distinguishes hero vs install section. Lets us measure
+  // install intent per campaign (utm_* ride along as super-properties) — the
+  // best proxy conversion for CLI traffic, since CLI activation happens in a
+  // separate identity space with no key back to the web landing.
+  FREEBUFF_CLI_INSTALL_COMMAND_COPIED = 'freebuff.cli_install_command_copied',
+
+  // Freebuff - Enterprise landing page (/enterprise). Fired when the contact
+  // form is submitted successfully; carries `companySize` and whether the
+  // sender self-identified as an AI lab, so inbound demand can be segmented
+  // without reading the emails. The lead itself lands in james@/victor@ inboxes
+  // — this event only measures the funnel into them.
+  FREEBUFF_ENTERPRISE_CONTACT_SUBMITTED = 'freebuff.enterprise_contact_submitted',
+
+  // Freebuff - Desktop download CTAs (home hero, products row, /desktop).
+  // Fired on every click of a download button; `location` distinguishes the
+…
+// FREEBUFF_DESKTOP_DOWNLOAD_CLICKED (location: savings_calculator) but adds
+  // what the visitor had configured at the moment they converted: `savings`
+  // (the headline number they were looking at), `perSeat`, `seats`, `tools`
+  // and `toolCount`. The question it exists to answer is whether a bigger
+  // computed number actually converts better — bucket `savings` and compare
+  // click-through, which the download event alone cannot show.
+  FREEBUFF_HOME_SAVINGS_CTA_CLICKED = 'freebuff.home_savings_cta_clicked',
+
+  // Freebuff - acquisition attribution (UTM / ad-click params captured as
+  // super-properties; filter by utm_source, reddit_click_id, is_reddit_traffic)
+  FREEBUFF_ATTRIBUTED = 'freebuff.attributed',
+  FREEBUFF_AFFILIATE_SIGNUP = 'freebuff.affiliate.signup',
+  FREEBUFF_AFFILIATE_ACTIVATION = 'freebuff.affiliate.activation',
+  // Freebuff - Reddit ad funnel (filter in PostHog by reddit_click_id / utm_source)
+  FREEBUFF_REDDIT_FUNNEL_CLI_INSTALLED = 'freebuff.reddit_funnel.cli_installed',
+  FREEBUFF_REDDIT_FUNNEL_LOGIN = 'freebuff.reddit_funnel.login',
+  FREEBUFF_REDDIT_FUNNEL_SIGN_UP = 'freebuff.reddit_funnel.sign_up',
+  FREEBUFF_REDDIT_FUNNEL_FIRST_PROMPT = 'freebuff.reddit_funnel.first_prompt',
+  FREEBUFF_REDDIT_FUNNEL_RETENTION_1D = 'freebuff.reddit_funnel.retention_1d',
+  FREEBUFF_REDDIT_FUNNEL_RETENTION_7D = 'freebuff.reddit_funnel.retention_7d',
+  FREEBUFF_REDDIT_FUNNEL_RETENTION_24D = 'freebuff.reddit_funnel.retention_24d',
+  // Legacy surface-specific names retained for historical dashboards.
+  FREEBUFF_REDDIT_FUNNEL_FIRST_PROMPT_CLI = 'freebuff.reddit_funnel.first_prompt_cli',
+  FREEBUFF_REDDIT_FUNNEL_FIRST_PROMPT_WEB = 'freebuff.reddit_funnel.first_prompt_web',
+  FREEBUFF_REDDIT_FUNNEL_FIRST_PROMPT_CHAT = 'freebuff.reddit_funnel.first_prompt_chat',
+```
+Tests this commit changed (added lines only; the assertions are what the change is expected to do, not a description of the feature):
+- File `common/src/__tests__/reddit-capi.test.ts`: "canonical signup and coding activation use standard SIGN_UP and LEAD types"
+```
+test('canonical signup and coding activation use standard SIGN_UP and LEAD types', () => {
+    conversionId: redditConversionId('CodingActivation', 'fixture-account'),
+    tracking_type: 'LEAD',
+  expect(activation.click_id).toBe(base.user.clickId)
+  expect(activation.event_at).toBe(base.eventAt)
+  expect(activation.metadata.conversion_id).toBe(
+    redditConversionId('CodingActivation', 'fixture-account'),
+  )
+```
+Diff (source hunks; lockfiles and pure test hunks omitted, except in a lockfile-only commit):
+```diff
+diff --git a/common/src/reddit-capi.ts b/common/src/reddit-capi.ts
+index fe1409bb6..5e5ec5acb 100644
+--- a/common/src/reddit-capi.ts
++++ b/common/src/reddit-capi.ts
+@@ -41,50 +41,51 @@ function normalizeEmail(email: string): string {
+ export function buildRedditCapiUserPayload(user: RedditCapiUser) {
+   const payload: Record<string, string> = {}
+ 
+   if (user.email) {
+     payload.email = sha256(normalizeEmail(user.email))
+   }
+   if (user.externalId) {
+     payload.external_id = sha256(user.externalId.trim())
+   }
+   if (user.ipAddress) {
+     payload.ip_address = user.ipAddress
+   }
+   if (user.userAgent) {
+     payload.user_agent = user.userAgent
+   }
+   if (user.uuid) {
+     payload.uuid = user.uuid
+   }
+ 
+   return Object.keys(payload).length > 0 ? payload : undefined
+ }
+ 
+ export type SendRedditCustomConversionParams = {
+   /** Conversion access token from Reddit Events Manager (env-provided; no-op when unset). */
+   accessToken: string | undefined
++  /** Internal event name; acquisition events map to Reddit's standard types. */
+   customEventName: RedditCapiEventName | RedditAcquisitionEvent
+   conversionId: string
+   actionSource: RedditActionSource
+   eventAt?: number
+   eventSourceUrl?: string
+   testId?: string
+   user: RedditCapiUser
+   fetchImpl?: typeof fetch
+   logger?: Logger
+   enabled?: boolean
+   sleepImpl?: (ms: number) => Promise<void>
+ }
+ 
+ export type RedditCapiDeliveryResult = 'sent' | 'disabled'
+ 
+ export class RedditCapiDeliveryError extends Error {
+   constructor(
+     message: string,
+     readonly status?: number,
+   ) {
+     super(message)
+     this.name = 'RedditCapiDeliveryError'
+   }
+ }
+ 
+@@ -111,130 +112,134 @@ export function buildRedditCustomConversionBody(
+     | 'conversionId'
+     | 'actionSource'
+     | 'eventAt'
+     | 'eventSourceUrl'
+     | 'testId'
+     | 'user'
+   >,
+ ) {
+   const user = buildRedditCapiUserPayload(params.user)
+   const eventSourceUrl = eventSourceUrlWithClickId(
+     params.eventSourceUrl,
+     params.user.clickId,
+   )
+ 
+   return {
+     data: {
+       ...(params.testId ? { test_id: params.testId } : {}),
+       events: [
+         {
+           event_at: params.eventAt ?? Date.now(),
+           action_source: params.actionSource,
+           ...(eventSourceUrl ? { event_source_url: eventSourceUrl } : {}),
+           type: {
+             ...(params.customEventName === 'SignUp'
+               ? { tracking_type: 'SIGN_UP' }
+-              : {
+-                  tracking_type: 'CUSTOM',
+-                  custom_event_name: params.customEventName,
+-                }),
++              : params.customEventName === 'CodingActivation'
++                ? { tracking_type: 'LEAD' }
++                : {
++                    tracking_type: 'CUSTOM',
++                    custom_event_name: params.customEventName,
++                  }),
+           },
+           ...(params.user.clickId ? { click_id: params.user.clickId } : {}),
+           metadata: {
+             conversion_id: params.conversionId,
+           },
+           ...(user ? { user } : {}),
+         },
+       ],
+     },
+   }
+ }
+ 
+ function isRetryableStatus(status: number): boolean {
+   return status === 408 || status === 429 || status >= 500
+ }
+ 
+ const sleep = (ms: number) =>
+   new Promise<void>((resolve) => setTimeout(resolve, ms))
+ 
+-/** Deliver one custom event, retrying one transient failure. */
++/** Deliver one conversion, retrying one transient failure. */
+ export async function sendRedditCustomConversion(
+   params: SendRedditCustomConversionParams,
+ ): Promise<RedditCapiDeliveryResult> {
+   if (!(params.enabled ?? IS_PROD) || !params.accessToken) {
+     return 'disabled'
+   }
+ 
+   const fetchImpl = params.fetchImpl ?? fetch
+   const body = buildRedditCustomConversionBody(params)
+   const sleepImpl = params.sleepImpl ?? sleep
+ 
+   for (let attempt = 1; attempt <= 2; attempt += 1) {
+     try {
+       const response = await fetchImpl(REDDIT_CAPI_ENDPOINT, {
+         method: 'POST',
+         headers: {
+           Authorization: `Bearer ${params.accessToken}`,
+           'Content-Type': 'application/json',
+           'User-Agent': 'freebuff/1.0 (reddit-capi)',
+         },
+         body: JSON.stringify(body),
+         signal: AbortSignal.timeout(3_000),
+       })
+       if (response.ok) {
+         params.logger?.info(
+           {
+             customEventName: params.customEventName,
++            trackingType: body.data.events[0]?.type.tracking_type,
+             conversionId: params.conversionId,
+             attempt,
+           },
+           'Reddit CAPI conversion delivered',
+         )
+         return 'sent'
+       }
+ 
+       if (attempt === 1 && isRetryableStatus(response.status)) {
+         await sleepImpl(100)
+         continue
+       }
+       throw new RedditCapiDeliveryError(
+         `Reddit CAPI rejected ${params.customEventName} (${response.status})`,
+         response.status,
+       )
+     } catch (error) {
+       if (
+         attempt === 1 &&
+         (!(error instanceof RedditCapiDeliveryError) ||
+           (error.status !== undefined && isRetryableStatus(error.status)))
+       ) {
+         await sleepImpl(100)
+         continue
+       }
+       params.logger?.warn(
+         {
+           error,
+           customEventName: params.customEventName,
++          trackingType: body.data.events[0]?.type.tracking_type,
+           conversionId: params.conversionId,
+           attempt,
+         },
+         'Reddit CAPI conversion request failed',
+       )
+       if (error instanceof RedditCapiDeliveryError) throw error
+       throw new RedditCapiDeliveryError(
+         `Reddit CAPI request failed for ${params.customEventName}`,
+       )
+     }
+   }
+ 
+   throw new RedditCapiDeliveryError(
+     `Reddit CAPI request failed for ${params.customEventName}`,
+   )
+ }
+ 
+ export function redditConversionId(
+   event: RedditCapiEventName | RedditAcquisitionEvent,
+   userId: string,
+ ): string {
+   return sha256(`${event}:${userId}`)
+ }
+ 
+ /**
+
+```
