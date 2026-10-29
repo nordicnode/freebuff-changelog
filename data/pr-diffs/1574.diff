@@ -1,0 +1,134 @@
+diff --git a/cli/src/__tests__/unit/create-run-config.test.ts b/cli/src/__tests__/unit/create-run-config.test.ts
+index 46ffc3ee5a..13577d886b 100644
+--- a/cli/src/__tests__/unit/create-run-config.test.ts
++++ b/cli/src/__tests__/unit/create-run-config.test.ts
+@@ -79,6 +79,29 @@ describe('createRunConfig', () => {
+     expect(observeChunk).toHaveBeenCalledTimes(1)
+   })
+ 
++  test('forwards the transcript-scaled checkpoint interval to the SDK', () => {
++    const run = createRunConfig({
++      agent: 'custom',
++      prompt: 'hi',
++      content: undefined,
++      previousRunState: null,
++      agentDefinitions: [],
++      signal: new AbortController().signal,
++    } as unknown as CreateRunConfigParams)
++    expect(run.stateSnapshotIntervalMs).toBeUndefined()
++
++    const scaled = createRunConfig({
++      agent: 'custom',
++      prompt: 'hi',
++      content: undefined,
++      previousRunState: null,
++      agentDefinitions: [],
++      signal: new AbortController().signal,
++      stateSnapshotIntervalMs: 15_000,
++    } as unknown as CreateRunConfigParams)
++    expect(scaled.stateSnapshotIntervalMs).toBe(15_000)
++  })
++
+   test('skips the symbol index only for a base3 root', () => {
+     expect(config('base3-free-deepseek-flash').skipSymbolIndex).toBe(true)
+     expect(config('base3-fast-free-deepseek-flash').skipSymbolIndex).toBe(true)
+diff --git a/cli/src/hooks/use-send-message.ts b/cli/src/hooks/use-send-message.ts
+index 004b220dd4..6e93aa7fac 100644
+--- a/cli/src/hooks/use-send-message.ts
++++ b/cli/src/hooks/use-send-message.ts
+@@ -37,6 +37,7 @@ import { runWithFreebuffCatalogStaleRetry } from '../utils/freebuff-model-catalo
+ import { logger } from '../utils/logger'
+ import { clearActiveRun, registerActiveRun } from '../utils/active-run'
+ import {
++  checkpointIntervalMsForChat,
+   clearLiveChatStateProvider,
+   loadMostRecentChatState,
+   resolveCurrentChatDir,
+@@ -823,6 +824,11 @@ export const useSendMessage = ({
+                       ...clientDescriptorMetadata(content),
+                     }
+                   : undefined,
++              // Checkpoint cost is proportional to the persisted state, so the
++              // interval scales with it — 5s under 8MB, then 10s/15s/20s at
++              // 8MB/16MB/24MB — instead of paying a full clone + serialize +
++              // fsync of tens of MB every 5s.
++              stateSnapshotIntervalMs: checkpointIntervalMsForChat(runChatDir),
+               onStateSnapshot: (snapshot) => {
+                 const pinnedSnapshot = pinByokConnection(snapshot, selectedByok)
+                 latestRunStateSnapshot = pinnedSnapshot
+diff --git a/cli/src/utils/create-run-config.ts b/cli/src/utils/create-run-config.ts
+index f7f2a707cc..a9450781e5 100644
+--- a/cli/src/utils/create-run-config.ts
++++ b/cli/src/utils/create-run-config.ts
+@@ -35,6 +35,9 @@ export type CreateRunConfigParams = {
+   extraCodebuffMetadata?: Record<string, string>
+   /** Periodic in-flight RunState checkpoints (see RunOptions.onStateSnapshot). */
+   onStateSnapshot?: (runState: RunState) => void
++  /** How often those checkpoints fire; scaled to the transcript by
++   *  checkpointIntervalMsForChat (see RunOptions.stateSnapshotIntervalMs). */
++  stateSnapshotIntervalMs?: number
+   /** Mid-turn steering: drained by the agent loop at each step boundary;
+    *  returned texts are appended as user prompts and keep the turn going
+    *  (see RunOptions.drainSteeringMessages). */
+@@ -110,6 +113,7 @@ export const createRunConfig = (params: CreateRunConfigParams) => {
+     byok,
+     extraCodebuffMetadata,
+     onStateSnapshot,
++    stateSnapshotIntervalMs,
+     drainSteeringMessages,
+   } = params
+ 
+@@ -155,6 +159,7 @@ export const createRunConfig = (params: CreateRunConfigParams) => {
+     byok,
+     extraCodebuffMetadata,
+     onStateSnapshot,
++    stateSnapshotIntervalMs,
+     drainSteeringMessages,
+     fileFilter: ((filePath: string) => {
+       if (isSensitiveFile(filePath)) return { status: 'blocked' }
+diff --git a/cli/src/utils/run-state-storage.ts b/cli/src/utils/run-state-storage.ts
+index 986bce3ce3..5260f0677d 100644
+--- a/cli/src/utils/run-state-storage.ts
++++ b/cli/src/utils/run-state-storage.ts
+@@ -20,6 +20,41 @@ import type { RunState } from '@codebuff/sdk'
+ 
+ const RUN_STATE_FILENAME = 'run-state.json'
+ 
++// One extra 5s of checkpoint interval per 8 MB of persisted state, capped at
++// 20s: a small chat keeps the base cadence, and only a genuinely large
++// transcript stretches, where a checkpoint costs tens of milliseconds and two
++// fsyncs. Read from the files on disk once per run, so the interval follows the
++// transcript that run will actually be extending.
++const CHECKPOINT_INTERVAL_STEP_BYTES = 8 * 1024 * 1024
++const CHECKPOINT_BASE_INTERVAL_MS = 5_000
++const CHECKPOINT_MAX_INTERVAL_MS = 20_000
++
++/** The interval for a given persisted size - 5s, +5s per 8 MB, capped at 20s. */
++export function checkpointIntervalMsForStateBytes(bytes: number): number {
++  if (!Number.isFinite(bytes) || bytes <= 0) return CHECKPOINT_BASE_INTERVAL_MS
++  const steps = Math.floor(bytes / CHECKPOINT_INTERVAL_STEP_BYTES)
++  return Math.min(
++    CHECKPOINT_MAX_INTERVAL_MS,
++    CHECKPOINT_BASE_INTERVAL_MS * (1 + steps),
++  )
++}
++
++/**
++ * The checkpoint interval to hand the SDK for a run in `chatDir` (see
++ * `RunOptions.stateSnapshotIntervalMs`). A stat per file, once per run.
++ */
++export function checkpointIntervalMsForChat(chatDir: string): number {
++  let bytes = 0
++  for (const name of [RUN_STATE_FILENAME, CHAT_MESSAGES_FILENAME]) {
++    try {
++      bytes += fs.statSync(path.join(chatDir, name)).size
++    } catch {
++      // A missing file just leaves the base interval in place.
++    }
++  }
++  return checkpointIntervalMsForStateBytes(bytes)
++}
++
+ type SavedChatState = {
+   runState: RunState
+   messages: ChatMessage[]
