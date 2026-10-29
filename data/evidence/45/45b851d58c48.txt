@@ -1,0 +1,836 @@
+Date: 2026-10-29T19:39:40Z
+Category: Core
+Areas: Shared/Core
+Commit nature: production
+Stats: +246 / -47
+Analysis notes: Shared/Core changes across 1 file(s) (+246/−47).
+Modified files: common/src/util/stats.ts
+Key facts (ground the WHY and DETAIL sentences in these): - One arm's per-opportunity revenue, as sums: `n` opportunities (no-fills included, at revenue 0), `sum` = sum of revenue r_i and `sumSquares` = sum of r_i^2, all in one unit (cents). Sums add across days and placements, so rollup rows combine by addition before this is called. - Standard error of `value`. - Unrounded mean and standard error, per 1,000 opportunities. - Mean revenue per 1,000 opportunities with a 95% normal (CLT) interval. The sample variance comes from the sums, (Q - S^2/n) / (n - 1), clamped at 0 against rounding. Treats opportunities as independent, which ignores clustering by user: read the interval as a lower bound on the true width.
+Structured facts (extracted mechanically from the diff; copy names and values verbatim, never round or rename):
+- Exports added: RevenueSums, RevenuePerThousand, RevenueUplift, revenuePerThousand, revenueUplift
+- Behavior asserted by new tests (test titles, verbatim; the hunks themselves are omitted): "revenuePerThousand" ; "mean and standard error from the sums" ; "constant revenue has zero width, never a negative variance" ; "null on too few or invalid sums" ; "matches the direct per-opportunity computation" ; "revenueUplift" ; "difference with an independent-arm standard error" ; "ratio with a delta-method interval on the log scale" ; "no ratio when the uniform arm earned nothing" ; "null when an arm is empty"
+Module & File Purpose (ground-truth documentation from touched files):
+- File `common/src/util/stats.ts`:
+```
+/**
+ * Small, dependency-free statistics for experiment readouts and eval gates.
+ *
+ * `wilsonInterval` moved here from `freebuff/web/src/server/ad-serving/intent/
+ * stats.ts` (which re-exports it) so Postgres-side readouts
+ * (`packages/internal/src/experiments/readout.ts`) can share it.
+ */
+```
+Complete Source of Modified Files (for complete module context):
+- File `common/src/util/stats.ts` (314 lines):
+```
+/**
+ * Small, dependency-free statistics for experiment readouts and eval gates.
+ *
+ * `wilsonInterval` moved here from `freebuff/web/src/server/ad-serving/intent/
+ * stats.ts` (which re-exports it) so Postgres-side readouts
+ * (`packages/internal/src/experiments/readout.ts`) can share it.
+ */
+
+const Z_95 = 1.959964
+
+export type WilsonInterval = {
+  readonly value: number
+  readonly lower: number
+  readonly upper: number
+}
+
+export function round6(value: number): number {
+  return Math.round(value * 1_000_000) / 1_000_000
+}
+
+function validProportion(successes: number, trials: number): boolean {
+  return (
+    Number.isFinite(successes) &&
+    Number.isFinite(trials) &&
+    trials > 0 &&
+    successes >= 0 &&
+    successes <= trials
+  )
+}
+
+/** Unrounded Wilson bounds; callers have already validated the inputs. */
+function wilsonRaw(successes: number, trials: number) {
+  const z = Z_95
+  const p = successes / trials
+  const z2 = z * z
+  const denominator = 1 + z2 / trials
+  const centre = (p + z2 / (2 * trials)) / denominator
+  const half =
+    (z * Math.sqrt((p * (1 - p)) / trials + z2 / (4 * trials * trials))) /
+    denominator
+  return {
+    p,
+    lower: Math.max(0, centre - half),
+    upper: Math.min(1, centre + half),
+  }
+}
+
+/** Wilson score interval at 95%. `null` when there are no trials. */
+export function wilsonInterval(
+  successes: number,
+  trials: number,
+): WilsonInterval | null {
+  if (!validProportion(successes, trials)) return null
+  const { p, lower, upper } = wilsonRaw(successes, trials)
+  return { value: round6(p), lower: round6(lower), upper: round6(upper) }
+}
+
+export type DifferenceInterval = {
+  /** p1 - p2 */
+  readonly difference: number
+  readonly lower: number
+  readonly upper: number
+}
+
+/**
+ * 95% interval for the difference of two independent proportions, p1 - p2,
+ * by Newcombe's hybrid score method (method 10, Newcombe 1998), built from
+ * the two Wilson intervals. Well-behaved at small counts and near 0 or 1,
+ * where the Wald interval is not. `null` when either arm has no trials.
+ */
+export function newcombeDifference(
+  successes1: number,
+  trials1: number,
+  successes2: number,
+  trials2: number,
+): DifferenceInterval | null {
+  if (
+    !validProportion(successes1, trials1) ||
+    !validProportion(successes2, trials2)
+  ) {
+    return null
+  }
+  const a = wilsonRaw(successes1, trials1)
+  const b = wilsonRaw(successes2, trials2)
+  const d = a.p - b.p
+  const lower = d - Math.sqrt((a.p - a.lower) ** 2 + (b.upper - b.p) ** 2)
+  const upper = d + Math.sqrt((a.upper - a.p) ** 2 + (b.p - b.lower) ** 2)
+  return {
+    difference: round6(d),
+    lower: round6(Math.max(-1, lower)),
+    upper: round6(Math.min(1, upper)),
+  }
+}
+
+export type SampleRatioCheck = {
+  readonly chiSquare: number
+  readonly degreesOfFreedom: number
+  /** Probability of a split at least this uneven if assignment is healthy. */
+  readonly pValue: number
+}
+
+/**
+ * Sample-ratio-mismatch check: Pearson chi-square goodness of fit of the
+ * observed per-arm counts against the configured weights. A tiny p-value
+ * (conventionally < 0.001) means assignment or logging is broken and the
+ * experiment's comparison cannot be trusted. `null` with fewer than two
+ * weighted arms or no observations.
+ */
+export function sampleRatioMismatch(
+  observed: readonly number[],
+  weights: readonly number[],
+): SampleRatioCheck | null {
+  if (observed.length !== weights.length) {
+    throw new Error('observed and weights must have the same length')
+  }
+  const total = observed.reduce((sum, n) => sum + n, 0)
+  const weightTotal = weights.reduce((sum, w) => sum + w, 0)
+  if (total <= 0 || weightTotal <= 0) return null
+  let chiSquare = 0
+  let cells = 0
+  for (let i = 0; i < observed.length; i++) {
+    if (weights[i] <= 0) continue
+    const expected = (total * weights[i]) / weightTotal
+    chiSquare += (observed[i] - expected) ** 2 / expected
+    cells++
+  }
+  if (cells < 2) return null
+  const degreesOfFreedom = cells - 1
+  return {
+    chiSquare: round6(chiSquare),
+    degreesOfFreedom,
+    pValue: round6(chiSquareSurvival(chiSquare, degreesOfFreedom)),
+  }
+}
+
+/**
+ * One arm's per-opportunity revenue, as sums: `n` opportunities (no-fills
+ * included, at revenue 0), `sum` = sum of revenue r_i and `sumSquares` =
+ * sum of r_i^2, all in one unit (cents). Sums add across days and
+ * placements, so rollup rows combine by addition before this is called.
+ */
+export type RevenueSums = {
+  readonly n: number
+  readonly sum: number
+  readonly sumSquares: number
+}
+
+export type RevenuePerThousand = {
+  /** 1,000 x mean revenue per opportunity. */
+  readonly value: number
+  /** Standard error of `value`. */
+  readonly standardError: number
+  readonly lower: number
+  readonly upper: number
+}
+
+export type RevenueUplift = {
+  readonly uniform: RevenuePerThousand
+  readonly ranked: RevenuePerThousand
+  /** ranked - uniform per 1,000 opportunities, 95% normal interval. */
+  readonly difference: {
+    readonly value: number
+    readonly lower: number
+    readonly upper: number
+  }
+  /**
+   * ranked / uniform with a 95% interval from the delta method on the log
+   * ratio; null when either arm's mean is 0.
+   */
+  readonly ratio: {
+    readonly value: number
+    readonly lower: number
+    readonly upper: number
+  } | null
+}
+
+function validSums(s: RevenueSums): boolean {
+  return (
+    Number.isFinite(s.n) &&
+    Number.isFinite(s.sum) &&
+    Number.isFinite(s.sumSquares) &&
+    s.n >= 2 &&
+    s.sum >= 0 &&
+    s.sumSquares >= 0
+  )
+}
+
+/** Unrounded mean and standard error, per 1,000 opportunities. */
+function perThousandRaw(sums: RevenueSums): { value: number; se: number } {
+  const mean = sums.sum / sums.n
+  const variance = Math.max(
+    0,
+    (sums.sumSquares - (sums.sum * sums.sum) / sums.n) / (sums.n - 1),
+  )
+  return { value: 1_000 * mean, se: 1_000 * Math.sqrt(variance / sums.n) }
+}
+
+/**
+ * Mean revenue per 1,000 opportunities with a 95% normal (CLT) interval.
+ * The sample variance comes from the sums, (Q - S^2/n) / (n - 1), clamped at
+ * 0 against rounding. Treats opportunities as independent, which ignores
+ * clustering by user: read the interval as a lower bound on the true width.
+ * `null` below two opportunities or on invalid sums.
+ */
+export function revenuePerThousand(
+  sums: RevenueSums,
+): RevenuePerThousand | null {
+  if (!validSums(sums)) return null
+  const { value, se } = perThousandRaw(sums)
+  return {
+    value: round6(value),
+    standardError: round6(se),
+    lower: round6(value - Z_95 * se),
+    upper: round6(value + Z_95 * se),
+  }
+}
+
+/**
+ * The ranked arm's revenue uplift over the uniform (random) arm, per 1,000
+ * opportunities: the difference with a 95% interval (independent arms,
+ * se = sqrt(se_r^2 + se_u^2)), and the ratio with a 95% interval from the
+ * delta method, var(log(m_r / m_u)) ~ (se_r / m_r)^2 + (se_u / m_u)^2,
+ * exponentiated back (so it is asymmetric and never below 0). `null` when
+ * either arm has under two opportunities.
+ */
+export function revenueUplift(
+  ranked: RevenueSums,
+  uniform: RevenueSums,
+): RevenueUplift | null {
+  const r = revenuePerThousand(ranked)
+  const u = revenuePerThousand(uniform)
+  if (!r || !u) return null
+  const rr = perThousandRaw(ranked)
+  const ur = perThousandRaw(uniform)
+  const diff = rr.value - ur.value
+  const diffSe = Math.sqrt(rr.se ** 2 + ur.se ** 2)
+  let ratio: RevenueUplift['ratio'] = null
+  if (rr.value > 0 && ur.value > 0) {
+    const logSe = Math.sqrt((rr.se / rr.value) ** 2 + (ur.se / ur.value) ** 2)
+    const logRatio = Math.log(rr.value / ur.value)
+    ratio = {
+      value: round6(rr.value / ur.value),
+      lower: round6(Math.exp(logRatio - Z_95 * logSe)),
+      upper: round6(Math.exp(logRatio + Z_95 * logSe)),
+    }
+  }
+  return {
+    uniform: u,
+    ranked: r,
+    difference: {
+      value: round6(diff),
+      lower: round6(diff - Z_95 * diffSe),
+      upper: round6(diff + Z_95 * diffSe),
+    },
+    ratio,
+  }
+}
+
+/** P(X >= x) for X ~ chi-square(k). */
+export function chiSquareSurvival(x: number, k: number): number {
+  if (x <= 0) return 1
+  return regularizedGammaQ(k / 2, x / 2)
+}
+
+function logGamma(x: number): number {
+  // Lanczos approximation (g = 7, n = 9).
+  const c = [
+    0.99999999999980993, 676.5203681218851, -1259.1392167224028,
+    771.32342877765313, -176.61502916214059, 12.507343278686905,
+    -0.13857109526572012, 9.9843695780195716e-6, 1.5056327351493116e-7,
+  ]
+  if (x < 0.5) {
+    return Math.log(Math.PI / Math.sin(Math.PI * x)) - logGamma(1 - x)
+  }
+  x -= 1
+  let a = c[0]
+  const t = x + 7.5
+  for (let i = 1; i < 9; i++) a += c[i] / (x + i)
+  return 0.5 * Math.log(2 * Math.PI) + (x + 0.5) * Math.log(t) - t + Math.log(a)
+}
+
+/** Q(a, x) = Γ(a, x) / Γ(a), series below a + 1, continued fraction above. */
+function regularizedGammaQ(a: number, x: number): number {
+  const gln = logGamma(a)
+  if (x < a + 1) {
+    let sum = 1 / a
+    let term = sum
+    for (let n = 1; n < 500; n++) {
+      term *= x / (a + n)
+      sum += term
+      if (Math.abs(term) < Math.abs(sum) * 1e-15) break
+    }
+    return Math.max(0, 1 - sum * Math.exp(-x + a * Math.log(x) - gln))
+  }
+  const tiny = 1e-300
+  let b = x + 1 - a
+  let c = 1 / tiny
+  let d = 1 / b
+  let h = d
+  for (let i = 1; i < 500; i++) {
+    const an = -i * (i - a)
+    b += 2
+    d = an * d + b
+    if (Math.abs(d) < tiny) d = tiny
+    c = b + an / c
+    if (Math.abs(c) < tiny) c = tiny
+    d = 1 / d
+    const delta = d * c
+    h *= delta
+    if (Math.abs(delta - 1) < 1e-15) break
+  }
+  return Math.min(1, Math.exp(-x + a * Math.log(x) - gln) * h)
+}
+```
+Where the symbols this change introduces are used elsewhere, at this same revision (the code that reads them; this is evidence for the WHAT and the WHY, and it is the only source for who consumes this change):
+- File `common/src/util/__tests__/stats.test.ts` (36 matching lines):
+```
+import { describe, expect, test } from 'bun:test'
+
+import {
+  chiSquareSurvival,
+  newcombeDifference,
+  revenuePerThousand,
+  revenueUplift,
+  sampleRatioMismatch,
+  wilsonInterval,
+} from '../stats'
+
+describe('wilsonInterval', () => {
+  test('matches the published 81/263 example', () => {
+    // Newcombe (1998), Table I, method 3 (score): 0.2553 to 0.3662.
+    const ci = wilsonInterval(81, 263)!
+    expect(ci.value).toBeCloseTo(0.307985, 5)
+    expect(ci.lower).toBeCloseTo(0.2553, 4)
+    expect(ci.upper).toBeCloseTo(0.3662, 4)
+  })
+
+  test('edges', () => {
+    expect(wilsonInterval(0, 0)).toBeNull()
+    expect(wilsonInterval(3, 2)).toBeNull()
+    expect(wilsonInterval(0, 10)!.lower).toBe(0)
+    expect(wilsonInterval(10, 10)!.upper).toBe(1)
+  })
+})
+```
+- File `common/src/project-understanding/__tests__/agent-cost.test.ts` (5 matching lines):
+```
+outputTokens: 0,
+      }),
+    ).toBe(0)
+  })
+
+  test('prices a million of each term at the card', () => {
+    expect(
+      estimateProjectUnderstandingCostUsd({
+        inputTokens: 1_000_000,
+        cachedInputTokens: 0,
+        outputTokens: 0,
+      }),
+    ).toBeCloseTo(PRICE.input, 12)
+    expect(
+      estimateProjectUnderstandingCostUsd({
+        inputTokens: 1_000_000,
+        cachedInputTokens: 1_000_000,
+        outputTokens: 0,
+      }),
+    ).toBeCloseTo(PRICE.cachedInput, 12)
+    expect(
+      estimateProjectUnderstandingCostUsd({
+        inputTokens: 0,
+        cachedInputTokens: 0,
+        outputTokens: 1_000_000,
+      }),
+    ).toBeCloseTo(PRICE.output, 12)
+  })
+
+  test('counts cached tokens as part of input, never on top of it', () => {
+    // 40k prompt tokens of which 30k were cache reads: 10k fresh.
+    const cost = estimateProjectUnderstandingCostUsd({
+      inputTokens: 40_000,
+      cachedInputTokens: 30_000,
+      outputTokens: 2_000,
+    })
+    expect(cost).toBeCloseTo(
+      (10_000 * PRICE.input +
+        30_000 * PRICE.cachedInput +
+```
+- File `agents/__tests__/base-chat.test.ts` (2 matching lines):
+```
+// source-shape assertion would be checking the bundler, not the table.
+    const budgetFraction =
+      budgetFor('minimax/minimax-m3') /
+      FREEBUFF_MODEL_CONTEXT_WINDOWS['minimax/minimax-m3']
+
+    for (const [model, window] of Object.entries(
+      FREEBUFF_MODEL_CONTEXT_WINDOWS,
+    )) {
+      // A model missing from the inline table would silently fall back to the
+      // default, giving a ratio nothing like the others — which is exactly the
+      // drift we want caught. Compare ratios (not floored products) so the
+      // assertion isn't hostage to floating-point rounding.
+      expect(budgetFor(model) / window).toBeCloseTo(budgetFraction, 4)
+    }
+
+    expect(
+      budgetFor('some/model-we-have-never-shipped') /
+        FREEBUFF_DEFAULT_CONTEXT_WINDOW,
+    ).toBeCloseTo(budgetFraction, 4)
+  })
+
+  test('budgets Luna 400k, not the 52k it got while missing from the table', () => {
+    // Luna's real window is ~1.05M (every OpenRouter endpoint reports it), so
+    // falling through to FREEBUFF_DEFAULT_CONTEXT_WINDOW budgeted a
+    // million-token model 131_072 * 0.4 = 52_428. Each summarize rewrites the
+    // thread from the front and discards the prompt cache with it, so an
+    // under-budget model pays for it in cache misses as well as lost context.
+    expect(budgetFor('openai/gpt-5.6-luna')).toBe(400_000)
+    expect(budgetFor('openai/gpt-5.6-luna')).toBeGreaterThan(
+      budgetFor('some/model-we-have-never-shipped'),
+    )
+```
+- File `agents/e2e/context-pruning-threshold.e2e.test.ts` (2 matching lines):
+```
+const CHARS_PER_TOKEN = 4
+const TOOL_PAIR_TOKENS = 550 // avg tokens for tool call + result every other round
+const TOKENS_PER_ROUND = Math.ceil(
+  (2 * LARGE_CONTENT_SIZE) / CHARS_PER_TOKEN + TOOL_PAIR_TOKENS,
+)
+
+/**
+ * Diverse word content that tokenizes predictably at ~4 chars/token.
+ * Repeated 'x' characters compress to ~5-6 chars/token in Anthropic's BPE tokenizer,
+ * making token estimates inaccurate. Using diverse words avoids this.
+ */
+const WORD_FILLER =
+  'alpha bravo charlie delta echo foxtrot golf hotel india juliett kilo lima mike november oscar papa quebec romeo sierra tango uniform victor whiskey xray yankee zulu '
+
+function makeLargeContent(prefix: string, size: number): string {
+  const repeats = Math.ceil((size - prefix.length) / WORD_FILLER.length)
+  return prefix + WORD_FILLER.repeat(repeats).slice(0, size - prefix.length)
+}
+
+function buildMessageHistory(targetApproxTokens: number): Message[] {
+  const messages: Message[] = []
+  const roundsNeeded = Math.max(1, Math.ceil(targetApproxTokens / TOKENS_PER_ROUND))
+  const now = Date.now()
+
+  console.log(
+…
+console.log('  [below-limit] Pruning result:', pruningResult)
+
+      // Key assertion: pruning should NOT have happened
+      expect(pruningResult.wasPruned).toBe(false)
+
+      // Token count should be below the limit
+      expect(tokenCount).toBeLessThan(100_000)
+
+      // CRITICAL: The token count should NOT have a 30% buffer applied
+      // If the old bug were present, the actual count (~50k) would be reported as ~65k
+      // With accurate counting for Anthropic models, no buffer is applied
+      expect(tokenCount).toBeGreaterThan(10_000) // At least some tokens accumulated
+      expect(tokenCount).toBeLessThan(80_000) // Well below limit even with natural variance
+    },
+    { timeout: 120_000 },
+  )
+
+  it(
+    'should prune when token count exceeds the limit',
+    async () => {
+      const apiKey = process.env[API_KEY_ENV_VAR]!
+      if (!apiKey) {
+        console.log('Skipping: No API key found')
+        return
+      }
+```
+- File `common/src/constants/__tests__/freebuff-sponsored-survey.test.ts` (2 matching lines):
+```
+it('the default mix is the 2026-10-09 WAU measurement and sums to 1', () => {
+    expect(SPONSORED_SURVEY_DEFAULT_TIER_MIX).toEqual({
+      tier1: 0.073,
+      tier2: 0.06,
+      tier3: 0.085,
+      tier4: 0.76,
+      tier5: 0.022,
+    })
+    const sum = Object.values(SPONSORED_SURVEY_DEFAULT_TIER_MIX).reduce(
+      (a, b) => a + b,
+      0,
+    )
+    expect(sum).toBeCloseTo(1, 9)
+  })
+
+  it('normalises a mix, and falls back to the default when empty', () => {
+    const m = normalizeSponsoredSurveyTierMix({ tier1: 2, tier4: 6 })
+    expect(m).toEqual({
+      tier1: 0.25,
+      tier2: 0,
+      tier3: 0,
+      tier4: 0.75,
+      tier5: 0,
+    })
+    const bad = normalizeSponsoredSurveyTierMix({
+      tier1: -1,
+      tier2: Number.NaN,
+      tier3: Number.POSITIVE_INFINITY,
+      tier5: 1,
+    })
+    expect(bad).toEqual({ tier1: 0, tier2: 0, tier3: 0, tier4: 0, tier5: 1 })
+    for (const empty of [null, undefined, {}, { tier1: 0 }]) {
+      const d = normalizeSponsoredSurveyTierMix(empty)
+      for (const t of SPONSORED_SURVEY_COUNTRY_TIERS)
+        expect(d[t]).toBeCloseTo(SPONSORED_SURVEY_DEFAULT_TIER_MIX[t], 12)
+    }
+  })
+
+  it('4 questions at 400 completes, default mix: Standard and Expedited', () => {
+    const standard = sponsoredSurveyQuote({
+      questionCount: 4,
+      speed: 'standard',
+      targetCompletes: 400,
+    })
+    // 500*.073 + 275*.06 + 125*.085 + 50*.76 + 50*.022 = 102.725
+    expect(standard?.bucket).toBe('S')
+    expect(standard?.perComplete).toEqual({
+```
+- File `common/src/util/axiom-only-log.ts` (2 matching lines):
+```
+/**
+   * The eligibility census: two counts and two producer-encoded histogram
+   * strings. `eligible_campaign_labels` comma-joins opaque allocation labels
+   * (`unlabeled` for a campaign carrying none) and `exclusion_reasons` is
+   * `code:count` pairs sorted by code, omitted when nothing was excluded.
+   * Campaign and advertiser ids never enter this event -- the label is the
+   * campaign handle on Axiom, the raw id stays in Postgres.
+   */
+  eligible_campaign_count: 'number',
+  /**
+   * THE UNIFORM ARM (`first-party-selection.ts`, `firstPartyExploreArm`):
+   * the placement's arm on every request whose direct stage ran on a leg in
+   * the experiment, `uniform` or `ranked`, no-fills included, so the split
+   * can be checked. Absent on the exempt legs and where our book was never
+   * asked. The served campaign's propensity is on `ad_candidate`.
+   */
+  explore_arm: 'string',
+  /**
+   * COD-996, the served ad's translation step (`ad-translation/serve.ts`):
+   * `ad_translation_result` (`off`, `no_language`, `unassigned`, `skipped`,
+   * `no_copy`, `control`, `translated`, `timeout`, `error`) and its two waits,
+   * the viewer decision (zero after a request's first placement) and the copy
+   * lookup. Absent where the step never ran: no first-party fill, the agentic
+   * pool, a shadow leg.
+   */
+…
+frequency_status: 'string',
+  frequency_unavailable_cause: 'string',
+  frequency_unavailable_causes: 'string',
+  frequency_reservation_ms: 'number',
+  frequency_max_reservation_ms: 'number',
+  duration_ms: 'number',
+  /**
+   * The L2 v0 ranker, present only while `FREEBUFF_FIRST_PARTY_RANKER` is not
+   * `off`: its mode and model version, the state of its evidence -- `ready`
+   * (scoring produced scores), `unscored` (evidence, but nothing scorable),
+   * `uncovered` (the newest window is not covered and nothing was retained)
+   * or `unavailable` (not loaded yet, loads failing, or aged out) -- and per
+   * request the placements it scored and those whose ranked pick differs
+   * from today's rotation pick -- the shadow disagreement rate. Counts only;
+   * the two picks' campaign ids stay in-process.
+   */
+  ranker_mode: 'string',
+  ranker_version: 'string',
+  ranker_evidence: 'string',
+  ranker_scored_placements: 'number',
+  ranker_disagreements: 'number',
+  /**
+   * F, the fatigue layer (`docs/ads/fatigue-layer.md` §8), with
+   * the ranker. Aggregates only, never a campaign or user id: the history
+   * read's status (`ready`, `no_history`, `opted_out`, `timeout`,
+```
+Tests this commit changed (added lines only; the assertions are what the change is expected to do, not a description of the feature):
+- File `common/src/util/__tests__/stats.test.ts`: "revenuePerThousand"; "mean and standard error from the sums"; "constant revenue has zero width, never a negative variance"; "null on too few or invalid sums"; "matches the direct per-opportunity computation"; "revenueUplift"; "difference with an independent-arm standard error"; "ratio with a delta-method interval on the log scale"
+```
+  revenuePerThousand,
+  revenueUplift,
+describe('revenuePerThousand', () => {
+  test('mean and standard error from the sums', () => {
+    // r = [0, 0, 10, 30]: mean 10, sample variance 200, se sqrt(200 / 4).
+    const out = revenuePerThousand({ n: 4, sum: 40, sumSquares: 1_000 })!
+    const se = 1_000 * Math.sqrt(50)
+    expect(out.value).toBe(10_000)
+    expect(out.standardError).toBeCloseTo(se, 4)
+    expect(out.lower).toBeCloseTo(10_000 - 1.959964 * se, 3)
+    expect(out.upper).toBeCloseTo(10_000 + 1.959964 * se, 3)
+  })
+  test('constant revenue has zero width, never a negative variance', () => {
+    const out = revenuePerThousand({ n: 3, sum: 0.3, sumSquares: 0.03 })!
+    expect(out.value).toBeCloseTo(100, 6)
+    expect(out.standardError).toBe(0)
+  })
+  test('null on too few or invalid sums', () => {
+    expect(revenuePerThousand({ n: 1, sum: 5, sumSquares: 25 })).toBeNull()
+    expect(revenuePerThousand({ n: 10, sum: -1, sumSquares: 1 })).toBeNull()
+    expect(
+      revenuePerThousand({ n: Number.NaN, sum: 1, sumSquares: 1 }),
+    ).toBeNull()
+  })
+  test('matches the direct per-opportunity computation', () => {
+    const values = [0, 0, 0, 0, 12, 0, 0, 3.5, 0, 0, 0, 40, 0, 0, 0.2]
+    const n = values.length
+    const sum = values.reduce((a, b) => a + b, 0)
+    const mean = sum / n
+    const variance = values.reduce((a, b) => a + (b - mean) ** 2, 0) / (n - 1)
+    const out = revenuePerThousand({
+      n,
+      sum,
+      sumSquares: values.reduce((a, b) => a + b * b, 0),
+    })!
+    expect(out.value).toBeCloseTo(1_000 * mean, 4)
+    expect(out.standardError).toBeCloseTo(1_000 * Math.sqrt(variance / n), 4)
+  })
+})
+describe('revenueUplift', () => {
+  // uniform r = [0, 0, 10, 30], ranked r = [10, 10, 20, 40]: means 10 and 20,
+  // both with sample variance 200.
+  const uniform = { n: 4, sum: 40, sumSquares: 1_000 }
+  const ranked = { n: 4, sum: 80, sumSquares: 2_200 }
+  const se = 1_000 * Math.sqrt(50)
+  test('difference with an independent-arm standard error'
+```
+Diff (source hunks; lockfiles and pure test hunks omitted, except in a lockfile-only commit):
+```diff
+diff --git a/common/src/util/stats.ts b/common/src/util/stats.ts
+index 492404647..32e9e3a36 100644
+--- a/common/src/util/stats.ts
++++ b/common/src/util/stats.ts
+@@ -111,50 +111,173 @@ export function sampleRatioMismatch(
+   weights: readonly number[],
+ ): SampleRatioCheck | null {
+   if (observed.length !== weights.length) {
+     throw new Error('observed and weights must have the same length')
+   }
+   const total = observed.reduce((sum, n) => sum + n, 0)
+   const weightTotal = weights.reduce((sum, w) => sum + w, 0)
+   if (total <= 0 || weightTotal <= 0) return null
+   let chiSquare = 0
+   let cells = 0
+   for (let i = 0; i < observed.length; i++) {
+     if (weights[i] <= 0) continue
+     const expected = (total * weights[i]) / weightTotal
+     chiSquare += (observed[i] - expected) ** 2 / expected
+     cells++
+   }
+   if (cells < 2) return null
+   const degreesOfFreedom = cells - 1
+   return {
+     chiSquare: round6(chiSquare),
+     degreesOfFreedom,
+     pValue: round6(chiSquareSurvival(chiSquare, degreesOfFreedom)),
+   }
+ }
+ 
++/**
++ * One arm's per-opportunity revenue, as sums: `n` opportunities (no-fills
++ * included, at revenue 0), `sum` = sum of revenue r_i and `sumSquares` =
++ * sum of r_i^2, all in one unit (cents). Sums add across days and
++ * placements, so rollup rows combine by addition before this is called.
++ */
++export type RevenueSums = {
++  readonly n: number
++  readonly sum: number
++  readonly sumSquares: number
++}
++
++export type RevenuePerThousand = {
++  /** 1,000 x mean revenue per opportunity. */
++  readonly value: number
++  /** Standard error of `value`. */
++  readonly standardError: number
++  readonly lower: number
++  readonly upper: number
++}
++
++export type RevenueUplift = {
++  readonly uniform: RevenuePerThousand
++  readonly ranked: RevenuePerThousand
++  /** ranked - uniform per 1,000 opportunities, 95% normal interval. */
++  readonly difference: {
++    readonly value: number
++    readonly lower: number
++    readonly upper: number
++  }
++  /**
++   * ranked / uniform with a 95% interval from the delta method on the log
++   * ratio; null when either arm's mean is 0.
++   */
++  readonly ratio: {
++    readonly value: number
++    readonly lower: number
++    readonly upper: number
++  } | null
++}
++
++function validSums(s: RevenueSums): boolean {
++  return (
++    Number.isFinite(s.n) &&
++    Number.isFinite(s.sum) &&
++    Number.isFinite(s.sumSquares) &&
++    s.n >= 2 &&
++    s.sum >= 0 &&
++    s.sumSquares >= 0
++  )
++}
++
++/** Unrounded mean and standard error, per 1,000 opportunities. */
++function perThousandRaw(sums: RevenueSums): { value: number; se: number } {
++  const mean = sums.sum / sums.n
++  const variance = Math.max(
++    0,
++    (sums.sumSquares - (sums.sum * sums.sum) / sums.n) / (sums.n - 1),
++  )
++  return { value: 1_000 * mean, se: 1_000 * Math.sqrt(variance / sums.n) }
++}
++
++/**
++ * Mean revenue per 1,000 opportunities with a 95% normal (CLT) interval.
++ * The sample variance comes from the sums, (Q - S^2/n) / (n - 1), clamped at
++ * 0 against rounding. Treats opportunities as independent, which ignores
++ * clustering by user: read the interval as a lower bound on the true width.
++ * `null` below two opportunities or on invalid sums.
++ */
++export function revenuePerThousand(
++  sums: RevenueSums,
++): RevenuePerThousand | null {
++  if (!validSums(sums)) return null
++  const { value, se } = perThousandRaw(sums)
++  return {
++    value: round6(value),
++    standardError: round6(se),
++    lower: round6(value - Z_95 * se),
++    upper: round6(value + Z_95 * se),
++  }
++}
++
++/**
++ * The ranked arm's revenue uplift over the uniform (random) arm, per 1,000
++ * opportunities: the difference with a 95% interval (independent arms,
++ * se = sqrt(se_r^2 + se_u^2)), and the ratio with a 95% interval from the
++ * delta method, var(log(m_r / m_u)) ~ (se_r / m_r)^2 + (se_u / m_u)^2,
++ * exponentiated back (so it is asymmetric and never below 0). `null` when
++ * either arm has under two opportunities.
++ */
++export function revenueUplift(
++  ranked: RevenueSums,
++  uniform: RevenueSums,
++): RevenueUplift | null {
++  const r = revenuePerThousand(ranked)
++  const u = revenuePerThousand(uniform)
++  if (!r || !u) return null
++  const rr = perThousandRaw(ranked)
++  const ur = perThousandRaw(uniform)
++  const diff = rr.value - ur.value
++  const diffSe = Math.sqrt(rr.se ** 2 + ur.se ** 2)
++  let ratio: RevenueUplift['ratio'] = null
++  if (rr.value > 0 && ur.value > 0) {
++    const logSe = Math.sqrt((rr.se / rr.value) ** 2 + (ur.se / ur.value) ** 2)
++    const logRatio = Math.log(rr.value / ur.value)
++    ratio = {
++      value: round6(rr.value / ur.value),
++      lower: round6(Math.exp(logRatio - Z_95 * logSe)),
++      upper: round6(Math.exp(logRatio + Z_95 * logSe)),
++    }
++  }
++  return {
++    uniform: u,
++    ranked: r,
++    difference: {
++      value: round6(diff),
++      lower: round6(diff - Z_95 * diffSe),
++      upper: round6(diff + Z_95 * diffSe),
++    },
++    ratio,
++  }
++}
++
+ /** P(X >= x) for X ~ chi-square(k). */
+ export function chiSquareSurvival(x: number, k: number): number {
+   if (x <= 0) return 1
+   return regularizedGammaQ(k / 2, x / 2)
+ }
+ 
+ function logGamma(x: number): number {
+   // Lanczos approximation (g = 7, n = 9).
+   const c = [
+     0.99999999999980993, 676.5203681218851, -1259.1392167224028,
+     771.32342877765313, -176.61502916214059, 12.507343278686905,
+     -0.13857109526572012, 9.9843695780195716e-6, 1.5056327351493116e-7,
+   ]
+   if (x < 0.5) {
+     return Math.log(Math.PI / Math.sin(Math.PI * x)) - logGamma(1 - x)
+   }
+   x -= 1
+   let a = c[0]
+   const t = x + 7.5
+   for (let i = 1; i < 9; i++) a += c[i] / (x + i)
+   return 0.5 * Math.log(2 * Math.PI) + (x + 0.5) * Math.log(t) - t + Math.log(a)
+ }
+ 
+ /** Q(a, x) = Γ(a, x) / Γ(a), series below a + 1, continued fraction above. */
+ function regularizedGammaQ(a: number, x: number): number {
+
+```
