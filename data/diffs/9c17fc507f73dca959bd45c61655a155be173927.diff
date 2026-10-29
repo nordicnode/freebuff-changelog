@@ -1,0 +1,335 @@
+diff --git a/common/src/desktop-cloud/hosted-workspace.ts b/common/src/desktop-cloud/hosted-workspace.ts
+index 64ae3e62e..1aedaf346 100644
+--- a/common/src/desktop-cloud/hosted-workspace.ts
++++ b/common/src/desktop-cloud/hosted-workspace.ts
+@@ -1,46 +1,50 @@
+ import type {
+   HostedBrowserDataRequest,
+   HostedBrowserDataResponses,
+ } from './browser-data'
+ 
+ /** The hosted renderer receives selectors and capabilities, never native credentials. */
+ export const HOSTED_WORKSPACE_PROTOCOL_VERSION = 1 as const
+ export const HOSTED_WORKSPACE_API_ORIGIN =
+   'https://staging-2-api.freebuffweb.site'
+ export const HOSTED_WORKSPACE_ORIGIN = 'https://staging-2-auth.freebuffweb.site'
+ /** Exact reviewed pairs: a staging session must never cross into another environment. */
+ export const HOSTED_WORKSPACE_ENVIRONMENTS = [
+   { apiOrigin: HOSTED_WORKSPACE_API_ORIGIN, authOrigin: HOSTED_WORKSPACE_ORIGIN },
+   { apiOrigin: 'https://staging-api.freebuff.com', authOrigin: 'https://staging-auth.freebuff.com' },
+   { apiOrigin: 'https://www.codebuff.com', authOrigin: 'https://freebuff.com' },
+ ] as const
+ 
+ 
+ export type HostedRuntimeProgress = {
+-  phase: 'preparing' | 'downloading' | 'landing'
++  /** Absent from Desktops that only reported downloads: read it as `to-local`. */
++  direction?: 'to-local' | 'to-cloud'
++  phase: 'preparing' | 'downloading' | 'landing' | 'uploading' | 'starting'
++  /** Bytes moved so far, in either direction. */
+   receivedBytes: number
++  /** Null while unknown; an upload streams, so it never knows its total. */
+   totalBytes: number | null
+ }
+ 
+ export type HostedWorkspaceConnection = {
+   /** A per-chat checkout does not change the project’s default runtime. */
+   threadId?: string
+   projectId: string
+   projectName: string
+   sessionId: string
+   bindingId: string
+   phase: 'connecting' | 'connected' | 'reconnecting' | 'stopped'
+   executionEnabled: boolean
+ }
+ 
+ export type HostedWorkspaceStatus = {
+   /** Local installation receipt, not an account or browser preference. */
+   projectSetupCompleted?: boolean
+   accountId: string | null
+   enabled: boolean
+   connections: HostedWorkspaceConnection[]
+   /** Previously enrolled projects remain local while their computer is disconnected. */
+   localProjects?: Array<{
+     projectId: string
+     projectName: string
+     reconnectStatus?: 'connecting' | 'retrying' | 'needs-approval'
+@@ -228,50 +232,68 @@ export type HostedWorkspaceHost = {
+   nativeProtocolVersion?: number
+   customTitleBar?: boolean
+   /** The native window stays hidden until the authenticated workspace has rendered. */
+   ready?(): Promise<void>
+   /** Discover native run locations or explicitly change a chat’s sandbox. */
+   runtime?(scope: {
+     projectId: string
+     threadId?: string
+     location?: 'local' | 'worktree' | 'cloud'
+     sourceBranch?: string
+   }): Promise<{
+     location: 'local' | 'worktree' | 'cloud'
+     choices: Array<'local' | 'worktree' | 'cloud'>
+     supportsWorktreeSourceBranch?: boolean
+     worktreeSourceBranch?: string | null
+     progress?: HostedRuntimeProgress
+     /** Display-only metadata resolved by native code for the authenticated chat. */
+     workspace?: {
+       projectName: string
+       projectPath: string
+       directory: string
+       branch: string | null
+       worktree: boolean
+     }
+   }>
++  /** Sites for a chat running on this computer, read from its own checkout. Older builds omit it. */
++  sitesContext?(scope: { projectId: string; threadId: string }): Promise<
++    import('../sites/project-context').SiteCompatibility & {
++      /** Desktop's `Site` rows (freebuff-desktop/src/shared/sites.ts). */
++      sites: unknown[]
++    }
++  >
++  /** The Publish button for a chat running on this computer: builds its checkout, streams stages. */
++  sitesPublish?(
++    input: {
++      projectId: string
++      threadId: string
++      environment: 'preview' | 'production'
++      siteId?: string
++      name?: string
++    },
++    onEvent: (event: import('../sites/publish-events').SitePublishEvent) => void,
++  ): Promise<import('../sites/publish-events').SitePublishResult>
+   /** Persist a device-backed cloud chat before native panels or first-send placement. */
+   prepareLocalChat?(scope: HostedBrowserScope): Promise<HostedBrowserScope>
+   terminal?: {
+     request(input: HostedTerminalRequest): Promise<HostedTerminalResponse>
+   }
+   window?: {
+     state(): Promise<HostedWindowState>
+     action(
+       action: 'minimize' | 'maximize' | 'close' | 'back' | 'forward',
+     ): Promise<void>
+     onState(listener: (state: HostedWindowState) => void): () => void
+   }
+   browser?: {
+     data?<T extends HostedBrowserDataRequest>(
+       input: HostedBrowserScope & { tabId: string; request: T },
+     ): Promise<HostedBrowserDataResponses[T['action']]>
+     snapshot(scope: HostedBrowserScope): Promise<HostedBrowserSnapshot>
+     action(
+       request: HostedBrowserScope & { action: HostedBrowserAction },
+     ): Promise<HostedBrowserSnapshot>
+     layout(request: HostedBrowserLayout): Promise<void>
+     onChanged?(
+       listener: (
+         scope: HostedBrowserScope,
+         snapshot: HostedBrowserSnapshot,
+diff --git a/common/src/sites/__tests__/local-files.test.ts b/common/src/sites/__tests__/local-files.test.ts
+index e0b0ab01c..86500d7ba 100644
+--- a/common/src/sites/__tests__/local-files.test.ts
++++ b/common/src/sites/__tests__/local-files.test.ts
+@@ -1,31 +1,32 @@
+ import { afterEach, expect, test } from 'bun:test'
+ import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+ import { tmpdir } from 'node:os'
+ import { join } from 'node:path'
+ 
+-import { bundleSite } from '../local-files'
++import { SitesClient } from '../client'
++import { bundleSite, readSiteSecret } from '../local-files'
+ 
+ const roots: string[] = []
+ afterEach(async () => {
+   await Promise.all(
+     roots.splice(0).map((root) => rm(root, { recursive: true, force: true })),
+   )
+ })
+ 
+ // Cloud bundles the same manifest with `sorted(os.listdir())`, and the two
+ // bundles must match byte for byte. readdir returns the filesystem's order
+ // (hash order on ext4), so with enough names an unsorted walk shows up here.
+ test('assets are bundled in name order at every level, whatever readdir returns', async () => {
+   const root = await mkdtemp(join(tmpdir(), 'local-files-'))
+   roots.push(root)
+   await writeFile(
+     join(root, 'worker.js'),
+     'export default {fetch:()=>new Response("ok")}',
+   )
+   await writeFile(
+     join(root, 'manifest.json'),
+     JSON.stringify({
+       entrypoint: 'index.js',
+       compatibilityDate: '2026-10-01',
+       modules: [{ name: 'index.js', type: 'esm', path: 'worker.js' }],
+       assetsDirectory: 'public',
+@@ -61,25 +62,93 @@ test('realtime is an explicit true-only managed capability in the deployment man
+   roots.push(root)
+   await writeFile(
+     join(root, 'worker.js'),
+     'export default {fetch:()=>new Response("ok")}',
+   )
+   const manifest = {
+     entrypoint: 'worker.js',
+     compatibilityDate: '2026-10-01',
+     modules: [{ name: 'worker.js', type: 'esm', path: 'worker.js' }],
+   }
+   await writeFile(
+     join(root, 'manifest.json'),
+     JSON.stringify({ ...manifest, realtime: true }),
+   )
+   expect((await bundleSite(root, 'manifest.json')).realtime).toBe(true)
+   for (const realtime of [false, 'true', 1, { class_name: 'Custom' }]) {
+     await writeFile(
+       join(root, 'manifest.json'),
+       JSON.stringify({ ...manifest, realtime }),
+     )
+     await expect(bundleSite(root, 'manifest.json')).rejects.toThrow(
+       'Invalid deploy manifest',
+     )
+   }
+ })
++
++test('a relative manifest inside the checkout bundles its modules relative to the manifest', async () => {
++  const root = await mkdtemp(join(tmpdir(), 'local-files-checkout-'))
++  roots.push(root)
++  await mkdir(join(root, 'dist'), { recursive: true })
++  await writeFile(join(root, 'dist/worker.js'), 'export default {}')
++  await writeFile(
++    join(root, 'dist/deploy.json'),
++    JSON.stringify({
++      entrypoint: 'worker.js',
++      compatibilityDate: '2026-10-01',
++      modules: [{ name: 'worker.js', type: 'esm', path: 'worker.js' }],
++    }),
++  )
++  const bundle = await bundleSite(root, 'dist/deploy.json')
++  expect(bundle.modules.map((module) => module.name)).toEqual(['worker.js'])
++})
++
++test('a missing manifest, module or secret file names the relative path tried and nothing else', async () => {
++  const root = await mkdtemp(join(tmpdir(), 'local-files-missing-'))
++  roots.push(root)
++  await expect(bundleSite(root, 'deploy.json')).rejects.toThrow(
++    'Site file not found in this chat’s workspace: deploy.json',
++  )
++  await mkdir(join(root, 'dist'))
++  await writeFile(
++    join(root, 'dist/deploy.json'),
++    JSON.stringify({
++      entrypoint: 'worker.js',
++      compatibilityDate: '2026-10-01',
++      modules: [{ name: 'worker.js', type: 'esm', path: 'build/worker.js' }],
++    }),
++  )
++  await expect(bundleSite(root, 'dist/deploy.json')).rejects.toThrow(
++    'Site file not found in this chat’s workspace: dist/build/worker.js',
++  )
++  await expect(readSiteSecret(root, 'secrets/token.txt')).rejects.toThrow(
++    'Site file not found in this chat’s workspace: secrets/token.txt',
++  )
++  // A missing path outside the checkout keeps the containment refusal.
++  await expect(bundleSite(root, '../elsewhere/deploy.json')).rejects.toThrow(
++    'must be inside this thread’s workspace',
++  )
++  const client = new SitesClient({
++    getToken: () => 'token',
++    host: 'https://example.invalid',
++    originApp: 'desktop',
++    fetcher: async () => {
++      throw new Error('A missing manifest must not reach hosting')
++    },
++  })
++  expect(
++    await client.runToolWithContext(
++      'sites_deploy',
++      {
++        siteId: '00000000-0000-4000-8000-000000000000',
++        environment: 'production',
++        requestId: '00000000-0000-4000-8000-000000000001',
++        manifestPath: 'deploy.json',
++      },
++      root,
++      'build',
++    ),
++  ).toEqual({
++    error: 'invalid_site_request',
++    message: 'Site file not found in this chat’s workspace: deploy.json',
++  })
++})
+diff --git a/common/src/sites/local-files.ts b/common/src/sites/local-files.ts
+index daeccd294..346d8638f 100644
+--- a/common/src/sites/local-files.ts
++++ b/common/src/sites/local-files.ts
+@@ -35,54 +35,70 @@ const manifestSchema = z
+           .strict(),
+       )
+       .max(1000)
+       .optional(),
+     spa: z.boolean().optional(),
+   })
+   .strict()
+   .refine(
+     (manifest) =>
+       manifest.cache === undefined || manifest.runtime === 'opennext',
+     {
+       message: 'Only OpenNext deployments contain private build cache entries.',
+     },
+   )
+   .refine(
+     (manifest) =>
+       manifest.modules.some(
+         (module) =>
+           module.name === manifest.entrypoint && module.type === 'esm',
+       ),
+     { message: 'Entrypoint must match the name of an ESM module.' },
+   )
+ const invalid = (message: string) =>
+   new SitesClientError(400, 'invalid_site_request', message)
+ 
++const outside = (rel: string) =>
++  !rel || rel === '..' || rel.startsWith('..' + sep) || isAbsolute(rel)
++const missing = (error: unknown) =>
++  (error as NodeJS.ErrnoException)?.code === 'ENOENT' ||
++  (error as NodeJS.ErrnoException)?.code === 'ENOTDIR'
++
+ async function localPath(root: string, path: string) {
+-  const absolute = await realpath(resolve(root, path))
+-  const rel = relative(root, absolute)
+-  if (!rel || rel === '..' || rel.startsWith('..' + sep) || isAbsolute(rel))
++  const requested = resolve(root, path)
++  const absolute = await realpath(requested).catch((error: unknown) => {
++    // realpath fails before containment can be checked. Name only a path
++    // inside the workspace, relative, so the agent can fix it.
++    const rel = relative(root, requested)
++    if (!missing(error)) throw error
++    if (outside(rel))
++      throw invalid('Site files must be inside this thread’s workspace.')
++    throw invalid(
++      `Site file not found in this chat’s workspace: ${rel.split(sep).join('/')}`,
++    )
++  })
++  if (outside(relative(root, absolute)))
+     throw invalid('Site files must be inside this thread’s workspace.')
+   return absolute
+ }
+ async function readBounded(path: string, limit: number): Promise<Buffer> {
+   const file = await open(path, 'r')
+   try {
+     const stat = await file.stat()
+     if (!stat.isFile() || stat.size > limit)
+       throw invalid(
+         'Site file exceeds the upload limit or is not a regular file.',
+       )
+     const buffer = Buffer.alloc(Math.min(stat.size + 1, limit + 1))
+     let used = 0
+     while (used < buffer.length) {
+       const { bytesRead } = await file.read(
+         buffer,
+         used,
+         buffer.length - used,
+         null,
+       )
+       if (!bytesRead) break
+       used += bytesRead
+     }
+     if (used > limit || used > stat.size)
+       throw invalid('Site file changed during upload. Rebuild and retry.')
