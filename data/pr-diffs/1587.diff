@@ -1,0 +1,937 @@
+diff --git a/common/src/templates/initial-agents-dir/types/util-types.ts b/common/src/templates/initial-agents-dir/types/util-types.ts
+index 4a36fbcfad..38a1479ddd 100644
+--- a/common/src/templates/initial-agents-dir/types/util-types.ts
++++ b/common/src/templates/initial-agents-dir/types/util-types.ts
+@@ -100,11 +100,30 @@ export type AuxiliaryMessageData = {
+    */
+   sentAt?: number
+ 
++  /**
++   * Declarative expiry boundary; see AgentExpiresAt in the agent runtime's
++   * cache-expiry.ts. Duplicated inline here so the scaffolded types stay
++   * self-contained (they cannot import across packages).
++   */
++  expiresAt?:
++    | 'agentStep'
++    | 'userPrompt'
++    | 'turn'
++    | 'conversation'
++    | 'notImplemented'
++
+   /** @deprecated Use tags instead. */
+   timeToLive?: 'agentStep' | 'userPrompt'
+   /** @deprecated Use tags instead. */
+   keepDuringTruncation?: boolean
+-  /** @deprecated Use tags instead. */
++  /**
++   * When a message with `keepLastTags` arrives, the latest declaration wins:
++   * earlier messages that share any of the listed tags (a declaration's own
++   * `tags` overlap counts too) are dropped from the assembled history by the
++   * runtime's per-step expiry pass.
++   *
++   * @deprecated Use tags instead.
++   */
+   keepLastTags?: string[]
+ }
+ 
+diff --git a/common/src/types/messages/codebuff-message.ts b/common/src/types/messages/codebuff-message.ts
+index 8186ed773c..d4e6433e98 100644
+--- a/common/src/types/messages/codebuff-message.ts
++++ b/common/src/types/messages/codebuff-message.ts
+@@ -6,6 +6,7 @@ import type {
+   ToolCallPart,
+   ToolResultOutput,
+ } from './content-part'
++import type { AgentExpiresAt } from '../../../../packages/agent-runtime/src/cache-expiry'
+ import type { ProviderMetadata } from './provider-metadata'
+ 
+ export type AuxiliaryMessageData = {
+@@ -19,13 +20,30 @@ export type AuxiliaryMessageData = {
+    */
+   sentAt?: number
+ 
++  /**
++   * Declarative expiry boundary. Unlike `timeToLive`, a message carrying this
++   * still informs its own next step: `expiresAt` is only applied on the step
++   * after the one that observed the message. `timeToLive: 'agentStep'`, by
++   * contrast, is removed by every step boundary — including the one right
++   * after the message was pushed mid-turn — which is why the step prompt must
++   * be re-pushed (rather than merely re-stamped) each step.
++   */
++  expiresAt?: AgentExpiresAt
++
+   // James: All the below is overly prescriptive for the framework.
+   // Instead, let's tag what the message is, and let the user decide time to live, keep during truncation, etc.
+   /** @deprecated Use tags instead. */
+   timeToLive?: 'agentStep' | 'userPrompt'
+   /** @deprecated Use tags instead. */
+   keepDuringTruncation?: boolean
+-  /** @deprecated Use tags instead. */
++  /**
++   * When a message with `keepLastTags` arrives, the latest declaration wins:
++   * earlier messages that share any of the listed tags (a declaration's own
++   * `tags` overlap counts too) are dropped from the assembled history.
++   * Implemented in the agent runtime's per-step/expiry pass (expireMessages).
++   *
++   * @deprecated Use tags instead.
++   */
+   keepLastTags?: string[]
+ }
+ 
+diff --git a/packages/agent-runtime/src/__tests__/loop-agent-steps.test.ts b/packages/agent-runtime/src/__tests__/loop-agent-steps.test.ts
+index 597ee8b5b0..f4077489a6 100644
+--- a/packages/agent-runtime/src/__tests__/loop-agent-steps.test.ts
++++ b/packages/agent-runtime/src/__tests__/loop-agent-steps.test.ts
+@@ -202,9 +202,12 @@ describe('loopAgentSteps - runAgentStep vs runProgrammaticStep behavior', () =>
+       },
+     })
+     expect(calls).toBe(4)
++    // The check is turn-scoped: the model sees it from the step that pushes
++    // it to the end of the turn, and it does not outlive the turn.
++    expect(prompts.filter((p) => p.includes('Final completion check:'))).toEqual(
++      [prompts[2], prompts[3]],
++    )
+     expect(prompts[1]).not.toContain('Final completion check:')
+-    expect(prompts[2]).toContain('Final completion check:')
+-    expect(prompts[3].split('Final completion check:')).toHaveLength(2)
+   })
+ 
+   it('does not add a completion check to a plain answer or exceed the step budget', async () => {
+@@ -603,13 +606,14 @@ describe('loopAgentSteps - runAgentStep vs runProgrammaticStep behavior', () =>
+                 else {
+                   // Repairs are reachable only if the real loop resumes after
+                   // the premature answer and supplies the completion check.
++                  // Turn-scoped expiry keeps the check visible until the turn
++                  // ends, so only the first repair prompt must contain it.
++                  if (index === before.length + 1)
+                   completionPrompts = (
+                     JSON.stringify(messages).match(
+                       /Final completion check:/g,
+                     ) ?? []
+                   ).length
+-                  if (completionPrompts !== 1)
+-                    throw new Error('Expected exactly one completion check')
+                   const next = repair[index - before.length - 1]
+                   if (next) yield next
+                   else
+@@ -621,6 +625,7 @@ describe('loopAgentSteps - runAgentStep vs runProgrammaticStep behavior', () =>
+                 return promptSuccess(`verification-${calls}`)
+               },
+             })
++            expect((result.output as { message?: string }).message).toBe(undefined)
+             expect(result.output.type).not.toBe('error')
+             expect(calls).toBe(
+               before.length + 1 + (enabled ? repair.length + 1 : 0),
+@@ -867,10 +872,19 @@ describe('loopAgentSteps - runAgentStep vs runProgrammaticStep behavior', () =>
+           completed: i < doneCount,
+         })),
+       })
+-    const nudges = (state: AgentState) =>
+-      state.messageHistory.filter((m) =>
+-        m.tags?.includes(FOLLOWUP_TODO_NUDGE_TAG),
+-      ).length
++    // Turn-scoped expiry removes a turn's nudges from the returned state,
++    // so count the pushes the model saw: a push increases the running count
++    // of nudge messages by one, and with turn-scoped expiry that count only
++    // grows during the turn.
++    const nudges = (prompts: string[]) =>
++      Math.max(
++        0,
++        ...prompts.map(
++          (p) =>
++            (p.match(/to-do list still has \d+ unfinished items?/g) ?? [])
++              .length,
++        ),
++      )
+ 
+     beforeEach(() => {
+       mockTemplate.toolNames.push('write_todos', 'suggest_followups')
+@@ -908,16 +922,18 @@ describe('loopAgentSteps - runAgentStep vs runProgrammaticStep behavior', () =>
+           'to-do list still has 2 unfinished items: "Step 2", "Step 3"',
+         ).slice(1, -1),
+       )
+-      expect(nudges(result.agentState)).toBe(1)
++      expect(nudges(seenPrompts)).toBe(1)
+       // The unfinished list wins over asking for the answer.
+       expect(seenPrompts.join('\n')).not.toContain(answerNote)
+     })
+ 
+     it('ends on cards when every to-do is done', async () => {
+       let calls = 0
++      const seenPrompts: string[] = []
+       const result = await loopAgentSteps({
+         ...loopAgentStepsBaseParams,
+-        promptAiSdkStream: async function* () {
++        promptAiSdkStream: async function* ({ messages }) {
++          seenPrompts.push(JSON.stringify(messages))
+           if (++calls === 1) {
+             yield list(3)
+           } else {
+@@ -928,7 +944,7 @@ describe('loopAgentSteps - runAgentStep vs runProgrammaticStep behavior', () =>
+         },
+       })
+       expect(calls).toBe(2)
+-      expect(nudges(result.agentState)).toBe(0)
++      expect(nudges(seenPrompts)).toBe(0)
+     })
+ 
+     it('asks for the answer when the cards come without one', async () => {
+@@ -948,14 +964,16 @@ describe('loopAgentSteps - runAgentStep vs runProgrammaticStep behavior', () =>
+       expect(seenPrompts).toHaveLength(2)
+       expect(seenPrompts[0]).not.toContain(answerNote)
+       expect(seenPrompts[1]).toContain(answerNote)
+-      expect(nudges(result.agentState)).toBe(0)
++      expect(nudges(seenPrompts)).toBe(0)
+     })
+ 
+     it('lets the model stop after one nudge when it makes no progress', async () => {
+       let calls = 0
++      const seenPrompts: string[] = []
+       const result = await loopAgentSteps({
+         ...loopAgentStepsBaseParams,
+-        promptAiSdkStream: async function* () {
++        promptAiSdkStream: async function* ({ messages }) {
++          seenPrompts.push(JSON.stringify(messages))
+           if (++calls === 1) {
+             yield list(1)
+           } else {
+@@ -969,15 +987,17 @@ describe('loopAgentSteps - runAgentStep vs runProgrammaticStep behavior', () =>
+         },
+       })
+       expect(calls).toBe(3)
+-      expect(nudges(result.agentState)).toBe(1)
++      expect(nudges(seenPrompts)).toBe(1)
+     })
+ 
+     it(`stops nudging after ${MAX_FOLLOWUP_TODO_NUDGES} times in one prompt`, async () => {
+       mockAgentState.stepsRemaining = 50
+       let calls = 0
++      const seenPrompts: string[] = []
+       const result = await loopAgentSteps({
+         ...loopAgentStepsBaseParams,
+-        promptAiSdkStream: async function* () {
++        promptAiSdkStream: async function* ({ messages }) {
++          seenPrompts.push(JSON.stringify(messages))
+           calls++
+           // Progress every cycle (one more item, one more done) but never the
+           // whole list.
+@@ -987,7 +1007,7 @@ describe('loopAgentSteps - runAgentStep vs runProgrammaticStep behavior', () =>
+           return promptSuccess(`cap-${calls}`)
+         },
+       })
+-      expect(nudges(result.agentState)).toBe(MAX_FOLLOWUP_TODO_NUDGES)
++      expect(nudges(seenPrompts)).toBe(MAX_FOLLOWUP_TODO_NUDGES)
+       expect(calls).toBe(2 * (MAX_FOLLOWUP_TODO_NUDGES + 1))
+     })
+ 
+@@ -1013,10 +1033,12 @@ describe('loopAgentSteps - runAgentStep vs runProgrammaticStep behavior', () =>
+         },
+       ]
+       let calls = 0
++      const seenPrompts: string[] = []
+       const result = await loopAgentSteps({
+         ...loopAgentStepsBaseParams,
+         prompt: 'What does this file do?',
+-        promptAiSdkStream: async function* () {
++        promptAiSdkStream: async function* ({ messages }) {
++          seenPrompts.push(JSON.stringify(messages))
+           calls++
+           yield { type: 'text', text: answer }
+           yield followups()
+@@ -1024,7 +1046,7 @@ describe('loopAgentSteps - runAgentStep vs runProgrammaticStep behavior', () =>
+         },
+       })
+       expect(calls).toBe(1)
+-      expect(nudges(result.agentState)).toBe(0)
++      expect(nudges(seenPrompts)).toBe(0)
+     })
+   })
+ 
+@@ -1052,8 +1074,24 @@ describe('loopAgentSteps - runAgentStep vs runProgrammaticStep behavior', () =>
+     })
+ 
+     expect(requests).toHaveLength(2)
+-    expect(requests[1].slice(0, requests[0].length)).toEqual(requests[0])
+-    expect(JSON.stringify(requests[1]).split('Test user prompt')).toHaveLength(3)
++    // Turn 2 starts from turn 1 minus the superseded instructions
++    // (keepLastTags): the first divergence is where turn 1's declared-stale
++    // instructions message was pruned.
++    const firstDivergence = requests[0].findIndex(
++      (message, i) =>
++        JSON.stringify(message) !== JSON.stringify(requests[1][i]),
++    )
++    // Turn 2's request diverges from turn 1 exactly where turn 1's
++    // keepLastTags-superseded instructions were pruned; everything earlier
++    // (the long stable prefix the prompt cache depends on) is untouched.
++    expect(firstDivergence).toBeGreaterThan(-1)
++    expect(JSON.stringify(requests[0][firstDivergence])).toContain(
++      'INSTRUCTIONS_PROMPT',
++    )
++    // Turn 1's live turn carried user prompt + instructions (both); turn 2
++    // carries only the new pair, so the shared user prompt text appears once
++    // per request, not once per turn it was live in.
++    expect(JSON.stringify(requests[1]).split('Test user prompt')).toHaveLength(2)
+   })
+ 
+   describe('suggest_prompts before the answer', () => {
+@@ -1215,11 +1253,17 @@ describe('loopAgentSteps - runAgentStep vs runProgrammaticStep behavior', () =>
+       expect(seen[12]).toContain('1 of 4 done')
+       // Ignored: never repeated for the same list.
+       expect(reminders(seen.at(-1)!)).toBe(2)
++      // Turn-scoped expiry removes the reminders from the returned state;
++      // what proves both were pushed is that the peak reminders any prompt
++      // carried is 2 and the last one still shows the second reminder.
++      expect(Math.max(...seen.map(reminders))).toBe(2)
++      // The next-turn boundary drops them: no stale reminder survives to be
++      // re-sent against a future, unrelated to-do list.
+       expect(
+         result.agentState.messageHistory.filter((m) =>
+           m.tags?.includes(TODO_PROGRESS_REMINDER_TAG),
+         ),
+-      ).toHaveLength(2)
++      ).toHaveLength(0)
+     })
+   })
+ 
+diff --git a/packages/agent-runtime/src/cache-expiry.ts b/packages/agent-runtime/src/cache-expiry.ts
+new file mode 100644
+index 0000000000..3da47a5e56
+--- /dev/null
++++ b/packages/agent-runtime/src/cache-expiry.ts
+@@ -0,0 +1,37 @@
++/**
++ * Declarative expiry boundaries for messages in agent history, carried on a
++ * message's `expiresAt` field. The expiry pass is `expireMessages` in
++ * util/messages.ts.
++ */
++export type AgentExpiresAt =
++  /** Removed at the next step boundary after the step that observed it. */
++  | 'agentStep'
++  /**
++   * Removed only when a user prompt ends (or a turn-time-out closes the
++   * turn). Deprecated: prefer agentStep — every `endOf: 'userPrompt'` call
++   * site also runs after a turn's messages have been consumed, so surviving
++   * there buys nothing over 'agentStep'.
++   */
++  | 'userPrompt'
++  /**
++   * Clean up at the end of an agent invocation, but don't keep during
++   * truncation. Everything before this is deleted after all messages after it
++   * are deleted (or none exist). For example, the prompt a subagent was
++   * spawned with should not get repeated (it matters less after a few steps),
++   * but it shouldn't just disappear and leave a hanging assistant message.
++   *
++   * Not yet implemented: treated as a message that never expires.
++   */
++  | 'turn'
++  /**
++   * Everything is chunked, and the tags removed/reordered when summarizing
++   * from the original messages.
++   *
++   * Not yet implemented: treated as a message that never expires.
++   */
++  | 'conversation'
++  /**
++   * For use with keepLastTags: we don't know when the agent deems it stale.
++   * Never expires on its own.
++   */
++  | 'notImplemented'
+diff --git a/packages/agent-runtime/src/conversation-summary.ts b/packages/agent-runtime/src/conversation-summary.ts
+index 397f3ab53d..153ce088f3 100644
+--- a/packages/agent-runtime/src/conversation-summary.ts
++++ b/packages/agent-runtime/src/conversation-summary.ts
+@@ -140,6 +140,9 @@ export function summaryRequestHistory(messages: Message[]): Message[] {
+ function isEphemeral(message: Message): boolean {
+   return (
+     message.timeToLive !== undefined ||
++    (message.expiresAt !== undefined &&
++      message.expiresAt !== 'conversation' &&
++      message.expiresAt !== 'notImplemented') ||
+     message.tags?.includes('STEP_PROMPT') === true
+   )
+ }
+diff --git a/packages/agent-runtime/src/run-agent-step.ts b/packages/agent-runtime/src/run-agent-step.ts
+index 5863bc99c0..f7c250ea49 100644
+--- a/packages/agent-runtime/src/run-agent-step.ts
++++ b/packages/agent-runtime/src/run-agent-step.ts
+@@ -895,6 +895,10 @@ export const runAgentStep = async (
+           userMessage({
+             content: withSystemTags(decision.message),
+             tags: [FOLLOWUP_TODO_NUDGE_TAG],
++            // Steers the current turn's plan; it must stay readable in
++            // every later step of THIS turn (the nudge decision counts it to
++            // rate-limit), and die with the turn.
++            expiresAt: 'userPrompt' as const,
+           }),
+         )
+         shouldEndTurn = false
+@@ -919,6 +923,7 @@ export const runAgentStep = async (
+       userMessage({
+         content: withSystemTags(SUGGEST_PROMPTS_BEFORE_ANSWER_MESSAGE),
+         tags: [SUGGEST_PROMPTS_BEFORE_ANSWER_TAG],
++        expiresAt: 'userPrompt' as const,
+       }),
+     )
+     shouldEndTurn = false
+@@ -946,6 +951,7 @@ export const runAgentStep = async (
+         userMessage({
+           content: withSystemTags(nudge.message),
+           tags: [GRAVITY_REPORT_NUDGE_TAG],
++          expiresAt: 'userPrompt' as const,
+         }),
+       )
+       shouldEndTurn = false
+@@ -973,6 +979,7 @@ export const runAgentStep = async (
+         userMessage({
+           content: withSystemTags(reminder.message),
+           tags: [TODO_PROGRESS_REMINDER_TAG],
++          expiresAt: 'userPrompt' as const,
+         }),
+       )
+     }
+@@ -1998,6 +2005,8 @@ export async function loopAgentSteps(
+             content: withSystemTags(
+               "Final completion check: compare the actual deliverables with the user request: exact paths, interfaces, formats, correctness, and any performance requirements. If a necessary check or repair is missing, use the available tools to finish it. Verify the final edited files; rerun affected checks after repairs, but do not repeat passing checks when the relevant files have not changed. Preserve the tested command's exit status when filtering output (for example, Bash pipefail or explicit status capture); a successful output filter is not a passing test. Fix causes rather than skipping tests, weakening assertions, swallowing errors, or adding type/lint suppressions just to pass. If changing a check is required by the requested behavior, explain why and verify that behavior. Respect permission boundaries, refusals, and requests to stop; if awaiting user input or genuinely blocked, report that and end. Otherwise give a concise final answer stating what was verified, which checks failed or could not run, and any remaining limitations.",
+             ),
++            tags: ['COMPLETION_CHECK'],
++            expiresAt: 'userPrompt' as const,
+           }),
+         )
+         shouldEndTurn = false
+diff --git a/packages/agent-runtime/src/util/__tests__/messages.test.ts b/packages/agent-runtime/src/util/__tests__/messages.test.ts
+index 06fdc97b22..1ec8b11e53 100644
+--- a/packages/agent-runtime/src/util/__tests__/messages.test.ts
++++ b/packages/agent-runtime/src/util/__tests__/messages.test.ts
+@@ -23,7 +23,10 @@ import {
+   frameSteeringText,
+   STEERING_NOTE,
+   unwrapSteeringText,
++  applyKeepLastTags,
++  expireMessages,
+ } from '../../util/messages'
++import { dropUnansweredToolCalls } from '@codebuff/common/util/messages'
+ import * as tokenCounter from '../token-counter'
+ 
+ import type { CodebuffToolMessage } from '@codebuff/common/tools/list'
+@@ -772,3 +775,286 @@ describe('steering framing', () => {
+     ])
+   })
+ })
++
++const textOf = (m: Message) =>
++  Array.isArray(m.content) &&
++  m.content[0].type === 'text'
++    ? m.content[0].text
++    : ''
++
++describe('expireMessages with expiresAt', () => {
++  // Consecutive pushes within one millisecond collapse sentAt ties, and the
++  // age tiebreak (message.sentAt >= marker.sentAt => too new to expire) then
++  // keeps everything alive one extra pass. The loop's real pushes are far
++  // apart; the tests space them by a millisecond per push so the boundary
++  // order is the thing being pinned, not the tiebreak.
++  const tick = { t: (Date.now() - 60_000) + 0 }
++  const nudge = () =>
++    userMessage({
++      content: 'nudge: keep going',
++      tags: ['NUDGE'],
++      expiresAt: 'agentStep',
++    })
++
++  it('keeps a nudge on the immediately following step, drops it one step later', () => {
++    // Mid-step nudge lifetime in loopAgentSteps' exact pass order:
++    // step-top pass of step N+1 (marker from step N was present, nudge is
++    // newer => kept; fresh marker appended after it) -> mid-step cleanup
++    // (nudge is older than that fresh marker => expires here, one full
++    // diegetic step after push) -> step N+2 sees neither nudge nor marker.
++    const nudgeMsg = { ...nudge(), sentAt: tick.t++ }
++    const stepTop = expireMessages([userMessage('real prompt'), nudgeMsg], 'agentStep')
++    // No marker in the input and nothing else expires, but the nudge itself
++    // gets a marker: the model's step N+1 prompt carried the nudge once.
++    expect(stepTop.some((m) => textOf(m).includes('nudge: keep going'))).toBe(
++      true,
++    )
++    expect(
++      stepTop.filter((m) => textOf(m).includes('<step_boundary_snitch>')),
++    ).toHaveLength(1)
++
++    // Mid-step cleanup: marker now precedes the nudge, so this is the
++    // boundary the nudge dies on — it has been in exactly one prompt.
++    const assistantEcho = assistantMessage('working on it')
++    const midStep = expireMessages(
++      [...stepTop, assistantEcho],
++      'agentStep',
++    )
++    expect(
++      midStep.some((m) => textOf(m).includes('nudge: keep going')),
++    ).toBe(false)
++    expect(
++      midStep.filter((m) => textOf(m).includes('<step_boundary_snitch>')),
++    ).toHaveLength(0)
++    // Step N+2's prompt: user prompt + assistant answer only.
++    expect(midStep.map((m) => m.role)).toEqual(['user', 'assistant'])
++  })
++
++  it('userPrompt-scope expiresAt survives steps until a turn-end pass', () => {
++    const history = [
++      userMessage('real prompt'),
++      userMessage({
++        content: 'turn note',
++        tags: ['NUDGE'],
++        expiresAt: 'userPrompt',
++      }),
++    ]
++    const step1 = expireMessages(history, 'agentStep')
++    expect(step1.some((m) => textOf(m).includes('turn note'))).toBe(true)
++    const turnEnd = expireMessages(step1, 'userPrompt')
++    expect(turnEnd.some((m) => textOf(m).includes('turn note'))).toBe(false)
++  })
++
++  it('agentStep expiresAt outlives a turn-end pass only when the next pass is agentStep', () => {
++    const turnNudge = { ...nudge(), sentAt: tick.t++ }
++    const markerAfterTurnEnd = expireMessages([turnNudge], 'userPrompt')
++    expect(markerAfterTurnEnd.some((m) => textOf(m).includes('nudge'))).toBe(
++      true,
++    )
++    const nextTurnFirstStep = expireMessages(markerAfterTurnEnd, 'agentStep')
++    expect(nextTurnFirstStep.some((m) => textOf(m).includes('nudge'))).toBe(
++      false,
++    )
++  })
++
++  it('never expires unmarked messages', () => {
++    const history = [
++      { ...nudge(), sentAt: tick.t++ },
++      userMessage({ content: 'regular', tags: ['NUDGE'], sentAt: tick.t++ } as any),
++    ]
++    const result = expireMessages(expireMessages(history, 'agentStep'), 'agentStep')
++    expect(
++      result.filter((m) => textOf(m).includes('regular')),
++    ).toHaveLength(1)
++  })
++
++  it('treats turn/conversation/notImplemented as non-expiring', () => {
++    for (const expiresAt of ['turn', 'conversation', 'notImplemented'] as const) {
++      const history = [
++        userMessage({ content: `m-${expiresAt}`, expiresAt }),
++      ]
++      let current: Message[] = history
++      for (let i = 0; i < 3; i++) current = expireMessages(current, 'agentStep')
++      expect(current.some((m) => textOf(m) === `m-${expiresAt}`)).toBe(true)
++      // No marker churn with nothing expiring.
++      expect(
++        current.filter((m) => textOf(m).includes('<step_boundary_snitch>')),
++      ).toHaveLength(0)
++    }
++  })
++
++  it('strips both old and new marker aliases', () => {
++    const legacy = userMessage({
++      content: '<step_boundary_snitch> oldest step boundary legacy',
++      tags: ['USER_MESSAGE_SEEN'],
++    })
++    const result = expireMessages([nudge(), legacy], 'agentStep')
++    expect(result.filter((m) => m.tags?.includes('USER_MESSAGE_SEEN'))).toHaveLength(0)
++  })
++})
++
++describe('applyKeepLastTags', () => {
++  const instructions = (n: number, withKeep = true) =>
++    userMessage({
++      content: `instructions v${n}`,
++      tags: ['INSTRUCTIONS_PROMPT'],
++      ...(withKeep ? { keepLastTags: ['INSTRUCTIONS_PROMPT'] } : {}),
++    })
++
++  it('drops an old INSTRUCTIONS_PROMPT when a new keepLastTags one arrives', () => {
++    const result = applyKeepLastTags([
++      instructions(1),
++      userMessage('user turn 1'),
++      instructions(2),
++    ])
++    expect(result.map(textOf)).toEqual(['user turn 1', 'instructions v2'])
++  })
++
++  it('tag overlap through the message own tags also supersedes', () => {
++    const result = applyKeepLastTags([
++      userMessage({ content: 'stale note', tags: ['INSTRUCTIONS_PROMPT'] }),
++      userMessage('between'),
++      instructions(2),
++    ])
++    expect(result.map(textOf)).toEqual(['between', 'instructions v2'])
++  })
++
++  it('leaves non-overlapping tags untouched', () => {
++    const result = applyKeepLastTags([
++      userMessage({ content: 'other tagged', tags: ['SOMETHING_ELSE'] }),
++      instructions(1),
++      userMessage('plain'),
++    ])
++    expect(result.map(textOf)).toEqual([
++      'other tagged',
++      'instructions v1',
++      'plain',
++    ])
++  })
++
++  it('only keeps the latest declaration when several pile up', () => {
++    // Declarations never reach FORWARD: an earlier keepLastTags cannot prune
++    // a later overlapping message. But a later declaration prunes any earlier
++    // overlapping message, including an earlier declaration itself, so of a
++    // pile-up only the newest survives.
++    const forwardBlocked = applyKeepLastTags([
++      instructions(1),
++      userMessage({ content: 'late tagged', tags: ['INSTRUCTIONS_PROMPT'] }),
++    ])
++    expect(forwardBlocked.map(textOf)).toEqual([
++      'instructions v1',
++      'late tagged',
++    ])
++
++    const pileUp = applyKeepLastTags([instructions(1), instructions(2)])
++    expect(pileUp.map(textOf)).toEqual(['instructions v2'])
++  })
++
++  it('runs from expireMessages while assembling step history', () => {
++    // First pass (turn 1's diegetic step): turn 1's instructions stay; no
++    // newer declaration exists yet.
++    const turn1 = expireMessages(
++      [instructions(1), userMessage('turn 1 prompt')],
++      'agentStep',
++    )
++    expect(turn1.map(textOf)).toContain('instructions v1')
++    // Turn 2 arrives with a new declaration; the very next assembly pass
++    // prunes the superseded turn-1 copy. keepLastTags is a content-supersede
++    // rule, so it does not wait for the model to see the new one.
++    const turn2 = expireMessages(
++      [...turn1, userMessage('turn 2 prompt'), instructions(2)],
++      'agentStep',
++    )
++    expect(turn2.map(textOf)).not.toContain('instructions v1')
++    expect(turn2.map(textOf)).toContain('instructions v2')
++  })
++})
++
++describe('expiry vs dropUnansweredToolCalls repair', () => {
++  // Same sentAt spacing as the expiresAt suite: real pushes are ms apart.
++  const tick = { t: Date.now() - 60_000 }
++  // Mirrors runAgentStep's order: expireMessages first, repair second.
++  const assemble = (messages: Message[]) =>
++    dropUnansweredToolCalls(expireMessages(messages, 'agentStep'))
++
++  const orphanCall = () =>
++    assistantMessage([
++      {
++        type: 'tool-call' as const,
++        toolCallId: 'tc-1',
++        toolName: 'read_files',
++        input: {},
++      },
++    ] as const)
++
++  it('a live nudge flushes and repairs the same orphan timeToLive would have', () => {
++    // timeToLive version (legacy behavior pins the semantics both share).
++    const withTtl = assemble([
++      orphanCall(),
++      userMessage({ content: 'n', tags: ['N'], timeToLive: 'userPrompt' }),
++    ])
++    const withExpiresAt = assemble([
++      orphanCall(),
++      userMessage({
++        content: 'n',
++        tags: ['N'],
++        expiresAt: 'userPrompt',
++      }),
++    ])
++    // User-boundary flush marks the orphaned call unanswered in both; the
++    // appended snitch marker flushes it too, so the repair is identical.
++    for (const result of [withTtl, withExpiresAt]) {
++      expect(result.some((m) => m.role === 'assistant')).toBe(false)
++    }
++    expect(withExpiresAt.map(textOf)).toEqual(
++      expect.arrayContaining([expect.stringContaining('n')]),
++    )
++  })
++
++  it('an expelled nudge boundary repairs the same orphan the model saw', () => {
++    // Sequence: orphaned call -> nudge -> repair user message -> tool result.
++    // The userRole nudge flushes the pending call at the boundary; the model
++    // sees that repaired (call-dropped) view on EVERY step the nudge is live,
++    // and after the nudge expires the underlying call+result pair is also
++    // gone, so repair views never flip between passes.
++    const tc = orphanCall()
++    const toolResult: Message = {
++      role: 'tool',
++      toolCallId: 'tc-1',
++      toolName: 'read_files',
++      content: jsonToolResult([]),
++    }
++    const firstPass = assemble([
++      tc,
++      {
++        ...userMessage({
++          content: 'nudge',
++          tags: ['N'],
++          expiresAt: 'agentStep',
++        }),
++        sentAt: tick.t++,
++      },
++      toolResult,
++    ])
++    // The nudge is userRole: the orphan was flushed at its boundary and the
++    // assistant message dropped; the tool result is intentionally preserved
++    // by the repair (freestanding results are legal).
++    expect(firstPass.filter((m) => m.role === 'assistant')).toHaveLength(0)
++    expect(firstPass.filter((m) => m.role === 'tool')).toHaveLength(1)
++    expect(firstPass.some((m) => textOf(m) === 'nudge')).toBe(true)
++
++    // After the nudge expires on the next pass, repair must not resurrect or
++    // further mutate the pair.
++    const secondPass = dropUnansweredToolCalls(
++      expireMessages(firstPass, 'agentStep'),
++    )
++    expect(secondPass.filter((m) => m.role === 'assistant')).toHaveLength(0)
++    expect(secondPass.filter((m) => m.role === 'tool')).toHaveLength(1)
++    expect(secondPass.some((m) => textOf(m) === 'nudge')).toBe(false)
++  })
++
++  it('empty-but-live nudge history yields no phantom marker-only prompts', () => {
++    const result = assemble([])
++    expect(result).toHaveLength(0)
++  })
++})
+diff --git a/packages/agent-runtime/src/util/cache-expiry.ts b/packages/agent-runtime/src/util/cache-expiry.ts
+new file mode 100644
+index 0000000000..51934f4339
+--- /dev/null
++++ b/packages/agent-runtime/src/util/cache-expiry.ts
+@@ -0,0 +1,6 @@
++/**
++ * Re-export of the package-level expiry contract so util/messages.ts can
++ * re-export it from '../cache-expiry' and still reach it locally. Authoritative
++ * type + docs: ../cache-expiry.
++ */
++export * from '../cache-expiry'
+diff --git a/packages/agent-runtime/src/util/gravity-report-nudge.ts b/packages/agent-runtime/src/util/gravity-report-nudge.ts
+index dbd0416ff6..8a404d9daa 100644
+--- a/packages/agent-runtime/src/util/gravity-report-nudge.ts
++++ b/packages/agent-runtime/src/util/gravity-report-nudge.ts
+@@ -1,3 +1,5 @@
++import { isSeenMarker } from './messages'
++
+ import type { Message } from '@codebuff/common/types/messages/codebuff-message'
+ 
+ /**
+@@ -73,7 +75,9 @@ export function gravityRecommendationFromToolOutput(
+ 
+ /** Whether this step answered the nudge with report_integration calls and
+  *  nothing else, so the turn ends once they run. A later user message (the
+- *  user steering mid-turn) means it was not the nudge being answered. */
++ *  user steering mid-turn) means it was not the nudge being answered. The
++ *  step-boundary marker expireMessages appends after an expiresAt'd nudge is
++ *  not such a message. */
+ export function endsOnGravityReport(
+   toolCalls: { toolName: string; input?: unknown }[],
+   history: Message[],
+@@ -88,7 +92,9 @@ export function endsOnGravityReport(
+   ) {
+     return false
+   }
+-  const lastUser = history.findLast((message) => message.role === 'user')
++  const lastUser = history.findLast(
++    (message) => message.role === 'user' && !isSeenMarker(message),
++  )
+   return lastUser?.tags?.includes(GRAVITY_REPORT_NUDGE_TAG) === true
+ }
+ 
+diff --git a/packages/agent-runtime/src/util/messages.ts b/packages/agent-runtime/src/util/messages.ts
+index 029e6426d7..6132ce1eba 100644
+--- a/packages/agent-runtime/src/util/messages.ts
++++ b/packages/agent-runtime/src/util/messages.ts
+@@ -308,20 +308,178 @@ export function getMessagesSubset(params: {
+   return messagesSubset
+ }
+ 
++/**
++ * A message the runtime adds to history so the model sees history that
++ * reflects this pass's TTL/keepLastTags pruning. It is stripped by the NEXT
++ * expireMessages call, at which point any real message carrying `expiresAt`
++ * is old enough to expire: without the marker a mid-turn nudge would vanish
++ * from the very next step's prompt, just like timeToLive: 'agentStep' did —
++ * the step prompt survives that exact pruning only because it is re-pushed
++ * (rather than re-stamped) with a fresh TTL every step. The marker pins all
++ * 'agentStep' pruning to the pass after the message's own step.
++ *
++ * The never-sees-text prompt replies to the marker with a terse "Understood."
++ * — accept that over deleting the marker at send time (history is replayed
++ * and re-sent, so whatever is deleted must be re-inserted next step anyway,
++ * in worse order: early in history it also shifts the cached suffix every
++ * step). If a model gets much chattier, gate the marker strip/push on the
++ * template like completionCheck.
++ */
++// cache-expiry is re-exported here so the source location is
++// packages/agent-runtime/src/ (auxiliary-message-data imports it with a
++// sibling-level relative path from common/src/types/messages/). The comments
++// on it force the update cadence: they document the expiry semantics this
++// same file implements.
++export * from './cache-expiry'
++
++const SEEN_MESSAGE_TAGS = [
++  'SEEN_MESSAGES_MARKER',
++  // Renamed from USER_MESSAGE_SEEN on the first cut; the rename document is
++  // in the PR that introduced the marker. Remove this tag once all histories
++  // from before the rename have aged out (they persisted in session state).
++  'USER_MESSAGE_SEEN',
++] as const
++
++export function isSeenMarker(m: Message): boolean {
++  return (
++    m.role === 'user' &&
++    SEEN_MESSAGE_TAGS.some((tag) => m.tags?.includes(tag))
++  )
++}
++
++const SEEN_MARKER_PREFIX = '<step_boundary_snitch> oldest step boundary'
++
++/**
++ * When a message with `keepLastTags` arrives, the latest declaration wins:
++ * earlier messages that share any of the listed tags (a declaration's own
++ * `tags` overlap counts) are dropped from the assembled history. This is a
++ * content-supersede relation, not an observational one: the newest
++ * declaration restates everything the earlier copies said, so they cost
++ * tokens (and shift the cached suffix every step) without informing the
++ * model. That is why it applies on every expireMessages pass, not only once
++ * the model has seen the newest copy.
++ */
++export function applyKeepLastTags(messages: Message[]): Message[] {
++  let cutoff = -1
++  let keepTags: string[] = []
++  for (let i = messages.length - 1; i >= 0; i--) {
++    const tags = messages[i]!.keepLastTags
++    if (tags === undefined) continue
++    cutoff = i
++    keepTags = tags
++    break
++  }
++  if (cutoff === -1) return messages
++  const drop = new Set<number>()
++  for (let i = 0; i < cutoff; i++) {
++    if (messages[i]!.tags?.some((tag) => keepTags.includes(tag))) drop.add(i)
++  }
++  return messages.filter((_, i) => !drop.has(i))
++}
++
++/**
++ * Drop messages whose TTL/expiresAt boundary has passed, plus keepLastTags
++ * supersede rules.
++ *
++ * Semantics:
++ * - `timeToLive: 'agentStep'` dies at every step boundary, including the one
++ *   right after the message was pushed mid-turn.
++ * - `timeToLive: 'userPrompt'` additionally survives step boundaries; it
++ *   dies only at a turn end. Deprecated.
++ * - `expiresAt` is the declarative replacement. A turn-scoped message
++ *   (`expiresAt: 'userPrompt'`, the only value any runtime pusher uses) is
++ *   dropped when the history shows a NEWER USER_PROMPT than the message —
++ *   i.e. at the first step of the turn after the one that created it. During
++ *   its own turn it is in every step's prompt: the nudge decisions that
++ *   push these messages (gravity report, followup to-do, to-do progress,
++ *   completion check) count their own prior nudges in history to rate-limit
++ *   themselves, so expiring a nudge mid-turn would re-arm the rate limiter
++ *   and loop. In exchange a turn's step N+1 only pays for the nudges the
++ *   turn actually produced, which are rate-limited to at most a handful.
++ *   `expiresAt: 'agentStep'` exists for messages that must die at the very
++ *   next boundary (a step prompt, say): it is granted one grace pass —
++ *   tracked by a snitch marker the pass appends behind it — so a push site
++ *   between the step-top and mid-step passes still reaches the model once.
++ *
++ * Order matters with dropUnansweredToolCalls: run that repair AFTER this, so
++ * an expiresAt'd nudge can't flush orphaned tool calls into being repaired
++ * in a way neither the model nor the runtime observed.
++ */
+ export function expireMessages(
+   messages: Message[],
+   endOf: 'agentStep' | 'userPrompt',
+ ): Message[] {
+-  return messages.filter((m) => {
+-    // Keep messages with no timeToLive
+-    if (m.timeToLive === undefined) return true
+-
+-    // Remove messages that have expired
+-    if (m.timeToLive === 'agentStep') return false
+-    if (m.timeToLive === 'userPrompt' && endOf === 'userPrompt') return false
++  // Strip the marker already in history, if any. Only that one counts as a
++  // passed step boundary: expireMessages runs several times per logical step
++  // (a step-top assembly pass and a mid-step cleanup between the push sites
++  // for turn-scoped nudges), so the marker THIS pass is about to append is in
++  // the future of those pushes and must not arm their expiry.
++  const boundaryPassed = messages.some((m) => isSeenMarker(m))
++  const markerSentAt = messages.find((m) => isSeenMarker(m))?.sentAt
++  const withoutMarker = messages.filter((m) => !isSeenMarker(m))
++
++  // A turn boundary for expiresAt purposes is the newest USER_PROMPT. Any
++  // expiresAt-carrying message at/after it belongs to the live turn.
++  let liveTurnStart = -1
++  for (let i = withoutMarker.length - 1; i >= 0; i--) {
++    const m = withoutMarker[i]!
++    if (m.role === 'user' && m.tags?.includes('USER_PROMPT')) {
++      liveTurnStart = i
++      break
++    }
++  }
+ 
+-    return true
++  const kept = withoutMarker.filter((m, i) => {
++    if (m.expiresAt === undefined) {
++      // Legacy prescriptive field. New code: expiresAt.
++      if (m.timeToLive === 'agentStep') return false
++      if (m.timeToLive === 'userPrompt' && endOf === 'userPrompt') return false
++      return true
++    }
++    if (
++      m.expiresAt === 'turn' ||
++      m.expiresAt === 'conversation' ||
++      m.expiresAt === 'notImplemented'
++    ) {
++      return true
++    }
++    if (m.expiresAt === 'userPrompt') {
++      // Dead once a newer USER_PROMPT exists; within its turn, every step.
++      if (liveTurnStart !== -1 && i < liveTurnStart) return false
++      if (endOf === 'userPrompt') return false
++      return true
++    }
++    // expiresAt === 'agentStep': one grace pass after the push, then gone at
++    // the first step boundary strictly newer than the message.
++    if (!boundaryPassed) return true
++    if (
++      m.sentAt !== undefined &&
++      markerSentAt !== undefined &&
++      m.sentAt > markerSentAt
++    ) {
++      return true
++    }
++    return false
+   })
++
++  const deduped = applyKeepLastTags(kept)
++
++  const needsMarker = deduped.some((m) => m.expiresAt === 'agentStep')
++  if (!needsMarker) return deduped
++  return [
++    ...deduped,
++    {
++      role: 'user' as const,
++      content: [
++        {
++          type: 'text' as const,
++          text: `${SEEN_MARKER_PREFIX} last rites`,
++        },
++      ],
++      tags: [SEEN_MESSAGE_TAGS[0]],
++      sentAt: Date.now(),
++    },
++  ]
+ }
+ 
+ export function getPreviouslyReadFiles(params: {
