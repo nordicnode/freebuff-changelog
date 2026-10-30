@@ -1,0 +1,1916 @@
+Date: 2026-10-30T13:10:46.000Z
+Category: CLI
+Areas: CLI
+Commit nature: production
+Stats: +133 / -8
+Analysis notes: cli: append streamed root text once per flush, not once per delta (#1570)
+Author intent & PR motivation (the WHY lives here; quote it when it explains the change, and say "the reason is not visible" when it does not):
+- PR #1570: cli: append streamed root text once per flush, not once per delta
+  PR Description: ## Why
+
+The batched message updater applies its queue once per 100 ms, but that batching was only half done: every streamed `text`/`reasoning` delta was queued as its own closure, so a flush called `appendTextToRootStream` once per token. That function starts with `const nextBlocks = [...blocks]` — a shallow copy of every block in the message — so a long answer copied the whole block array per token.
+
+## What changes
+
+- `PendingUpdate` becomes a tagged union: `{ kind: 'updater' }` for existing queued closures, `{ kind: 'rootText', delta }` for streamed text.
+- `appendRootText` merges a delta into the tail entry when both are `rootText` of the same type, so consecutive deltas collapse into one string per window. An interleaved non-text update ends the merge, so ordering is preserved by construction.
+- `flush` composes the queue into a single transform and applies it in one `setMessages`, appending text once per text type per window.
+- `appendRootChunk` (`utils/sdk-event-handlers.ts`) calls `updater.appendRootText(delta)` instead of wrapping `appendTextToRootStream` in a closure.
+
+No primitive, component or render path changes.
+
+## Performance
+
+`bun` 1.4.2, same machine:
+
+| fixture | per-delta (before) | after |
+|---|---|---|
+| 200 KB answer, 26,572 deltas | 765.2 ms | 19.7 ms at 100 deltas/flush — 39× (22.5 ms at 50, 41.8 ms at 25) |
+| 2,040,000 chars, 291,429 deltas, 20,001 blocks | 23,949.6 ms | 352.6 ms at 200 deltas/flush |
+
+The second row is the case that produced
+- Commit message details: Co-authored-by: Codebuff <noreply@codebuff.com>
+Modified files: cli/src/utils/message-updater.ts, cli/src/utils/sdk-event-handlers.ts
+Structured facts (extracted mechanically from the diff; copy names and values verbatim, never round or rename):
+- Exports added: RootTextDelta
+- Behavior asserted by new tests (test titles, verbatim; the hunks themselves are omitted): "appendRootText coalescing" ; "merged deltas produce the same blocks as one append each" ; "a flush boundary and an interleaved update keep arrival order"
+Module & File Purpose (ground-truth documentation from touched files):
+- File `cli/src/utils/message-updater.ts`:
+```
+/** A streamed text delta for the root message. Structural twin of the
+ *  event handler's own `TextDelta`, declared here so this module does not
+ *  import from the handler that imports it. */
+```
+Subsystem Architecture Documentation (from nearby package guides):
+- From `cli/README.md`:
+```markdown
+# @codebuff/cli
+
+A Terminal User Interface (TUI) package built with OpenTUI and React.
+
+## Installation
+
+```bash
+bun install
+```
+
+## Development
+
+Run the TUI in development mode:
+
+```bash
+bun run dev
+```
+
+## Testing
+
+Run the test suite:
+
+```bash
+bun test
+```
+
+### Interactive E2E Testing
+
+For testing interactive CLI features, install tmux:
+
+```bash
+# macOS
+brew install tmux
+
+# Ubuntu/Debian
+sudo apt-get install tmux
+
+# Windows (via WSL)
+wsl --install
+sudo apt-get install tmux
+```
+
+Then run the proof-of-concept:
+
+```bash
+bun run test:tmux-poc
+```
+
+[freebuff product prompt text omitted]
+
+```bash
+# ❌ Broken: tmux send-keys -t session "hello"
+# ✅ Works:  tmux send-keys -t session $'\e[200~hello\e[201~'
+```
+
+See [tmux.knowledge.md](tmux.knowledge.md) for comprehensive tmux documentation and [src/__tests__/README.md](src/__tests__/README.md) for testing documentation.
+
+## Build
+
+Build the package:
+
+```bash
+bun run build
+```
+
+## Run
+
+Run the built TUI:
+
+```bash
+bun run start
+```
+
+Or use the binary directly:
+
+```bash
+codebuff-tui
+```
+
+## Features
+```
+Complete Source of Modified Files (for complete module context):
+- File `cli/src/utils/message-updater.ts` (337 lines):
+```
+import { appendTextToRootStream } from './block-operations'
+
+import type { ChatMessage, ContentBlock, TextContentBlock } from '../types/chat'
+
+/** A streamed text delta for the root message. Structural twin of the
+ *  event handler's own `TextDelta`, declared here so this module does not
+ *  import from the handler that imports it. */
+export type RootTextDelta = { type: 'text' | 'reasoning'; text: string }
+
+// Small wrapper to avoid repeating the ai-message map/update pattern.
+export type SetMessagesFn = (
+  updater: (messages: ChatMessage[]) => ChatMessage[],
+) => void
+
+export type MessageUpdater = {
+  updateAiMessage: (updater: (msg: ChatMessage) => ChatMessage) => void
+  updateAiMessageBlocks: (
+    blockUpdater: (blocks: ContentBlock[]) => ContentBlock[],
+  ) => void
+  /**
+   * Append a streamed text delta to the root message.
+   *
+   * Prefer this over `updateAiMessageBlocks((blocks) =>
+   * appendTextToRootStream(blocks, delta))`: a batched updater merges
+   * consecutive deltas of the same text type into one append per flush, which
+   * is what keeps a long reply from copying the block array once per token.
+   */
+  appendRootText: (delta: RootTextDelta) => void
+  markComplete: (metadata?: Partial<ChatMessage>) => void
+  setError: (message: string) => void
+  /** Clears the userError field (e.g., when a new message is sent successfully) */
+  clearUserError: () => void
+  addBlock: (block: ContentBlock) => void
+}
+
+/** Extended updater with batching control methods */
+export type BatchedMessageUpdater = MessageUpdater & {
+  /** Immediately flush all pending updates to state */
+  flush: () => void
+  /** Stop the flush interval and clean up. Called automatically by markComplete/setError */
+  dispose: () => void
+}
+
+/** Default interval for batched updates in milliseconds */
+export const DEFAULT_FLUSH_INTERVAL_MS = 100
+
+export const createMessageUpdater = (
+  aiMessageId: string,
+  setMessages: SetMessagesFn,
+): MessageUpdater => {
+  const updateAiMessage = (updater: (msg: ChatMessage) => ChatMessage) => {
+    setMessages((prev) =>
+      prev.map((msg) => (msg.id === aiMessageId ? updater(msg) : msg)),
+    )
+  }
+
+  const updateAiMessageBlocks = (
+    blockUpdater: (blocks: ContentBlock[]) => ContentBlock[],
+  ) => {
+    updateAiMessage((msg) => ({
+      ...msg,
+      blocks: blockUpdater(msg.blocks ?? []),
+    }))
+  }
+
+  const appendRootText = (delta: RootTextDelta) => {
+    if (!delta.text) return
+    updateAiMessageBlocks((blocks) => appendTextToRootStream(blocks, delta))
+  }
+
+  const addBlock = (block: ContentBlock) => {
+    updateAiMessage((msg) => ({
+      ...msg,
+      blocks: [...(msg.blocks ?? []), block],
+    }))
+  }
+
+  const markComplete = (metadata?: Partial<ChatMessage>) => {
+    updateAiMessage((msg) => {
+      const { metadata: messageMetadata, ...rest } = metadata ?? {}
+      
+      // Mark native reasoning blocks as complete by setting thinkingOpen = false
+      // This ensures thinking blocks auto-collapse when the message finishes
+      // Check for thinkingOpen !== false to handle both true (native) and undefined (legacy)
+      const updatedBlocks = msg.blocks?.map((block) => {
+        if (
+          block.type === 'text' &&
+          (block as TextContentBlock).textType === 'reasoning' &&
+          (block as TextContentBlock).thinkingOpen !== false
+        ) {
+          return { ...block, thinkingOpen: false } as ContentBlock
+        }
+        return block
+      })
+      
+      const nextMessage: ChatMessage = {
+        ...msg,
+        isComplete: true,
+        ...(updatedBlocks && { blocks: updatedBlocks }),
+        ...rest,
+      }
+
+      if (messageMetadata) {
+        nextMessage.metadata = {
+          ...(msg.metadata ?? {}),
+          ...messageMetadata,
+        }
+      }
+
+      return nextMessage
+    })
+  }
+
+  const setError = (message: string) => {
+    updateAiMessage((msg) => ({
+      ...msg,
+      userError: message,
+      isComplete: true,
+    }))
+  }
+
+  /**
+   * Clears the userError field from the message.
+   * Call this when starting a new successful interaction to dismiss any previous error banners.
+   */
+  const clearUserError = () => {
+    updateAiMessage((msg) => {
+      if (!msg.userError) return msg
+      const { userError: _, ...rest } = msg
+      return rest as ChatMessage
+    })
+  }
+
+  return {
+    updateAiMessage,
+    updateAiMessageBlocks,
+    appendRootText,
+    markComplete,
+    setError,
+    clearUserError,
+    addBlock,
+  }
+}
+
+/**
+ * One queued change. A text delta is kept structured rather than as a closure
+ * so consecutive deltas of the same type can be merged into a single append at
+ * flush time.
+ */
+type PendingUpdate =
+  | { kind: 'updater'; update: (msg: ChatMessage) => ChatMessage }
+  | { kind: 'rootText'; delta: RootTextDelta }
+
+/** Batched updater that queues updates and flushes at a regular interval. */
+export const createBatchedMessageUpdater = (
+  aiMessageId: string,
+  setMessages: SetMessagesFn,
+  flushIntervalMs: number = DEFAULT_FLUSH_INTERVAL_MS,
+): BatchedMessageUpdater => {
+  // Ordered queue, applied on the next flush. Text deltas are merged in place
+  // with the previous entry when they share a type, so a 100ms flush window
+  // costs one block-array append per text type instead of one per token.
+  const pendingUpdaters: PendingUpdate[] = []
+  let intervalId: ReturnType<typeof setInterval> | null = null
+  let isDisposed = false
+
+  const flush = () => {
+    if (pendingUpdaters.length === 0) return
+
+    // Capture and clear the queue atomically
+    const updaters = pendingUpdaters.splice(0, pendingUpdaters.length)
+
+    // Compose all pending updates into a single transform, in arrival order
+    const composedUpdater = (msg: ChatMessage): ChatMessage => {
+      return updaters.reduce(
+        (m, entry) =>
+          entry.kind === 'updater'
+            ? entry.update(m)
+            : {
+                ...m,
+                blocks: appendTextToRootStream(m.blocks ?? [], entry.delta),
+              },
+        msg,
+      )
+    }
+
+    // Apply composed update to the target message
+    setMessages((prev) =>
+      prev.map((msg) => (msg.id === aiMessageId ? composedUpdater(msg) : msg)),
+    )
+  }
+
+  const dispose = () => {
+    if (isDisposed) return
+    // Flush any pending updates before disposing to prevent data loss
+    flush()
+    isDisposed = true
+    if (intervalId !== null) {
+      clearInterval(intervalId)
+      intervalId = null
+    }
+  }
+
+  // Start the periodic flush interval
+  intervalId = setInterval(flush, flushIntervalMs)
+
+  const updateAiMessage = (updater: (msg: ChatMessage) => ChatMessage) => {
+    if (isDisposed) {
+      // If disposed, apply immediately as fallback
+      setMessages((prev) =>
+        prev.map((msg) => (msg.id === aiMessageId ? updater(msg) : msg)),
+      )
+      return
+    }
+    pendingUpdaters.push({ kind: 'updater', update: updater })
+  }
+
+  const updateAiMessageBlocks = (
+    blockUpdater: (blocks: ContentBlock[]) => ContentBlock[],
+  ) => {
+    updateAiMessage((msg) => ({
+      ...msg,
+      blocks: blockUpdater(msg.blocks ?? []),
+    }))
+  }
+
+  const appendRootText = (delta: RootTextDelta) => {
+    if (!delta.text) return
+    if (isDisposed) {
+      updateAiMessageBlocks((blocks) => appendTextToRootStream(blocks, delta))
+      return
+    }
+    const tail = pendingUpdaters[pendingUpdaters.length - 1]
+    if (tail && tail.kind === 'rootText' && tail.delta.type === delta.type) {
+      tail.delta = { ...tail.delta, text: tail.delta.text + delta.text }
+      return
+    }
+    pendingUpdaters.push({ kind: 'rootText', delta })
+  }
+
+  const addBlock = (block: ContentBlock) => {
+    updateAiMessage((msg) => ({
+      ...msg,
+      blocks: [...(msg.blocks ?? []), block],
+    }))
+  }
+
+  const markComplete = (metadata?: Partial<ChatMessage>) => {
+    // Flush any pending updates first
+    flush()
+    // Stop the interval
+    dispose()
+
+    // Apply completion immediately
+    setMessages((prev) =>
+      prev.map((msg) => {
+        if (msg.id !== aiMessageId) return msg
+        const { metadata: messageMetadata, ...rest } = metadata ?? {}
+        
+        // Mark native reasoning blocks as complete by setting thinkingOpen = false
+        // This ensures thinking blocks auto-collapse when the message finishes
+        // Check for thinkingOpen !== false to handle both true (native) and undefined (legacy)
+        const updatedBlocks = msg.blocks?.map((block) => {
+          if (
+            block.type === 'text' &&
+            (block as TextContentBlock).textType === 'reasoning' &&
+            (block as TextContentBlock).thinkingOpen !== false
+          ) {
+            return { ...block, thinkingOpen: false } as ContentBlock
+          }
+          return block
+        })
+        
+        const nextMessage: ChatMessage = {
+          ...msg,
+          isComplete: true,
+          ...(updatedBlocks && { blocks: updatedBlocks }),
+          ...rest,
+        }
+        if (messageMetadata) {
+          nextMessage.metadata = {
+            ...(msg.metadata ?? {}),
+            ...messageMetadata,
+          }
+        }
+        return nextMessage
+      }),
+    )
+  }
+
+  const setError = (message: string) => {
+    // Flush any pending updates first so we don't lose streamed content
+    flush()
+    // Stop the interval
+    dispose()
+
+    // Apply error immediately while preserving existing content and blocks
+    setMessages((prev) =>
+      prev.map((msg) => {
+        if (msg.id !== aiMessageId) return msg
+        return {
+          ...msg,
+          userError: message,
+          isComplete: true,
+        }
+      }),
+    )
+  }
+
+  /**
+   * Clears the userError field from the message immediately (bypasses batch queue).
+   * Call this when starting a new successful interaction to dismiss any previous error banners.
+   */
+  const clearUserError = () => {
+    // Apply immediately (bypass batch queue) so error banners are dismissed instantly
+    setMessages((prev) =>
+      prev.map((msg) => {
+        if (msg.id !== aiMessageId || !msg.userError) return msg
+        const { userError: _, ...rest } = msg
+        return rest as ChatMessage
+      }),
+    )
+  }
+
+  return {
+    updateAiMessage,
+    updateAiMessageBlocks,
+    appendRootText,
+    markComplete,
+    setError,
+    clearUserError,
+    addBlock,
+    flush,
+    dispose,
+  }
+}
+```
+- File `cli/src/utils/sdk-event-handlers.ts` (673 lines):
+```
+import { match } from 'ts-pattern'
+
+import {
+  noteAdStreamChunk,
+  noteAdToolCall,
+  noteAdToolResult,
+} from '../ads/ad-signals'
+
+import {
+  appendTextToRootStream,
+  appendToolToAgentBlock,
+  closeNativeReasoningBlock,
+  closeNativeReasoningInAgent,
+  markAgentComplete,
+} from './block-operations'
+import { shouldHideAgent } from './constants'
+import {
+  createAgentBlock,
+  extractPlanFromBuffer,
+  extractSpawnAgentResultContent,
+  findAgentTypeById,
+  insertPlanBlock,
+  nestBlockUnderParent,
+  transformAskUserBlocks,
+  updateToolBlockWithOutput,
+} from './message-block-helpers'
+import {
+  findMatchingSpawnAgent,
+  resolveSpawnAgentToReal,
+} from './spawn-agent-matcher'
+import {
+  destinationFromChunkEvent,
+  processTextChunk,
+} from './stream-chunk-processor'
+
+import type { AgentMode } from './constants'
+import type { MessageUpdater } from './message-updater'
+import type { StreamController } from '../hooks/stream-state'
+import type { StreamStatus } from '../hooks/use-message-queue'
+import type { ContentBlock, ToolContentBlock } from '../types/chat'
+import type { Logger } from '@codebuff/common/types/contracts/logger'
+import type {
+  PrintModeError,
+  PrintModeEvent as SDKEvent,
+  PrintModeFinish,
+  PrintModeSubagentFinish,
+  PrintModeSubagentStart,
+  PrintModeToolCall,
+  PrintModeToolResult,
+} from '@codebuff/common/types/print-mode'
+import type { ToolName } from '@codebuff/sdk'
+import type { MutableRefObject } from 'react'
+
+export type SetStreamingAgentsFn = (
+  updater: (prev: Set<string>) => Set<string>,
+) => void
+
+export type SetStreamStatusFn = (status: StreamStatus) => void
+
+export type StreamChunkEvent =
+  | string
+  | {
+      type: 'subagent_chunk'
+      agentId: string
+      agentType: string
+      chunk: string
+    }
+  | {
+      type: 'reasoning_chunk'
+      agentId: string
+      ancestorRunIds: string[]
+      chunk: string
+    }
+
+export type StreamingState = {
+  streamRefs: StreamController
+  setStreamingAgents: SetStreamingAgentsFn
+  setStreamStatus: SetStreamStatusFn
+}
+
+export type MessageState = {
+  aiMessageId: string
+  updater: MessageUpdater
+  hasReceivedContentRef: MutableRefObject<boolean>
+}
+
+export type SubagentState = {
+  addActiveSubagent: (id: string) => void
+  removeActiveSubagent: (id: string) => void
+}
+
+export type ModeState = {
+  agentMode: AgentMode
+  setHasReceivedPlanResponse: (value: boolean) => void
+}
+
+export type EventHandlerState = {
+  /** Reject late SDK callbacks after this run loses chat ownership. */
+  isActive?: () => boolean
+  streaming: StreamingState
+  message: MessageState
+  subagents: SubagentState
+  mode: ModeState
+  logger: Logger
+  setIsRetrying: (retrying: boolean) => void
+  onTotalCost?: (cost: number) => void
+}
+
+type TextDelta = { type: 'text' | 'reasoning'; text: string }
+
+const hiddenToolNames = new Set<ToolName | 'spawn_agent_inline'>([
+  'spawn_agent_inline',
+  'end_turn',
+  'spawn_agents',
+])
+
+const isHiddenToolName = (
+  toolName: string,
+): toolName is ToolName | 'spawn_agent_inline' =>
+  hiddenToolNames.has(toolName as ToolName | 'spawn_agent_inline')
+
+const ensureStreaming = (state: EventHandlerState) => {
+  if (!state.message.hasReceivedContentRef.current) {
+    state.message.hasReceivedContentRef.current = true
+    state.streaming.setStreamStatus('streaming')
+  }
+}
+
+const appendRootChunk = (state: EventHandlerState, delta: TextDelta) => {
+  if (!delta.text) {
+    return
+  }
+
+  // Structured rather than a closure: the batched updater merges consecutive
+  // deltas of one type into a single block-array append per flush.
+  state.message.updater.appendRootText(delta)
+
+  if (
+    state.mode.agentMode === 'PLAN' &&
+    delta.type === 'text' &&
+    !state.streaming.streamRefs.state.planExtracted &&
+    state.streaming.streamRefs.state.rootStreamBuffer.includes('</PLAN>')
+  ) {
+    const rawPlan = extractPlanFromBuffer(
+      state.streaming.streamRefs.state.rootStreamBuffer,
+    )
+    if (rawPlan !== null) {
+      state.streaming.streamRefs.setters.setPlanExtracted(true)
+      state.mode.setHasReceivedPlanResponse(true)
+      state.message.updater.updateAiMessageBlocks((blocks) =>
+        insertPlanBlock(blocks, rawPlan),
+      )
+    }
+  }
+}
+
+const updateStreamingAgents = (
+  state: EventHandlerState,
+  op: { add?: string; remove?: string },
+) => {
+  state.streaming.setStreamingAgents((prev) => {
+    const next = new Set(prev)
+    if (op.remove) {
+      next.delete(op.remove)
+    }
+    if (op.add) {
+      next.add(op.add)
+    }
+    return next
+  })
+}
+
+const handleSubagentStart = (
+  state: EventHandlerState,
+  event: PrintModeSubagentStart,
+) => {
+  if (shouldHideAgent(event.agentType)) {
+    return
+  }
+
+  state.subagents.addActiveSubagent(event.agentId)
+
+  const spawnAgentMatch = findMatchingSpawnAgent(
+    state.streaming.streamRefs.state.spawnAgentsMap,
+    event.agentType || '',
+  )
+
+  if (spawnAgentMatch) {
+    state.message.updater.updateAiMessageBlocks((blocks) =>
+      resolveSpawnAgentToReal({
+        blocks,
+        match: spawnAgentMatch,
+        realAgentId: event.agentId,
+        realAgentType: event.agentType,
+        parentAgentId: event.parentAgentId,
+        params: event.params,
+        prompt: event.prompt,
+      }),
+    )
+
+    updateStreamingAgents(state, {
+      remove: spawnAgentMatch.tempId,
+      add: event.agentId,
+    })
+    state.streaming.streamRefs.setters.removeSpawnAgentInfo(
+      spawnAgentMatch.tempId,
+    )
+    return
+  }
+
+  state.logger.info(
+    {
+      agentId: event.agentId,
+      agentType: event.agentType,
+      parentAgentId: event.parentAgentId || 'ROOT',
+    },
+    'Creating new agent block (no spawn_agents match)',
+  )
+
+  state.message.updater.updateAiMessageBlocks((blocks) => {
+    // Look up the parent agent's type if there's a parent agent ID
+    const parentAgentType = event.parentAgentId
+      ? findAgentTypeById(blocks, event.parentAgentId)
+      : undefined
+
+    const newAgentBlock = createAgentBlock({
+      agentId: event.agentId,
+      agentType: event.agentType || '',
+      prompt: event.prompt,
+      params: event.params,
+      parentAgentType,
+    })
+
+    if (event.parentAgentId) {
+      const { blocks: nestedBlocks, parentFound } = nestBlockUnderParent(
+        blocks,
+        event.parentAgentId,
+        newAgentBlock,
+      )
+      if (parentFound) {
+        return nestedBlocks
+      }
+    }
+    return [...blocks, newAgentBlock]
+  })
+
+  updateStreamingAgents(state, { add: event.agentId })
+}
+
+const handleSubagentFinish = (
+  state: EventHandlerState,
+  event: PrintModeSubagentFinish,
+) => {
+  if (shouldHideAgent(event.agentType)) {
+    return
+  }
+
+  state.streaming.streamRefs.setters.removeAgentAccumulator(event.agentId)
+  state.subagents.removeActiveSubagent(event.agentId)
+
+  state.message.updater.updateAiMessageBlocks((blocks) =>
+    markAgentComplete(blocks, event.agentId),
+  )
+
+  updateStreamingAgents(state, { remove: event.agentId })
+}
+
+const handleSpawnAgentsToolCall = (
+  state: EventHandlerState,
+  event: PrintModeToolCall,
+) => {
+  const agents = Array.isArray(event.input?.agents) ? event.input?.agents : []
+
+  // Hidden agents get no block, so give them no spawn info or streaming id
+  // either — an id with no block would linger until the tool result clears it.
+  // Indices stay the original array positions so results still line up.
+  const visibleAgents = agents
+    .map((agent: any, index: number) => ({ agent, index }))
+    .filter(({ agent }: any) => !shouldHideAgent(agent?.agent_type || ''))
+
+  visibleAgents.forEach(({ agent, index }: any) => {
+    const tempAgentId = `${event.toolCallId}-${index}`
+    state.streaming.streamRefs.setters.setSpawnAgentInfo(tempAgentId, {
+      index,
+      agentType: agent.agent_type || 'unknown',
+    })
+  })
+
+  state.message.updater.updateAiMessageBlocks((blocks) => {
+    // Look up the parent agent's type if there's a parent agent ID
+    const parentAgentType = event.agentId
+      ? findAgentTypeById(blocks, event.agentId)
+      : undefined
+
+    const newAgentBlocks: ContentBlock[] = visibleAgents.map(
+      ({ agent, index }: any) =>
+        createAgentBlock({
+          agentId: `${event.toolCallId}-${index}`,
+          agentType: agent.agent_type || '',
+          prompt: agent.prompt,
+          params: agent.params,
+          spawnToolCallId: event.toolCallId,
+          spawnIndex: index,
+          parentAgentType,
+        }),
+    )
+
+    return [...blocks, ...newAgentBlocks]
+  })
+
+  visibleAgents.forEach(({ index }: any) => {
+    updateStreamingAgents(state, { add: `${event.toolCallId}-${index}` })
+  })
+}
+
+const handleRegularToolCall = (
+  state: EventHandlerState,
+  event: PrintModeToolCall,
+) => {
+  const newToolBlock: ToolContentBlock = {
+    type: 'tool',
+    toolCallId: event.toolCallId,
+    toolName: event.toolName as ToolName,
+    input: event.input,
+    agentId: event.agentId,
+    ...(event.includeToolCall !== undefined && {
+      includeToolCall: event.includeToolCall,
+    }),
+  }
+
+  if (event.parentAgentId && event.agentId) {
+    state.message.updater.updateAiMessageBlocks((blocks) =>
+      appendToolToAgentBlock(blocks, event.agentId as string, newToolBlock),
+    )
+    return
+  }
+
+  state.message.updater.updateAiMessageBlocks((blocks) => [
+    ...blocks,
+    newToolBlock,
+  ])
+}
+
+const handleToolCall = (state: EventHandlerState, event: PrintModeToolCall) => {
+  // Close any open native reasoning blocks when a tool call happens
+  // (agent may go directly from thinking to tool calls without emitting text)
+  // This must happen BEFORE any early returns (spawn_agents, hidden tools)
+  if (event.parentAgentId && event.agentId) {
+    // For agent tool calls, close reasoning in that specific agent
+    state.message.updater.updateAiMessageBlocks((blocks) =>
+      closeNativeReasoningInAgent(blocks, event.agentId as string),
+    )
+  } else if (!event.parentAgentId) {
+    // For root tool calls, close reasoning at root level
+    state.message.updater.updateAiMessageBlocks(closeNativeReasoningBlock)
+  }
+
+  if (event.toolName === 'spawn_agents' && event.input?.agents) {
+    handleSpawnAgentsToolCall(state, event)
+    return
+  }
+
+  if (isHiddenToolName(event.toolName)) {
+    return
+  }
+
+  handleRegularToolCall(state, event)
+  updateStreamingAgents(state, { add: event.toolCallId })
+}
+
+/**
+ * Recursively finds and updates agent blocks that match a spawn_agents tool call.
+ */
+const updateSpawnAgentBlock = (
+  block: ContentBlock,
+  toolCallId: string,
+  results: any[],
+): ContentBlock | null => {
+  if (block.type !== 'agent') {
+    return block
+  }
+
+  const spawnIndex = block.spawnIndex
+  const childBlocks = block.blocks
+  const isSpawnResultTarget =
+    block.spawnToolCallId === toolCallId &&
+    spawnIndex !== undefined &&
+    childBlocks
+
+  if (isSpawnResultTarget) {
+    const result = results[spawnIndex]
+    if (result?.value) {
+      const { content, hasError } = extractSpawnAgentResultContent(result.value)
+
+      if (hasError) {
+        if (childBlocks.length === 0) {
+          return null
+        }
+
+        return {
+          ...block,
+          blocks: content
+            ? [...childBlocks, { type: 'text', content } as ContentBlock]
+            : childBlocks,
+          status: 'complete' as const,
+        }
+      }
+
+      // Agents like thinker return all output at the end via lastMessage,
+      // while agents like basher may have already streamed their text.
+      const hasStreamedTextContent = childBlocks.some(
+        (b) => b.type === 'text' && b.textType === 'text',
+      )
+      const finalBlocks =
+        content && !hasStreamedTextContent
+          ? [...childBlocks, { type: 'text', content } as ContentBlock]
+          : childBlocks
+
+      if (finalBlocks.length > 0) {
+        return {
+          ...block,
+          blocks: finalBlocks,
+          status: 'complete' as const,
+        }
+      }
+    }
+  }
+
+  if (!childBlocks?.length) {
+    return block
+  }
+
+  return {
+    ...block,
+    blocks: updateSpawnAgentBlocks(childBlocks, toolCallId, results),
+  }
+}
+
+const updateSpawnAgentBlocks = (
+  blocks: ContentBlock[],
+  toolCallId: string,
+  results: any[],
+): ContentBlock[] => {
+  return blocks
+    .map((block) => updateSpawnAgentBlock(block, toolCallId, results))
+    .filter((block): block is ContentBlock => block !== null)
+}
+
+const handleSpawnAgentsResult = (
+  state: EventHandlerState,
+  toolCallId: string,
+  results: any[],
+) => {
+  // Replace placeholder spawn agent blocks with their final text/status output.
+  state.message.updater.updateAiMessageBlocks((blocks) =>
+    updateSpawnAgentBlocks(blocks, toolCallId, results),
+  )
+
+  results.forEach((_, index: number) => {
+    const agentId = `${toolCallId}-${index}`
+    updateStreamingAgents(state, { remove: agentId })
+  })
+}
+
+const handleToolResult = (
+  state: EventHandlerState,
+  event: PrintModeToolResult,
+) => {
+  const askUserResult = (event.output?.[0] as any)?.value
+  state.message.updater.updateAiMessageBlocks((blocks) =>
+    transformAskUserBlocks(blocks, {
+      toolCallId: event.toolCallId,
+      resultValue: askUserResult,
+    }),
+  )
+
+  const firstOutput = event.output?.[0]
+  const firstOutputValue =
+    firstOutput && 'value' in firstOutput ? firstOutput.value : undefined
+  const isSpawnAgentsResult =
+    Array.isArray(firstOutputValue) &&
+    firstOutputValue.some((v: any) => v?.agentName || v?.agentType)
+
+  if (isSpawnAgentsResult && Array.isArray(firstOutputValue)) {
+    handleSpawnAgentsResult(state, event.toolCallId, firstOutputValue)
+    return
+  }
+
+  state.message.updater.updateAiMessageBlocks((blocks) =>
+    updateToolBlockWithOutput(blocks, {
+      toolCallId: event.toolCallId,
+      toolOutput: event.output,
+    }),
+  )
+
+  updateStreamingAgents(state, { remove: event.toolCallId })
+}
+
+const handleFinish = (state: EventHandlerState, event: PrintModeFinish) => {
+  if (typeof event.totalCost === 'number' && state.onTotalCost) {
+    state.onTotalCost(event.totalCost)
+  }
+}
+
+const handleStreamError = (state: EventHandlerState, event: PrintModeError) => {
+  if (!event.source) {
+    // Sourceless error chunks already surface to the model as inline
+    // tool-error messages; the UI intentionally stays quiet about them.
+    return
+  }
+  // A `source` means an auto-recovered stream ending (connection cut, or
+  // output budget burned on reasoning): the agent loop is taking another
+  // step to continue. Show the transient retrying status; the next content
+  // chunk (or run completion) clears it.
+  state.logger.warn({ event }, 'Stream recovery; agent loop is retrying')
+  state.setIsRetrying(true)
+}
+
+// ---------------------------------------------------------------- UI isolation
+//
+// These handlers only project SDK events onto the chat UI, but they run INSIDE
+// the SDK's stream callback chain (sdk run.ts -> agent-runtime tool executor ->
+// stream parser). A throw from a UI state update therefore escaped as an
+// unhandled rejection, and the process-level handler turned it into a fatal
+// exit: the agent run, the chat and the Freebuff session all died with it.
+// Reported on Arch after 29 hours of uptime: React's "Maximum update depth
+// exceeded" (#185), raised by the store notification inside
+// `setStreamingAgents` (updateStreamingAgents <- handleToolCall).
+//
+// React raises #185 AFTER the store has taken the new value and resets its
+// nested-update counter before throwing, so dropping one render notification is
+// harmless: the next update renders the latest state. A missed repaint is
+// always better than killing the run, so a failing UI update is logged (with
+// its stack, to Axiom) and the run continues.
+
+const MAX_UI_HANDLER_FAILURE_LOGS_PER_RUN = 3
+const uiHandlerFailures = new WeakMap<EventHandlerState, number>()
+
+const describeHandlerError = (error: unknown) => {
+  if (error instanceof Error) {
+    return {
+      name: error.name,
+      message: error.message.slice(0, 500),
+      stack: error.stack?.split('\n').slice(0, 20).join('\n'),
+    }
+  }
+  return { message: String(error).slice(0, 500) }
+}
+
+const isolateUiHandler =
+  <E>(
+    state: EventHandlerState,
+    handler: string,
+    describe: (event: E) => string,
+    handle: (event: E) => void,
+  ) =>
+  (event: E): void => {
+    try {
+      handle(event)
+    } catch (error) {
+      const failures = (uiHandlerFailures.get(state) ?? 0) + 1
+      uiHandlerFailures.set(state, failures)
+      if (failures > MAX_UI_HANDLER_FAILURE_LOGS_PER_RUN) return
+      try {
+        state.logger.error(
+          {
+            handler,
+            sdkEvent: describe(event),
+            failures,
+            error: describeHandlerError(error),
+          },
+          'SDK event handler failed; the run continues',
+        )
+      } catch {
+        // Reporting must never turn a UI failure back into a crash.
+      }
+    }
+  }
+
+export const createStreamChunkHandler = (state: EventHandlerState) =>
+  isolateUiHandler<StreamChunkEvent>(
+    state,
+    'stream_chunk',
+    (event) => (typeof event === 'string' ? 'text' : event.type),
+    (event) => handleStreamChunk(state, event),
+  )
+
+const handleStreamChunk = (
+  state: EventHandlerState,
+  event: StreamChunkEvent,
+): void => {
+  if (state.isActive?.() === false) return
+  const destination = destinationFromChunkEvent(event)
+  let text: string | undefined
+  if (typeof event === 'string') {
+    text = event
+  } else {
+    text = event.chunk
+  }
+
+  if (!destination) {
+    state.logger.warn({ event }, 'Unhandled stream chunk event')
+    return
+  }
+
+  if (!text) {
+    return
+  }
+
+  ensureStreaming(state)
+  // COD-757: the turn's time to first token (one null check after the first).
+  noteAdStreamChunk()
+  // Content is flowing (again) — clear any stream-interrupted retry status.
+  // Terminal paths (run completion, error, abort) already reset it in
+  // use-send-message/send-message, so the indicator can't outlive its run.
+  // (No-op when already false: the immer store returns the same state.)
+  state.setIsRetrying(false)
+
+  if (destination.type === 'root') {
+    if (destination.textType === 'text') {
+      state.streaming.streamRefs.setters.appendRootStreamBuffer(text)
+    }
+    state.streaming.streamRefs.setters.setRootStreamSeen(true)
+    appendRootChunk(state, { type: destination.textType, text })
+    return
+  }
+
+  state.message.updater.updateAiMessageBlocks((blocks) =>
+    processTextChunk(blocks, destination, text),
+  )
+}
+
+export const createEventHandler = (state: EventHandlerState) =>
+  isolateUiHandler<SDKEvent>(
+    state,
+    'event',
+    (event) => event.type,
+    (event) => handleSdkEvent(state, event),
+  )
+
+const handleSdkEvent = (state: EventHandlerState, event: SDKEvent): void => {
+  // A cancelled run may still report its final billed cost. Keep that
+  // accounting event, but reject every callback that could mutate the chat
+  // or shared streaming UI after ownership has moved to another run.
+  if (state.isActive?.() === false) {
+    if (event.type === 'finish') handleFinish(state, event)
+    return
+  }
+  return match(event)
+    .with({ type: 'subagent_start' }, (e) => handleSubagentStart(state, e))
+    .with({ type: 'subagent_finish' }, (e) => handleSubagentFinish(state, e))
+    .with({ type: 'tool_call' }, (e) => {
+      // COD-757: the tool's category, and an agent shell command for the
+      // post-click adoption watch. In memory only; never throws.
+      noteAdToolCall(
+        e.toolName,
+        e.toolName === 'run_terminal_command' &&
+          typeof e.input?.command === 'string'
+          ? e.input.command
+          : undefined,
+      )
+      return handleToolCall(state, e)
+    })
+    .with({ type: 'tool_result' }, (e) => {
+      // COD-757: a failed result's error CLASS only, never its text.
+      noteAdToolResult(e.output)
+      return handleToolResult(state, e)
+    })
+    .with({ type: 'finish' }, (e) => handleFinish(state, e))
+    .with({ type: 'error' }, (e) => handleStreamError(state, e))
+    .otherwise(() => undefined)
+}
+```
+Where the symbols this change introduces are used elsewhere, at this same revision (the code that reads them; this is evidence for the WHAT and the WHY, and it is the only source for who consumes this change):
+- File `cli/src/utils/__tests__/message-updater.test.ts` (70 matching lines):
+```
+import { describe, expect, test, beforeEach, afterEach } from 'bun:test'
+
+import { appendTextToRootStream } from '../block-operations'
+import {
+  createMessageUpdater,
+  createBatchedMessageUpdater,
+  DEFAULT_FLUSH_INTERVAL_MS,
+} from '../message-updater'
+
+import type { ChatMessage, ContentBlock, TextContentBlock } from '../../types/chat'
+
+// Type for metadata with runState for testing
+interface TestMessageMetadata {
+  bashCwd?: string
+  runState?: { id: string }
+}
+
+const baseMessages: ChatMessage[] = [
+  {
+    id: 'ai-1',
+…
+},
+  {
+    id: 'user-1',
+    variant: 'user',
+    content: 'hi',
+    timestamp: 'now',
+  },
+]
+
+describe('createMessageUpdater', () => {
+  test('updates only the targeted AI message', () => {
+    let state = [...baseMessages]
+    const updater = createMessageUpdater('ai-1', (fn) => {
+      state = fn(state)
+    })
+
+    updater.updateAiMessage((msg) => ({ ...msg, content: 'updated' }))
+
+    expect(state[0].content).toBe('updated')
+    expect(state[1].content).toBe('hi')
+  })
+
+  test('adds blocks and marks complete with metadata merge', () => {
+    let state = [...baseMessages]
+```
+- File `cli/src/hooks/helpers/__tests__/send-message.test.ts` (48 matching lines):
+```
+const { useChatStore } = await import('../../../state/chat-store')
+const { IS_FREEBUFF } = await import('../../../utils/constants')
+const { createStreamController } = await import('../../stream-state')
+const {
+  setupStreamingContext,
+  handleRunCompletion,
+  handleRunError,
+  finalizeQueueState,
+  resetEarlyReturnState,
+} = await import('../send-message')
+const { createBatchedMessageUpdater } =
+  await import('../../../utils/message-updater')
+const freebuffSession = await import('../../use-freebuff-session')
+const { FREEBUFF_MODEL_UNAVAILABLE_MESSAGE, FREEBUFF_REFUNDED_START_HINT } =
+  await import('../../../utils/error-handling')
+import { createPaymentRequiredError } from '@codebuff/sdk'
+import type { RunState } from '@codebuff/sdk'
+
+const createMockTimerController = (): SendMessageTimerController & {
+  startCalls: string[]
+  stopCalls: Array<'success' | 'error' | 'aborted'>
+} => {
+  const startCalls: string[] = []
+  const stopCalls: Array<'success' | 'error' | 'aborted'> = []
+…
+describe('setupStreamingContext', () => {
+  describe('abort flow', () => {
+    test('abort handler appends interruption notice, marks complete, and releases chain lock', () => {
+      let messages = createBaseMessages()
+      const streamRefs = createStreamController()
+      const timerController = createMockTimerController()
+      let streamStatus: StreamStatus = 'idle'
+      let canProcessQueue = false
+      let chainInProgress = true
+      let isRetrying = true
+
+      const { updater, abortController } = setupStreamingContext({
+        aiMessageId: 'ai-1',
+        timerController,
+        setMessages: (fn: any) => {
+          messages = fn(messages)
+        },
+        streamRefs,
+        setStreamStatus: (status: StreamStatus) => {
+          streamStatus = status
+        },
+        setCanProcessQueue: (can: boolean) => {
+          canProcessQueue = can
+        },
+…
+// Chain lock is released immediately so new messages can be sent directly
+      expect(chainInProgress).toBe(false)
+      expect(canProcessQueue).toBe(true)
+
+      // Verify retrying reset
+      expect(isRetrying).toBe(false)
+
+      // Verify timer stopped with 'aborted' outcome
+      expect(timerController.stopCalls).toContain('aborted')
+
+      // Flush any pending updates to check interruption notice
+      updater.flush()
+
+      // Verify interruption notice appended (the message should have been updated)
+      const aiMessage = messages.find((m: ChatMessage) => m.id === 'ai-1')
+      expect(aiMessage).toBeDefined()
+
+      // The interruption notice should be added to blocks
+      const lastBlock = aiMessage!.blocks?.[aiMessage!.blocks.length - 1]
+      expect(lastBlock?.type).toBe('text')
+      const textBlock = lastBlock as { type: 'text'; content: string }
+      expect(textBlock?.content).toContain('[response interrupted]')
+
+      // Verify message marked complete
+```
+- File `cli/src/hooks/helpers/send-message.ts` (31 matching lines):
+```
+FREEBUFF_MODEL_UNAVAILABLE_MESSAGE,
+  FREEBUFF_REFUNDED_START_HINT,
+  OUT_OF_CREDITS_MESSAGE,
+} from '../../utils/error-handling'
+import { formatElapsedTime } from '../../utils/format-elapsed-time'
+import { processImagesForMessage } from '../../utils/image-processor'
+import { logger } from '../../utils/logger'
+import { appendInterruptionNotice } from '../../utils/message-block-helpers'
+import { getUserMessage } from '../../utils/message-history'
+import {
+  createBatchedMessageUpdater,
+  type BatchedMessageUpdater,
+} from '../../utils/message-updater'
+import { createModeDividerMessage } from '../../utils/send-message-helpers'
+import { yieldToEventLoop } from '../../utils/yield-to-event-loop'
+import { invalidateActivityQuery } from '../use-activity-query'
+import { usageQueryKeys } from '../use-usage-query'
+
+import type {
+  PendingAttachment,
+  PendingFileAttachment,
+  PendingImageAttachment,
+  PendingTextAttachment,
+} from '../../types/store'
+import type { ChatMessage } from '../../types/chat'
+…
+setStreamStatus,
+    setCanProcessQueue,
+    isQueuePausedRef,
+    isProcessingQueueRef,
+    updateChainInProgress,
+    setIsRetrying,
+    setStreamingAgents,
+  } = params
+  const { aiMessageId } = params
+
+  streamRefs.reset()
+  timerController.start(aiMessageId)
+  const updater = createBatchedMessageUpdater(aiMessageId, setMessages)
+  // Clear any previous UI-only error on this message when starting a new run
+  updater.clearUserError()
+  const hasReceivedContentRef = { current: false }
+  const abortController = params.abortController ?? new AbortController()
+
+  abortController.signal.addEventListener('abort', () => {
+    // Abort means the user stopped streaming; update UI with an interruption notice.
+    // Release the chain lock immediately so new messages can be sent directly instead
+    // of being queued.
+    streamRefs.setters.setWasAbortedByUser(true)
+    setIsRetrying(false)
+    timerController.stop('aborted')
+
+    // Update stream status so the UI reflects cancellation visually
+```
+- File `cli/src/utils/__tests__/send-message-helpers.test.ts` (14 matching lines):
+```
+import { describe, test, expect } from 'bun:test'
+
+import {
+  appendTextToRootStream,
+  appendTextToAgentBlock,
+  appendToolToAgentBlock,
+  isNativeReasoningBlock,
+  closeNativeReasoningBlock,
+  closeNativeReasoningInAgent,
+  markAgentComplete,
+  markRunningAgentsAsCancelled,
+} from '../block-operations'
+import {
+  updateBlocksRecursively,
+  scrubPlanTags,
+  scrubPlanTagsInBlocks,
+…
+},
+    ]
+
+    const result = autoCollapsePreviousMessages(messages, 'ai-new')
+    expect(result[0].metadata?.isCollapsed).toBeUndefined()
+  })
+})
+
+// ============================================================================
+// Stream Chunk Processing Tests (from block-operations)
+// ============================================================================
+
+describe('appendTextToRootStream', () => {
+  test('creates new text block for empty blocks array', () => {
+    const result = appendTextToRootStream([], { type: 'text', text: 'Hello' })
+
+    expect(result).toHaveLength(1)
+    expect(result[0].type).toBe('text')
+    expect((result[0] as TextContentBlock).content).toBe('Hello')
+  })
+
+  test('appends to existing text block of same type', () => {
+    const blocks: ContentBlock[] = [
+      { type: 'text', content: 'Hello', textType: 'text' },
+    ]
+
+    const result = appendTextToRootStream(blocks, {
+      type: 'text',
+      text: ' World',
+    })
+
+    expect(result).toHaveLength(1)
+    expect((result[0] as TextContentBlock).content).toBe('Hello World')
+  })
+
+  test('creates new block for different text type', () => {
+    const blocks: ContentBlock[] = [
+      { type: 'text', content: 'Hello', textType: 'text' },
+    ]
+```
+- File `cli/src/utils/__tests__/sdk-event-handlers.test.ts` (9 matching lines):
+```
+import { describe, expect, test } from 'bun:test'
+
+import { createAgentBlock } from '../message-block-helpers'
+import { createMessageUpdater } from '../message-updater'
+import {
+  createEventHandler,
+  createStreamChunkHandler,
+} from '../sdk-event-handlers'
+
+import type { StreamStatus } from '../../hooks/use-message-queue'
+import type { AgentContentBlock, ChatMessage } from '../../types/chat'
+import type { AgentMode } from '../constants'
+import type { EventHandlerState } from '../sdk-event-handlers'
+import type { Logger } from '@codebuff/common/types/contracts/logger'
+
+// Type for spawn agent info stored in the map
+…
+id: 'ai-1',
+      variant: 'ai',
+      content: '',
+      blocks: [],
+      timestamp: 'now',
+    },
+  ]
+  let streamingAgents = new Set<string>()
+  let streamStatus: StreamStatus | null = null
+  let hasPlanResponse = false
+  const streamRefs = createStreamRefs()
+
+  const updater = createMessageUpdater(
+    'ai-1',
+    (fn: (msgs: ChatMessage[]) => ChatMessage[]) => {
+      messages = fn(messages)
+    },
+  )
+
+  const ctx: EventHandlerState = {
+    streaming: {
+      streamRefs: streamRefs.controller,
+      setStreamingAgents: (fn: (prev: Set<string>) => Set<string>) => {
+        streamingAgents = fn(streamingAgents)
+      },
+      setStreamStatus: (status: StreamStatus) => {
+        streamStatus = status
+      },
+    },
+    message: {
+      aiMessageId: 'ai-1',
+      updater,
+      hasReceivedContentRef: { current: false },
+    },
+    subagents: {
+      addActiveSubagent: () => {},
+      removeActiveSubagent: () => {},
+    },
+    mode: {
+      agentMode,
+      setHasReceivedPlanResponse: (value: boolean) => {
+        hasPlanResponse = value
+      },
+    },
+```
+- File `cli/src/utils/__tests__/block-operations-streaming.test.ts` (8 matching lines):
+```
+import { describe, expect, test } from 'bun:test'
+
+import { appendTextToRootStream } from '../block-operations'
+
+import type { ContentBlock, TextContentBlock } from '../../types/chat'
+
+/**
+ * The text stream path only scans the seam between the last block and the new
+ * delta when looking for a partial think tag (see block-operations.ts), so it
+ * must still notice a tag split at any point inside the tag syntax, including
+ * the widest partial prefix it has to recognise (`</think`).
+ */
+
+const stream = (text: string, chunkSize: number): ContentBlock[] => {
+  let blocks: ContentBlock[] = []
+  for (let i = 0; i < text.length; i += chunkSize) {
+    blocks = appendTextToRootStream(blocks, {
+      type: 'text',
+      text: text.slice(i, i + chunkSize),
+    })
+  }
+  return blocks
+}
+
+const shape = (blocks: ContentBlock[]) =>
+  blocks.map((block) => {
+    const text = block as TextContentBlock
+    return {
+      type: block.type,
+…
+const code = 'if (a < b && c > d) { return <Item value={a} /> }\n'
+    const blocks = stream(code.repeat(40), 7)
+
+    // One text block, no reasoning block, content intact.
+    expect(blocks).toHaveLength(1)
+    expect(textOf(blocks)).toBe(code.repeat(40))
+    expect((blocks[0] as TextContentBlock).textType).toBe('text')
+  })
+
+  test('a long block does not change what a seam tag does', () => {
+    // The block is far longer than any tag, so only its tail can matter.
+    const blocks = stream('a'.repeat(100_000) + '<thi', 4096)
+    const finished = appendTextToRootStream(blocks, {
+      type: 'text',
+      text: 'nk>think',
+    })
+
+    expect((finished[0] as TextContentBlock).content).toBe('a'.repeat(100_000))
+    expect(shape(finished)[1]).toEqual({
+      type: 'text',
+      textType: 'reasoning',
+      content: 'think',
+      thinkingOpen: true,
+    })
+  })
+```
+Tests this commit changed (added lines only; the assertions are what the change is expected to do, not a description of the feature):
+- File `cli/src/utils/__tests__/message-updater.test.ts`: "appendRootText coalescing"; "merged deltas produce the same blocks as one append each"; "a flush boundary and an interleaved update keep arrival order"
+```
+import { appendTextToRootStream } from '../block-operations'
+describe('appendRootText coalescing', () => {
+  const streamed = [
+    { type: 'text' as const, text: 'answer ' },
+    { type: 'text' as const, text: 'more ' },
+    { type: 'text' as const, text: '<thi' },
+    { type: 'reasoning' as const, text: 'nking>why' },
+    { type: 'reasoning' as const, text: '</thi' },
+    { type: 'text' as const, text: 'nk>done' },
+  ]
+  test('merged deltas produce the same blocks as one append each', () => {
+    let merged: ChatMessage[] = [{ ...baseMessages[0] }]
+    const batched = createBatchedMessageUpdater('ai-1', (fn) => {
+      merged = fn(merged)
+    }, 10_000)
+    for (const delta of streamed) batched.appendRootText(delta)
+    batched.flush()
+    batched.dispose()
+    // Same content applied one at a time, through the primitive the merge
+    // replaces; any difference here is a rendering or ordering regression.
+    const oneByOne = streamed.reduce(
+      (blocks, delta) => appendTextToRootStream(blocks, delta as never),
+      [] as ContentBlock[],
+    )
+    // `thinkingId` comes from a module-global counter, so the two runs number
+    // their reasoning blocks differently; everything visible is compared.
+    const shape = (blocks: ContentBlock[] | undefined) =>
+      (blocks ?? []).map((block) => {
+        const text = block as TextContentBlock
+        return {
+          type: block.type,
+          content: text.content,
+          textType: text.textType,
+          thinkingOpen: text.thinkingOpen,
+        }
+      })
+    expect(shape(merged[0].blocks)).toEqual(shape(oneByOne))
+  })
+  test('a flush boundary and an interleaved update keep arrival order', () => {
+    let state: ChatMessage[] = [{ ...baseMessages[0] }]
+    const batched = createBatchedMessageUpdater('ai-1', (fn) => {
+      state = fn(state)
+    }, 10_000)
+    batched.appendRootText({ type: 'text', text: 'before ' })
+    batched.flush()
+    batched.appendRootText({ type: 'text', text: 'after' })
+    batched.u
+```
+Diff (source hunks; lockfiles and pure test hunks omitted, except in a lockfile-only commit):
+```diff
+diff --git a/cli/src/utils/message-updater.ts b/cli/src/utils/message-updater.ts
+index 2fba21cde..86cb6000c 100644
+--- a/cli/src/utils/message-updater.ts
++++ b/cli/src/utils/message-updater.ts
+@@ -1,74 +1,95 @@
++import { appendTextToRootStream } from './block-operations'
++
+ import type { ChatMessage, ContentBlock, TextContentBlock } from '../types/chat'
+ 
++/** A streamed text delta for the root message. Structural twin of the
++ *  event handler's own `TextDelta`, declared here so this module does not
++ *  import from the handler that imports it. */
++export type RootTextDelta = { type: 'text' | 'reasoning'; text: string }
++
+ // Small wrapper to avoid repeating the ai-message map/update pattern.
+ export type SetMessagesFn = (
+   updater: (messages: ChatMessage[]) => ChatMessage[],
+ ) => void
+ 
+ export type MessageUpdater = {
+   updateAiMessage: (updater: (msg: ChatMessage) => ChatMessage) => void
+   updateAiMessageBlocks: (
+     blockUpdater: (blocks: ContentBlock[]) => ContentBlock[],
+   ) => void
++  /**
++   * Append a streamed text delta to the root message.
++   *
++   * Prefer this over `updateAiMessageBlocks((blocks) =>
++   * appendTextToRootStream(blocks, delta))`: a batched updater merges
++   * consecutive deltas of the same text type into one append per flush, which
++   * is what keeps a long reply from copying the block array once per token.
++   */
++  appendRootText: (delta: RootTextDelta) => void
+   markComplete: (metadata?: Partial<ChatMessage>) => void
+   setError: (message: string) => void
+   /** Clears the userError field (e.g., when a new message is sent successfully) */
+   clearUserError: () => void
+   addBlock: (block: ContentBlock) => void
+ }
+ 
+ /** Extended updater with batching control methods */
+ export type BatchedMessageUpdater = MessageUpdater & {
+   /** Immediately flush all pending updates to state */
+   flush: () => void
+   /** Stop the flush interval and clean up. Called automatically by markComplete/setError */
+   dispose: () => void
+ }
+ 
+ /** Default interval for batched updates in milliseconds */
+ export const DEFAULT_FLUSH_INTERVAL_MS = 100
+ 
+ export const createMessageUpdater = (
+   aiMessageId: string,
+   setMessages: SetMessagesFn,
+ ): MessageUpdater => {
+   const updateAiMessage = (updater: (msg: ChatMessage) => ChatMessage) => {
+     setMessages((prev) =>
+       prev.map((msg) => (msg.id === aiMessageId ? updater(msg) : msg)),
+     )
+   }
+ 
+   const updateAiMessageBlocks = (
+     blockUpdater: (blocks: ContentBlock[]) => ContentBlock[],
+   ) => {
+     updateAiMessage((msg) => ({
+       ...msg,
+       blocks: blockUpdater(msg.blocks ?? []),
+     }))
+   }
+ 
++  const appendRootText = (delta: RootTextDelta) => {
++    if (!delta.text) return
++    updateAiMessageBlocks((blocks) => appendTextToRootStream(blocks, delta))
++  }
++
+   const addBlock = (block: ContentBlock) => {
+     updateAiMessage((msg) => ({
+       ...msg,
+       blocks: [...(msg.blocks ?? []), block],
+     }))
+   }
+ 
+   const markComplete = (metadata?: Partial<ChatMessage>) => {
+     updateAiMessage((msg) => {
+       const { metadata: messageMetadata, ...rest } = metadata ?? {}
+       
+       // Mark native reasoning blocks as complete by setting thinkingOpen = false
+       // This ensures thinking blocks auto-collapse when the message finishes
+       // Check for thinkingOpen !== false to handle both true (native) and undefined (legacy)
+       const updatedBlocks = msg.blocks?.map((block) => {
+         if (
+           block.type === 'text' &&
+           (block as TextContentBlock).textType === 'reasoning' &&
+           (block as TextContentBlock).thinkingOpen !== false
+         ) {
+           return { ...block, thinkingOpen: false } as ContentBlock
+         }
+         return block
+       })
+       
+@@ -91,119 +112,154 @@ export const createMessageUpdater = (
+   }
+ 
+   const setError = (message: string) => {
+     updateAiMessage((msg) => ({
+       ...msg,
+       userError: message,
+       isComplete: true,
+     }))
+   }
+ 
+   /**
+    * Clears the userError field from the message.
+    * Call this when starting a new successful interaction to dismiss any previous error banners.
+    */
+   const clearUserError = () => {
+     updateAiMessage((msg) => {
+       if (!msg.userError) return msg
+       const { userError: _, ...rest } = msg
+       return rest as ChatMessage
+     })
+   }
+ 
+   return {
+     updateAiMessage,
+     updateAiMessageBlocks,
++    appendRootText,
+     markComplete,
+     setError,
+     clearUserError,
+     addBlock,
+   }
+ }
+ 
++/**
++ * One queued change. A text delta is kept structured rather than as a closure
++ * so consecutive deltas of the same type can be merged into a single append at
++ * flush time.
++ */
++type PendingUpdate =
++  | { kind: 'updater'; update: (msg: ChatMessage) => ChatMessage }
++  | { kind: 'rootText'; delta: RootTextDelta }
++
+ /** Batched updater that queues updates and flushes at a regular interval. */
+ export const createBatchedMessageUpdater = (
+   aiMessageId: string,
+   setMessages: SetMessagesFn,
+   flushIntervalMs: number = DEFAULT_FLUSH_INTERVAL_MS,
+ ): BatchedMessageUpdater => {
+-  // Queue of message updater functions to be applied on next flush
+-  const pendingUpdaters: Array<(msg: ChatMessage) => ChatMessage> = []
++  // Ordered queue, applied on the next flush. Text deltas are merged in place
++  // with the previous entry when they share a type, so a 100ms flush window
++  // costs one block-array append per text type instead of one per token.
++  const pendingUpdaters: PendingUpdate[] = []
+   let intervalId: ReturnType<typeof setInterval> | null = null
+   let isDisposed = false
+ 
+   const flush = () => {
+     if (pendingUpdaters.length === 0) return
+ 
+     // Capture and clear the queue atomically
+     const updaters = pendingUpdaters.splice(0, pendingUpdaters.length)
+ 
+-    // Compose all pending updaters into a single transform
++    // Compose all pending updates into a single transform, in arrival order
+     const composedUpdater = (msg: ChatMessage): ChatMessage => {
+-      return updaters.reduce((m, fn) => fn(m), msg)
++      return updaters.reduce(
++        (m, entry) =>
++          entry.kind === 'updater'
++            ? entry.update(m)
++            : {
++                ...m,
++                blocks: appendTextToRootStream(m.blocks ?? [], entry.delta),
++              },
++        msg,
++      )
+     }
+ 
+     // Apply composed update to the target message
+     setMessages((prev) =>
+       prev.map((msg) => (msg.id === aiMessageId ? composedUpdater(msg) : msg)),
+     )
+   }
+ 
+   const dispose = () => {
+     if (isDisposed) return
+     // Flush any pending updates before disposing to prevent data loss
+     flush()
+     isDisposed = true
+     if (intervalId !== null) {
+       clearInterval(intervalId)
+       intervalId = null
+     }
+   }
+ 
+   // Start the periodic flush interval
+   intervalId = setInterval(flush, flushIntervalMs)
+ 
+   const updateAiMessage = (updater: (msg: ChatMessage) => ChatMessage) => {
+     if (isDisposed) {
+       // If disposed, apply immediately as fallback
+       setMessages((prev) =>
+         prev.map((msg) => (msg.id === aiMessageId ? updater(msg) : msg)),
+       )
+       return
+     }
+-    pendingUpdaters.push(updater)
++    pendingUpdaters.push({ kind: 'updater', update: updater })
+   }
+ 
+   const updateAiMessageBlocks = (
+     blockUpdater: (blocks: ContentBlock[]) => ContentBlock[],
+   ) => {
+     updateAiMessage((msg) => ({
+       ...msg,
+       blocks: blockUpdater(msg.blocks ?? []),
+     }))
+   }
+ 
++  const appendRootText = (delta: RootTextDelta) => {
++    if (!delta.text) return
++    if (isDisposed) {
++      updateAiMessageBlocks((blocks) => appendTextToRootStream(blocks, delta))
++      return
++    }
++    const tail = pendingUpdaters[pendingUpdaters.length - 1]
++    if (tail && tail.kind === 'rootText' && tail.delta.type === delta.type) {
++      tail.delta = { ...tail.delta, text: tail.delta.text + delta.text }
++      return
++    }
++    pendingUpdaters.push({ kind: 'rootText', delta })
++  }
++
+   const addBlock = (block: ContentBlock) => {
+     updateAiMessage((msg) => ({
+       ...msg,
+       blocks: [...(msg.blocks ?? []), block],
+     }))
+   }
+ 
+   const markComplete = (metadata?: Partial<ChatMessage>) => {
+     // Flush any pending updates first
+     flush()
+     // Stop the interval
+     dispose()
+ 
+     // Apply completion immediately
+     setMessages((prev) =>
+       prev.map((msg) => {
+         if (msg.id !== aiMessageId) return msg
+         const { metadata: messageMetadata, ...rest } = metadata ?? {}
+         
+         // Mark native reasoning blocks as complete by setting thinkingOpen = false
+         // This ensures thinking blocks auto-collapse when the message finishes
+         // Check for thinkingOpen !== false to handle both true (native) and undefined (legacy)
+         const updatedBlocks = msg.blocks?.map((block) => {
+           if (
+             block.type === 'text' &&
+@@ -247,33 +303,34 @@ export const createBatchedMessageUpdater = (
+           userError: message,
+           isComplete: true,
+         }
+       }),
+     )
+   }
+ 
+   /**
+    * Clears the userError field from the message immediately (bypasses batch queue).
+    * Call this when starting a new successful interaction to dismiss any previous error banners.
+    */
+   const clearUserError = () => {
+     // Apply immediately (bypass batch queue) so error banners are dismissed instantly
+     setMessages((prev) =>
+       prev.map((msg) => {
+         if (msg.id !== aiMessageId || !msg.userError) return msg
+         const { userError: _, ...rest } = msg
+         return rest as ChatMessage
+       }),
+     )
+   }
+ 
+   return {
+     updateAiMessage,
+     updateAiMessageBlocks,
++    appendRootText,
+     markComplete,
+     setError,
+     clearUserError,
+     addBlock,
+     flush,
+     dispose,
+   }
+ }
+diff --git a/cli/src/utils/sdk-event-handlers.ts b/cli/src/utils/sdk-event-handlers.ts
+index 7755cbeef..1ba4e40fe 100644
+--- a/cli/src/utils/sdk-event-handlers.ts
++++ b/cli/src/utils/sdk-event-handlers.ts
+@@ -109,53 +109,53 @@ export type EventHandlerState = {
+ type TextDelta = { type: 'text' | 'reasoning'; text: string }
+ 
+ const hiddenToolNames = new Set<ToolName | 'spawn_agent_inline'>([
+   'spawn_agent_inline',
+   'end_turn',
+   'spawn_agents',
+ ])
+ 
+ const isHiddenToolName = (
+   toolName: string,
+ ): toolName is ToolName | 'spawn_agent_inline' =>
+   hiddenToolNames.has(toolName as ToolName | 'spawn_agent_inline')
+ 
+ const ensureStreaming = (state: EventHandlerState) => {
+   if (!state.message.hasReceivedContentRef.current) {
+     state.message.hasReceivedContentRef.current = true
+     state.streaming.setStreamStatus('streaming')
+   }
+ }
+ 
+ const appendRootChunk = (state: EventHandlerState, delta: TextDelta) => {
+   if (!delta.text) {
+     return
+   }
+ 
+-  state.message.updater.updateAiMessageBlocks((blocks) =>
+-    appendTextToRootStream(blocks, delta),
+-  )
++  // Structured rather than a closure: the batched updater merges consecutive
++  // deltas of one type into a single block-array append per flush.
++  state.message.updater.appendRootText(delta)
+ 
+   if (
+     state.mode.agentMode === 'PLAN' &&
+     delta.type === 'text' &&
+     !state.streaming.streamRefs.state.planExtracted &&
+     state.streaming.streamRefs.state.rootStreamBuffer.includes('</PLAN>')
+   ) {
+     const rawPlan = extractPlanFromBuffer(
+       state.streaming.streamRefs.state.rootStreamBuffer,
+     )
+     if (rawPlan !== null) {
+       state.streaming.streamRefs.setters.setPlanExtracted(true)
+       state.mode.setHasReceivedPlanResponse(true)
+       state.message.updater.updateAiMessageBlocks((blocks) =>
+         insertPlanBlock(blocks, rawPlan),
+       )
+     }
+   }
+ }
+ 
+ const updateStreamingAgents = (
+   state: EventHandlerState,
+   op: { add?: string; remove?: string },
+ ) => {
+   state.streaming.setStreamingAgents((prev) => {
+
+```

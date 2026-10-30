@@ -1,0 +1,183 @@
+Date: 2026-10-30T13:09:51.000Z
+Category: CLI
+Areas: CLI
+Commit nature: production
+Stats: +220 / -8
+Analysis notes: cli: scan only the seam for a completable think tag (#1573)
+Author intent & PR motivation (the WHY lives here; quote it when it explains the change, and say "the reason is not visible" when it does not):
+- PR #1573: cli: scan only the seam for a completable think tag
+  PR Description: ## Why
+
+Inside a text block, the streaming parser could only ever complete a `think` tag in two places: at the seam (the block's tail is a partial tag and the new delta finishes it) or wholly inside the new delta. The old code found those two cases by concatenating the block with the delta and searching the result — O(block) per chunk on any text that contains `<`, which is ordinary in code (`JSX`, XML, `a < b`). Over a stream that is quadratic.
+
+## What changes
+
+`appendTextWithThinkParsingToBlocks` checks the seam and the delta instead, and concatenates the block only when a tag is actually completable there:
+
+- the seam probe reads at most `MAX_TAG_LENGTH_PLUS_ONE` characters from the block's tail, never the block;
+- `text.includes('<think')` / `text.includes('</think')` on the delta is O(chunk);
+- the full concatenation now happens only on the chunk that completes a tag.
+
+Behaviour is unchanged: the tag split across chunk boundaries is still handled, and a tag that appears wholly inside a delta still splits the block.
+
+## Performance
+
+This branch, `bun` 1.4.2:
+
+| fixture | before | after |
+|---|---|---|
+| 470 KB code-heavy stream (`<` in every chunk), appended 200 chars at a time | concatenated the block per chunk — O(block), quadratic over the stream (the 470 KB case was measured at ~430 ms once blocks were long) | **6.51 ms** |
+
+The old cost is not a constant either: it grew with the block, so the longer the answer, the more expensive each chunk became — which
+- Commit message details: Co-authored-by: Codebuff <noreply@codebuff.com>
+Modified files: cli/src/utils/block-operations.ts
+Structured facts (extracted mechanically from the diff; copy names and values verbatim, never round or rename):
+- Behavior asserted by new tests (test titles, verbatim; the hunks themselves are omitted): "text that only looks like a tag" ; "a '<' that cannot complete a tag is appended, not re-parsed" ; "a long block does not change what a seam tag does" ; "a tag split at every position still opens a thinking block" ; "think tags split across delta boundaries" ; "opening tag split across two deltas opens a thinking block" ; "closing tag split across two deltas closes the thinking block" ; "an empty think pair produces no blocks, however it is chunked" ; "the widest partial close prefix is still recognised" ; "ordinary less-than at the end of a delta is kept as text" ; "long streams stay a single block" ; "5000 characters without tags accumulate into one block" ; "a tag completed after a long prefix is still split out" ; "a large block with a less-than keeps every character"
+Module & File Purpose (ground-truth documentation from touched files):
+- File `cli/src/utils/block-operations.ts`:
+```
+/** Longest tag minus one: a tag split across the seam can start this far back. */
+```
+Diff (source hunks; lockfiles and pure test hunks omitted, except in a lockfile-only commit):
+```diff
+diff --git a/cli/src/utils/block-operations.ts b/cli/src/utils/block-operations.ts
+index 86396507a..0f4821275 100644
+--- a/cli/src/utils/block-operations.ts
++++ b/cli/src/utils/block-operations.ts
+@@ -1,39 +1,43 @@
+ import { updateBlocksRecursively } from './message-block-helpers'
+ import {
+   parseThinkTags,
+   getPartialTagLength,
+   THINK_OPEN_TAG,
+   THINK_CLOSE_TAG,
+ } from './think-tag-parser'
+ 
+ import type {
+   ContentBlock,
+   ToolContentBlock,
+   TextContentBlock,
+ } from '../types/chat'
+ 
++const MAX_TAG_LENGTH_PLUS_ONE =
++  Math.max(THINK_OPEN_TAG.length, THINK_CLOSE_TAG.length)
++
+ let thinkingIdCounter = 0
+ const generateThinkingId = (): string => {
+   thinkingIdCounter++
+   return `thinking-${thinkingIdCounter}`
+ }
+ 
+ type AgentTextUpdate =
+   | { type: 'text'; mode: 'append'; content: string; textType: 'text' | 'reasoning' }
+   | { type: 'text'; mode: 'replace'; content: string }
+ 
+ const updateAgentText = (
+   blocks: ContentBlock[],
+   agentId: string,
+   update: AgentTextUpdate,
+ ) => {
+   return updateBlocksRecursively(blocks, agentId, (block) => {
+     if (block.type !== 'agent') {
+       return block
+     }
+ 
+     const agentBlocks = block.blocks ? [...block.blocks] : []
+     const text = update.content ?? ''
+ 
+     if (update.mode === 'replace') {
+       const updatedBlocks = [...agentBlocks]
+@@ -126,79 +130,103 @@ const createTextBlock = (content: string): TextContentBlock => ({
+   content,
+   textType: 'text',
+ })
+ 
+ const appendTextWithThinkParsingToBlocks = (
+   blocks: ContentBlock[],
+   text: string,
+ ): ContentBlock[] => {
+   if (!text) {
+     return blocks
+   }
+ 
+   const nextBlocks = [...blocks]
+   const lastBlock = nextBlocks[nextBlocks.length - 1]
+   const wasInsideThinking = isOpenThinkingBlock(lastBlock)
+ 
+   let textToParse = text
+ 
+   if (wasInsideThinking && lastBlock?.type === 'text') {
+     const lastBlockContent = lastBlock.content
+ 
+-    const partialLen = getPartialTagLength(lastBlockContent)
++    const partialLen = getPartialTagLength(
++      lastBlockContent.slice(-MAX_TAG_LENGTH_PLUS_ONE),
++    )
+     if (partialLen > 0) {
+       const potentialTag = lastBlockContent.slice(-partialLen) + text
+       if (potentialTag.startsWith(THINK_CLOSE_TAG)) {
+         const newLastContent = lastBlockContent.slice(0, -partialLen)
+         textToParse = lastBlockContent.slice(-partialLen) + text
+ 
+         if (newLastContent) {
+           nextBlocks[nextBlocks.length - 1] = {
+             ...lastBlock,
+             content: newLastContent,
+           }
+         } else {
+           nextBlocks.pop()
+         }
+       }
+     }
+   } else if (
+     !wasInsideThinking &&
+     lastBlock?.type === 'text' &&
+     lastBlock.textType === 'text'
+   ) {
+-    const combinedText = lastBlock.content + text
+-
+-    if (
+-      combinedText.includes(THINK_OPEN_TAG) ||
+-      combinedText.includes(THINK_CLOSE_TAG)
+-    ) {
+-      textToParse = combinedText
++    const seam = lastBlock.content.slice(
++      Math.max(0, lastBlock.content.length - MAX_TAG_LENGTH_PLUS_ONE),
++    )
++    const partialLen = getPartialTagLength(seam)
++    const seamTail = partialLen > 0 ? seam.slice(-partialLen) : ''
++    const seamCompletesTag =
++      partialLen > 0 &&
++      ((seamTail + text).startsWith(THINK_OPEN_TAG) ||
++        (seamTail + text).startsWith(THINK_CLOSE_TAG))
++    const chunkHasTag =
++      text.includes(THINK_OPEN_TAG) || text.includes(THINK_CLOSE_TAG)
++
++    if (seamCompletesTag || chunkHasTag) {
++      textToParse = lastBlock.content + text
+       nextBlocks.pop()
+     }
+   }
+ 
+   const currentLastBlock = nextBlocks[nextBlocks.length - 1]
+   const insideThinking = isOpenThinkingBlock(currentLastBlock)
+ 
+   if (insideThinking && !textToParse.includes('<')) {
+     if (currentLastBlock?.type === 'text') {
+       nextBlocks[nextBlocks.length - 1] = {
+         ...currentLastBlock,
+         content: currentLastBlock.content + textToParse,
+       }
+       return nextBlocks
+     }
+   }
+ 
+   if (!insideThinking && !textToParse.includes('<')) {
+     if (
+       currentLastBlock?.type === 'text' &&
+       currentLastBlock.textType === 'text'
+     ) {
+       nextBlocks[nextBlocks.length - 1] = {
+         ...currentLastBlock,
+         content: currentLastBlock.content + textToParse,
+```
