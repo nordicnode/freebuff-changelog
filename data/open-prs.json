@@ -1,5 +1,5 @@
 {
-  "fetchedAt": "2026-10-30T15:46:00.377Z",
+  "fetchedAt": "2026-10-30T16:27:07.021Z",
   "total": 90,
   "listComplete": true,
   "prs": [
@@ -10,17 +10,28 @@
       "author": "Salhi-zh",
       "body": "## What\n\n`convertCbToModelMessages` ran on **every agent step over the full history**, and almost all of its cost was per-message work that is a pure function of the message: `cloneDeep` of every content part, the lone-surrogate scrub across every string, and a zod `safeParse` per converted part. `sdk/run.ts` measured the clone alone at ~230 ms for an 8 MB history (~575 ms at 20 MB) — **paid every step, quadratic over a turn.** The per-step token estimate had the same shape: the full history re-walked 3–5× per step.\n\n## Commit 1 — convert each message exactly once\n\nMemoize the per-message product on a `WeakMap` keyed by message identity: each history message is cloned, scrubbed, converted and schema-checked **exactly once per process**; a step's remaining cost is the envelope logic plus O(1) per message. Identity keying is sound because history messages are immutable once appended — **verified at every rewrite site** (`fit-tool-results` clones before clipping, `trimMessages` cloneDeeps, compaction allocates, `dropUnansweredToolCalls` spreads).\n\nBecause cached forms are shared across requests, both mutation passes were made non-destructive: `withCacheControl` shallow-copies down to the marked leaf instead of `cloneDeep`-ing whole messages, and cache-control placement replaces entries rather than writing through aggregated arrays. The orphan-tool-call repair moved out of the converter (provably a no-op there on the hot path — `run-agent-step` repairs and assigns the history before the request is built); auxiliary SDK paths in `sdk/impl/llm.ts` repair at their own boundary via `repairToolCallHistory`. `expireMessages` returns the input array by reference when nothing expired **and nothing is pruneable by keepLastTags** — this PR is rebased on #1587, so the fast path now tracks keepLastTags too (previously two INSTRUCTIONS_PROMPT messages could be wrongly identity-stable).\n\n**Equivalence:** verified by a randomized **differential harness** against the pre-change implementation — tool calls, parallel batches with interleaved media, tags/providerOptions/timeToLive, lone/valid unicode, histories to 60 messages × 20 trials × both cache-control modes — **byte-identical request JSON for every fixture**. (The harness caught and I fixed a real bug in the first draft: deep strings inside tool-call inputs escaping the scrub fast-path.)\n\n## Commit 2 — memoize the per-message token estimate\n\n`countTokensMessages` split into per-message `countTokensMessage` memoized on a WeakMap; list totals remain the exact same sum. One semantics clash surfaced and is handled: `fitToolResults` clips defensive copies in place during binary search, so the budget loop probes with **uncached** counting; the already-fits fast path still memoizes the accurate final count.\n\n## Merge-time change (post-#1587 rebase)\n\nTwo small follow-ups this PR adds on top of the main resolution:\n\n- `expireMessages` fast path tracks `keepLastTags` too, so two `INSTRUCTIONS_PROMPT` messages in history are still superseded rather than deemed identity-stable.\n- The `expireMessages` identity test assertion updated to content equality: legacy `timeToLives` always take the copy path under the new `expiresAt` machinery (the snitch marker forces one), so reference-identity assertions no longer hold for those cases; content equality is what the contract actually guarantees.\n\n## Reviewer caveats (stated, not hidden)\n\n1. **By design:** unpaired tool-call history passed to the converter is no longer silently repaired *inside* the converter. The hot path is repaired upstream; SDK auxiliary entry points repair at their boundary. Pinned by a test.\n2. **New contract:** history messages must never be mutated in place after conversion/counting. True today (verified at all rewrite sites); called out in header comments, though a future violating site would stale-cache silently.\n3. `withCacheControl`'s shallow copy assumes providerMetadata is plain JSON (true today).\n\n## Tests\n\n`message-conversion-cache",
       "created": "2026-10-30T14:26:37Z",
-      "updated": "2026-10-30T15:44:25Z",
+      "updated": "2026-10-30T16:26:53Z",
       "draft": false,
-      "comments": 0,
+      "comments": 1,
       "reviewComments": 0,
       "additions": 861,
       "deletions": 150,
       "files": 9,
-      "labels": [],
+      "labels": [
+        {
+          "name": "pr:needs-work",
+          "color": "fbca04",
+          "description": "Right idea, not mergeable as written"
+        },
+        {
+          "name": "bot:triaged",
+          "color": "ededed",
+          "description": "Classified by the community triage bot"
+        }
+      ],
       "enrichment": {
         "policy": 1,
-        "admittedAt": "2026-10-30T15:45:58.463Z"
+        "admittedAt": "2026-10-30T16:27:04.799Z"
       },
       "hasDiff": true,
       "commitsList": [
@@ -46,9 +57,19 @@
           "url": "https://github.com/CodebuffAI/freebuff/commit/bf3ac8246796bec09b9087d703eef532cb6b1150"
         }
       ],
+      "commentsList": [
+        {
+          "id": 6527814343,
+          "author": "codebuff-team",
+          "body": "The underlying diagnosis is correct and valuable: re-running `cloneDeep` + surrogate scrubbing + zod validation over the full history on every step is genuinely quadratic, and the WeakMap-per-message memoization is a sound shape for the fix. The differential-harness methodology described in the PR body is the right way to validate an invisible-refactor like this.\n\nThat said, a few things make this hard to port as-is:\n\n1. **It's stacked on #1587** (\"this PR is rebased on #1587\"), which isn't merged here. The `expireMessages` keepLastTags fast-path change in `packages/agent-runtime/src/util/messages.ts` only makes sense in that context, and `mergeable: unstable` suggests this diff doesn't apply cleanly on its own.\n\n2. **`convertCbToModelMessages` stops calling `dropUnansweredToolCalls`.** That's a behavior change to a shared, widely-used entry point, not just a caching change — confirmed by the flipped assertion in `common/src/util/__tests__/messages.test.ts` (\"drops a call\" → \"passes through a call\"). You found and patched three call sites in `sdk/src/impl/llm.ts` that relied on the old defensive repair, which is good diligence, but it means the converter's contract silently changed for every caller, and there's no guarantee every current or future caller remembers to repair upstream. That's a landmine for a shared utility.\n\n3. **Footprint.** 860 lines across a conversion cache, a token-counter cache, an `expireMessages` fast path, and an SDK-level repair relocation is too much to review and reason about safety invariants for in one pass — especially invariants like \"history messages are immutable once appended,\" which the PR itself admits needed auditing at every rewrite site and still depends on no future rewrite site violating it silently.\n\nSplitting into (a) the token-counter memoization (self-contained, lower risk) and (b) the conversion cache + repair relocation (needs its own scrutiny and ideally lands after #1587) would make this portable.",
+          "created": "2026-10-30 16:26",
+          "url": "https://github.com/CodebuffAI/freebuff/pull/1588#issuecomment-6527814343",
+          "isReview": false
+        }
+      ],
       "ai": {
-        "title": "Memoize per-message conversion and token estimation across agent steps",
-        "summary": "The PR introduces WeakMap-based caching for the message conversion and token counting functions so that each history message is processed exactly once per process instead of being re-walked on every agent step. It also makes cache-control mutations non-destructive by copying message entries before applying marks, and moves orphan tool-call repair out of the converter into the upstream history builders.",
+        "title": "Memoize history message conversion and token counting",
+        "summary": "The PR proposes caching per-message work in a WeakMap to prevent redundant cloning, scrubbing, and schema validation on every agent step. It also moves tool call repair to the history builder and adds fast paths that return the original array when no expiring messages exist.",
         "significance": "notable",
         "audience": "maintainers",
         "inputIdentity": "d00cde424054",
@@ -58,27 +79,49 @@
         "manifest": {
           "policy": 1,
           "head": "pr-1588",
-          "base": "2026-10-30T15:44:25Z",
+          "base": "2026-10-30T16:26:53Z",
           "sourceHash": "38f7bca2ae5d",
-          "promptHash": "36fb9cf9810f",
+          "promptHash": "f8fc4d63addc",
           "model": "agnes-3.0-flash",
-          "chars": 52590,
+          "chars": 52625,
           "partial": false
         },
         "requests": [
           {
-            "id": "a743209b-d63f-405f-be3d-0f58b6100336",
+            "id": "8fedb0cf-d4e8-45f0-bd48-cffe983154cf",
             "stage": "PR-preview",
             "model": "agnes-3.0-flash",
             "route": "primary",
-            "promptHash": "36fb9cf9810f",
-            "startedAt": "2026-10-30T15:50:43.250Z",
+            "promptHash": "f8fc4d63addc",
+            "startedAt": "2026-10-30T16:27:30.053Z",
+            "outcome": "http-error",
+            "status": 429,
+            "durationMs": 4766
+          },
+          {
+            "id": "5ee96b78-15d7-487d-afc0-087b512d4ddc",
+            "stage": "PR-preview",
+            "model": "agnes-3.0-flash",
+            "route": "primary",
+            "promptHash": "f8fc4d63addc",
+            "startedAt": "2026-10-30T16:27:36.984Z",
+            "outcome": "http-error",
+            "status": 429,
+            "durationMs": 731
+          },
+          {
+            "id": "bc92ebc7-3eba-4162-939d-ec705dfe65a6",
+            "stage": "PR-preview",
+            "model": "agnes-3.0-flash",
+            "route": "primary",
+            "promptHash": "f8fc4d63addc",
+            "startedAt": "2026-10-30T16:27:42.327Z",
             "outcome": "validated",
             "status": 200,
-            "durationMs": 4164
+            "durationMs": 4168
           }
         ],
-        "at": "2026-10-30T15:50:47.417Z"
+        "at": "2026-10-30T16:27:46.500Z"
       }
     },
     {
@@ -88,17 +131,28 @@
       "author": "Salhi-zh",
       "body": "## Problem\n\n`build-and-test` fails on `main` for **every** recent commit, at the first build step:\n\n```\nBuild SDK → ❌ TypeScript declaration bundling failed: Compiled with errors\n```\n\nSeven errors, in three files, all one cause — plus a second break waiting behind it that only shows once the SDK builds.\n\n## Cause 1 — JSON is read-only where it crosses a boundary, but its type said mutable\n\n`common/src/types/json.ts` declared:\n\n```ts\nexport type JSONObject = { [key in string]: JSONValue | undefined }\nexport type JSONArray = JSONValue[]\n```\n\nThe model SDKs type their payloads as `Readonly<...>` (`Readonly<JSONObject>`, readonly arrays, `@ai-sdk/provider`'s own `JSONValue`). A **mutable index signature does not accept a read-only one**, so `SharedV4ProviderOptions` cannot be assigned to `ProviderMetadata`, and every message/stream path that touches `providerOptions` fails to compile:\n\n- `sdk/src/impl/llm.ts:269`, `:782`\n- `common/src/util/messages.ts:138`, `:454`, `:461`\n- `packages/agent-runtime/src/tool-stream-parser.ts:142`\n- `packages/agent-runtime/src/tools/stream-parser.ts:805`\n\nThe data really is read-only once it leaves a provider call, so the type now says so: `JSONObject` has a `readonly` index signature and `JSONArray` is `readonly JSONValue[]`. One place assembles a new payload — `omitUndefined` in `agent-runtime/…/gravity-index.ts` — and it now builds a writable `Record<string, JSONValue | undefined>` and returns that, which is what it was doing anyway; the annotation was the only thing forcing the mutable view.\n\n## Cause 2 — `picocolors` is imported but declared nowhere\n\n`cli/src/index.tsx`, `cli/src/login/plain-login.ts` and `cli/src/utils/agent-dir-trust.ts` import `picocolors`; no `package.json` listed it, so once the SDK builds, the next step stops at:\n\n```\nerror: Could not resolve: \"picocolors\"\n    at cli/src/index.tsx:28:42\n```\n\nDeclared as `^1.1.1` in `cli/package.json`; `bun.lock` updated. This is the only dependency change in the PR.\n\n## Verification — the four steps CI runs, in order, on this branch\n\n```text\nbun install --frozen-lockfile                → exit 0   (lock and package.json agree)\nbun run build:sdk                            → exit 0   (was: 7 TS errors, bundling failed)\nbun freebuff/cli/build.ts 0.0.0-ci           → exit 0   (was: Could not resolve picocolors)\ncli/bin/freebuff --version                   → 0.0.0-ci\nbun cli/scripts/smoke-binary.ts cli/bin/freebuff → OK (matched /Press ENTER to login/, attempt 1)\n```\n\n`cd sdk && bun run typecheck` is **exit 0**, zero errors (was seven).\n\n## Why this is the durable fix, not a suppression\n\n- No `any`, no `@ts-expect-error`, no cast at the failing call sites: the seven errors disappear because the type describes the data correctly.\n- The read-only model matches the direction the SDKs already moved (their `JSONValue` is `Readonly`), so a future provider bump does not reintroduce it.\n- The one write site is fixed where writing actually happens, rather than by making the shared type mutable again.\n\n## Effect on other PRs\n\nThis is the only thing standing between the repo and a green `build-and-test`: the step fails before any test runs, so every open PR inherits it regardless of content. Once this lands, the other open PRs get a green run on a rebase.\n",
       "created": "2026-10-29T19:59:32Z",
-      "updated": "2026-10-30T14:11:47Z",
+      "updated": "2026-10-30T16:26:50Z",
       "draft": false,
-      "comments": 0,
+      "comments": 2,
       "reviewComments": 0,
       "additions": 30,
       "deletions": 3,
       "files": 5,
-      "labels": [],
+      "labels": [
+        {
+          "name": "pr:port-candidate",
+          "color": "0e8a16",
+          "description": "Worth porting into the private source tree"
+        },
+        {
+          "name": "bot:triaged",
+          "color": "ededed",
+          "description": "Classified by the community triage bot"
+        }
+      ],
       "enrichment": {
         "policy": 1,
-        "admittedAt": "2026-10-30T14:11:49.273Z"
+        "admittedAt": "2026-10-30T16:27:04.799Z"
       },
       "hasDiff": true,
       "commitsList": [
@@ -117,9 +171,27 @@
           "url": "https://github.com/CodebuffAI/freebuff/commit/4e3a1613533ef7b7c9c17bae12e4ecff166eac42"
         }
       ],
+      "commentsList": [
+        {
+          "id": 6524877544,
+          "author": "Salhi-zh",
+          "body": "@obadakhalili this is now the critical blocker: main's last three merges all failed `build-and-test`, so every open PR (#1583, #1584, #1571, +further) inherits the red check and is unmergeable through normal channels.\n\nThe fix in this PR is exactly what's needed to unbreak the chain. Once this merges, I'll rebase the ones I care about onto green main so their CI re-runs pass the new check-run and land cleanly.\n\nConcrete merge order I'd suggest:\n1. **#1575** (this) — unblocks everything else\n2. Then I'll rebase + land #1583 (freebuff RAM), #1584 (checkpoint efficiency), #1571, and the rest in sequence.\n\nLet me know if you want anything else changed here before merging — happy to fix.",
+          "created": "2026-10-30 14:11",
+          "url": "https://github.com/CodebuffAI/freebuff/pull/1575#issuecomment-6524877544",
+          "isReview": false
+        },
+        {
+          "id": 6527813374,
+          "author": "codebuff-team",
+          "body": "Good diagnostic work: the readonly/mutable mismatch between `JSONObject`/`JSONArray` and the `Readonly<...>` types used by the provider SDKs is a real, specific cause, and tightening `common/src/types/json.ts` to `readonly` (plus fixing the one mutation site in `gravity-index.ts` to build a plain `Record` instead) is the right layer to fix it at rather than casting at each call site. The missing `picocolors` entry in `cli/package.json`/`bun.lock` is an equally clear, minimal fix.\n\nTwo things worth flagging before this is ported:\n\n1. The `.github/workflows/ci.yml` env-var addition (NEXT_PUBLIC_* placeholders) isn't mentioned anywhere in the PR description's two named causes, even though it's a meaningful, separate change (inlining env at build time for the smoke test). Please call it out explicitly — a reviewer skimming the prose would miss it entirely.\n2. Flipping `JSONObject`/`JSONArray` to `readonly` is a fairly broad type change. You found and fixed the one mutation site inside `agent-runtime`, but since this type is exported from `common`, it's worth double-checking there isn't a write site elsewhere in the private tree that the public mirror doesn't show (e.g. anything building provider options or stream state mutably). Your own typecheck run is good evidence, but it only covers what's visible here.\n\nOverall this looks like exactly the sort of build-breakage fix worth porting by hand — just tighten the write-up to cover all three changes so whoever ports it doesn't have to reverse-engineer the CI diff.",
+          "created": "2026-10-30 16:26",
+          "url": "https://github.com/CodebuffAI/freebuff/pull/1575#issuecomment-6527813374",
+          "isReview": false
+        }
+      ],
       "ai": {
-        "title": "Fix SDK type errors and CI build environment",
-        "summary": "This change updates shared JSON types to use readonly properties and arrays, resolving seven compilation errors that blocked the SDK build. It also adds required public environment variables to the GitHub Actions CI workflow so that they are inlined correctly when building the Freebuff binary.",
+        "title": "Fix TypeScript readonly types and CI environment variables",
+        "summary": "The pull request updates the `JSONObject` and `JSONArray` type definitions to use readonly properties, resolving type conflicts where mutable indices failed to accept read-only model payloads. It also adds public environment variables to the GitHub Actions workflow to ensure the binary build correctly inlines required configuration values.",
         "significance": "notable",
         "audience": "maintainers",
         "inputIdentity": "d00cde424054",
@@ -129,27 +201,38 @@
         "manifest": {
           "policy": 1,
           "head": "pr-1575",
-          "base": "2026-10-29T20:04:07Z",
+          "base": "2026-10-30T16:26:50Z",
           "sourceHash": "ad69d8883027",
-          "promptHash": "899393e759c1",
+          "promptHash": "152be1f5b1ca",
           "model": "agnes-3.0-flash",
-          "chars": 10644,
+          "chars": 10683,
           "partial": false
         },
         "requests": [
           {
-            "id": "da435e8c-447d-4d3d-a624-00ad101175ae",
+            "id": "5eb240c2-0ef0-46bf-9caa-7d7925298316",
             "stage": "PR-preview",
             "model": "agnes-3.0-flash",
             "route": "primary",
-            "promptHash": "899393e759c1",
-            "startedAt": "2026-10-29T20:12:29.484Z",
+            "promptHash": "152be1f5b1ca",
+            "startedAt": "2026-10-30T16:27:46.501Z",
+            "outcome": "http-error",
+            "status": 429,
+            "durationMs": 834
+          },
+          {
+            "id": "f58be3f8-9365-4ce6-be41-9d736af998f8",
+            "stage": "PR-preview",
+            "model": "agnes-3.0-flash",
+            "route": "primary",
+            "promptHash": "152be1f5b1ca",
+            "startedAt": "2026-10-30T16:27:50.110Z",
             "outcome": "validated",
             "status": 200,
-            "durationMs": 1505
+            "durationMs": 3563
           }
         ],
-        "at": "2026-10-29T20:12:30.990Z"
+        "at": "2026-10-30T16:27:53.675Z"
       }
     },
     {
