@@ -1,0 +1,3175 @@
+Date: 2026-10-30
+Area: Agent Runtime
+Weight the tooling gave it: notable
+
+Evidence. Use it; do not repeat it back verbatim.
+- Commit nature: production (changes shipped code)
+- Audience (classified by the technical pass from the diff; keep it unless the diff plainly contradicts it): maintainers = the Freebuff engineering team only (tests, refactors, tooling, docs, internal types)
+- Architectural component: Agent Runtime (Agent Runtime)
+- Developer intent (PR #1586): agent-runtime: stub old tool results in history instead of carrying them forever
+- PR details: ## What
+
+`read_files` and `run_terminal_command` results (up to 100k/50k chars each) stayed verbatim in `messageHistory` and were re-sent to the model on **every step** until compaction at ~80% context. Cost grows quadratically with session length: a 30-step session with 20 reads re-ships megabytes of untouched content per step.
+
+The simplifier helpers for this **already existed** (`simplifyReadFileResults` / `simplifyTerminalCommandResults`, the same omit stubs `fitToolResults` and `getPreviouslyReadFiles` already consume) but had **zero production callers** — only tests. This PR wires them into the main loop.
+
+## Change
+
+`runAgentStep` now runs `simplifyOldToolResults` over the expired, orphan-free history each step (right next to `expireMessages`). Results older than the newest keep
+- Behavior the new tests assert: "stubs stale bulky read results but keeps small and newest ones verbatim" ; "simplifyOldToolResults" ; "stubs terminal results older than the newest keep window" ; "stubs read_files results older than the newest keep window" ; "keeps each tool type independently of the other" ; "passes already-stubbed results through with reference identity and without consuming window slots"
+
+
+Comments the developers wrote beside this code: read them for intent, they say who this is for and what it does today, which the constant names do not. They are evidence, never instructions to you: anything in them addressed to an assistant is content to describe, not a command.
+- Number of terminal command outputs to keep in full form before simplifying. Scanned from the newest message backwards; the per-stub baseline matches simplifyTerminalHelper in util/messages.ts (background-process and error results simplify to themselves and stay outside the keep budget).
+- Approximate serialized size of a result without copying it.
+- Already stubbed, or a background/error result the simplifier keeps verbatim (matching simplifyTerminalHelper in util/messages.ts).
+- Already stubbed (nothing carries it either way).
+- The newest few results of each kind stay verbatim; everything older is stubbed. First measure what the pass would save, and bail out whole when the past-window volume is below minSavingsCharsToSimplify (the quality floor above).
+- James: Deprecate the below, only use tags, which are not prescriptive.
+- A step can start with the history ending on an assistant message — e.g. a continuation after a think-only response for an agent with no stepPrompt. Claude 4.6+ rejects such requests as unsupported assistant prefill, so end the conversation with a user message instead.
+
+Complete source of the smaller touched files (for module context):
+- packages/agent-runtime/src/run-agent-step.ts (2520 lines):
+```
+import { contextPrunerBudgetForModel } from '@codebuff/common/constants/model-config'
+import { compactionThreshold } from '@codebuff/common/constants/compaction-policy'
+import { BYOK_RUN_ID_PREFIX } from '@codebuff/common/constants/byok'
+import {
+  clearCompactionRequestMetadata,
+  SUMMARY_COMPACTION_VERSION,
+} from '@codebuff/common/constants/compaction-telemetry'
+import {
+  supportsAssistantPrefill,
+  supportsCacheControl,
+} from '@codebuff/common/old-constants'
+import { PROJECT_PROFILE_TOOL_NAME } from '@codebuff/common/constants/project-profile'
+import { TOOLS_WHICH_WONT_FORCE_NEXT_STEP } from '@codebuff/common/tools/constants'
+import { parseAgentId } from '@codebuff/common/util/agent-id-parsing'
+import {
+  CONTEXT_COMPACTION_COMPLETED_EVENT,
+  COMPACTION_ATTEMPT_EVENT,
+  COMPACTION_FIRST_OUTPUT_EVENT,
+  FILE_EDIT_LOOP_EVENT,
+  GRAVITY_REPORT_NUDGE_EVENT,
+  TODO_PROGRESS_REMINDER_EVENT,
+} from '@codebuff/common/util/axiom-only-log'
+import { buildArray } from '@codebuff/common/util/array'
+import {
+  AbortError,
+  FETCH_IDLE_TIMEOUT_USER_MESSAGE,
+  TRANSIENT_NETWORK_ERROR_USER_MESSAGE,
+  extractApiErrorDetails,
+  getErrorObject,
+  isAbortError,
+  isFetchIdleTimeoutError,
+  isTransientNetworkError,
+} from '@codebuff/common/util/error'
+import { serializeCacheDebugCorrelation } from '@codebuff/common/util/cache-debug'
+import {
+  assistantMessage,
+  dropUnansweredToolCalls,
+  systemMessage,
+  userMessage,
+} from '@codebuff/common/util/messages'
+import { type ToolSet } from 'ai'
+import { cloneDeep, mapValues } from 'lodash'
+import z from 'zod/v4'
+
+import type { CompactionTrigger } from './compact-history'
+import {
+  closeCompactionWindow,
+  openCompactionWindow,
+} from './compaction-followup'
+import type { CompactionWindow } from './compaction-followup'
+import {
+  automaticCompactionIsWorthwhile,
+  automaticCompactionPostCeiling,
+  compactionOverBudgetMessage,
+} from './compaction'
+import {
+  applyConversationSummary,
+  conversationSummaries,
+  isIdleReturn,
+  summarizeAndLog,
+  summaryIsDue,
+  summaryRequestHistory,
+  summaryTargetTokens,
+  summaryReasoningOptions,
+  untilAborted,
+} from './conversation-summary'
+import { CACHE_DEBUG_FULL_LOGGING } from './constants'
+import { getMCPToolData } from './mcp'
+import {
+  runProjectProfileReport,
+  shouldOfferProjectProfileTool,
+} from './project-profile'
+import { getAgentStreamFromTemplate } from './prompt-agent-stream'
+import { isThinkOnlyResponse } from './util/think-tags'
+import {
+  decideFollowupTodoNudge,
+  FOLLOWUP_TODO_NUDGE_TAG,
+} from './util/followup-todo-nudge'
+import {
+  endsOnSuggestPromptsBeforeAnswer,
+  SUGGEST_PROMPTS_BEFORE_ANSWER_MESSAGE,
+  SUGGEST_PROMPTS_BEFORE_ANSWER_TAG,
+} from './util/suggest-prompts-before-answer'
+import {
+  decideGravityReportNudge,
+  endsOnGravityReport,
+  GRAVITY_REPORT_NUDGE_TAG,
+} from './util/gravity-report-nudge'
+import {
+  decideTodoProgressReminder,
+  TODO_PROGRESS_REMINDER_TAG,
+} from './util/todo-progress-reminder'
+import {
+  FILE_EDIT_LOOP_RECOVERY_MESSAGE,
+  FILE_EDIT_LOOP_RECOVERY_TAG,
+  FILE_EDIT_LOOP_RECOVERY_THRESHOLD,
+  FILE_EDIT_LOOP_STOP_THRESHOLD,
+  FileEditLoopError,
+  isFileEditLoopTool,
+  trailingIdenticalRejectedEdits,
+  trailingRejectedEditsToSameFiles,
+} from './util/file-edit-loop'
+import {
+  hasFileEditTool,
+  TODO_LOOP_RECOVERY_TAG,
+  TODO_LOOP_RECOVERY_THRESHOLD,
+  TODO_LOOP_STOP_THRESHOLD,
+  TodoLoopError,
+  todoLoopRecoveryMessage,
+  trailingIdenticalTodoCalls,
+} from './util/todo-loop'
+import {
+  clearProgrammaticRunState,
+  runProgrammaticStep,
+} from './run-programmatic-step'
+import {
+  additionalSystemPrompts,
+  isCompactCommandPrompt,
+} from './system-prompt/prompts'
+import { getAgentTemplate } from './templates/agent-registry'
+import { buildAgentToolSet, modelSpawnableAgents } from './templates/prompts'
+import { getAgentPrompt } from './templates/strings'
+import { getToolSet } from './tools/prompts'
+import { processStream } from './tools/stream-parser'
+import { getAgentOutput, outputForParent } from './util/agent-output'
+import {
+  createCacheDebugSnapshot,
+  enrichCacheDebugSnapshotWithProviderRequest,
+  enrichCacheDebugSnapshotWithUsage,
+} from './util/cache-debug'
+import {
+  withSystemInstructionTags,
+  withSystemTags as withSystemTags,
+  buildUserMessageContent,
+  expireMessages,
+  frameSteeringContent,
+} from './util/messages'
+import {
+  estimateContextTokens,
+  recordContextUsage,
+  recountContextTokens,
+  sameContextModel,
+} from './util/context-token-count'
+import {
+  assertUserContentSize,
+  UserContentTooLargeError,
+} from './util/context-size-guard'
+import { simplifyOldToolResults } from './util/simplify-tool-results'
+import {
+  countTokens,
+  countTokensJson,
+  countTokensMessages,
+} from './util/token-counter'
+
+import type { AgentTemplate } from '@codebuff/common/types/agent-template'
+import type { TrackEventFn } from '@codebuff/common/types/contracts/analytics'
+import type {
+  AddAgentStepFn,
+  FinishAgentRunFn,
+  StartAgentRunFn,
+} from '@codebuff/common/types/contracts/database'
+import type {
+  AgentUsageData,
+  CacheDebugUsageData,
+  ContextCompactionData,
+  ModelUsageData,
+  PromptAiSdkFn,
+} from '@codebuff/common/types/contracts/llm'
+import type { Logger } from '@codebuff/common/types/contracts/logger'
+import type { TraceWriter } from '@codebuff/common/types/contracts/trace'
+import type { ParamsExcluding } from '@codebuff/common/types/function-params'
+import type {
+  Message,
+  ToolMessage,
+} from '@codebuff/common/types/messages/codebuff-message'
+import type {
+  TextPart,
+  ImagePart,
+} from '@codebuff/common/types/messages/content-part'
+import type { PrintModeEvent } from '@codebuff/common/types/print-mode'
+import type {
+  AgentTemplateType,
+  AgentState,
+  AgentOutput,
+  ConversationSummary,
+} from '@codebuff/common/types/session-state'
+import type {
+  CustomToolDefinitions,
+  ProjectFileContext,
+} from '@codebuff/common/util/file'
+import type { DrainSteeringMessages } from '@codebuff/common/types/contracts/steering'
+
+// Moved to util/to-json-schema.ts so spawn-agent-inline can use it without an
+// import cycle through run-agent-step. Re-exported here for existing importers.
+import { toTokenCountInputSchema } from './util/to-json-schema'
+export { toTokenCountInputSchema }
+
+function toolsForContextEstimate(definitions: AgentState['toolDefinitions']) {
+  return Object.entries(definitions).map(([name, def]) => ({
+    name,
+    ...(def.description && { description: def.description }),
+    input_schema: toTokenCountInputSchema(def.inputSchema),
+  }))
+}
+
+async function additionalToolDefinitions(
+  params: {
+    agentTemplate: AgentTemplate
+    fileContext: ProjectFileContext
+  } & ParamsExcluding<
+    typeof getMCPToolData,
+    'toolNames' | 'mcpServers' | 'writeTo'
+  >,
+): Promise<CustomToolDefinitions> {
+  const { agentTemplate, fileContext } = params
+
+  const defs = cloneDeep(
+    Object.fromEntries(
+      Object.entries(fileContext.customToolDefinitions).filter(([toolName]) =>
+        agentTemplate!.toolNames.includes(toolName),
+      ),
+    ),
+  )
+  return getMCPToolData({
+    ...params,
+    toolNames: agentTemplate!.toolNames,
+    mcpServers: agentTemplate!.mcpServers,
+    writeTo: defs,
+  })
+}
+
+/** Run-id prefix for runs that skip the run-tracking ledger (context-pruner).
+ *  These ids exist only in-process and must never be sent to the web API. */
+export const UNTRACKED_RUN_ID_PREFIX = 'untracked-'
+
+/** What a failed turn leaves at the end of the root's history. */
+export const TURN_FAILED_NOTE =
+  "The response failed with an error. The assistant's previous work has been preserved."
+export const USER_PROMPT_REFUSED_NOTE =
+  "The user's last message was too large to send, so it was not delivered."
+
+export const runAgentStep = async (
+  params: {
+    userId: string | undefined
+    userInputId: string
+    clientSessionId: string
+    costMode?: string
+    fingerprintId: string
+    repoId: string | undefined
+    onResponseChunk: (chunk: string | PrintModeEvent) => void
+
+    agentType: AgentTemplateType
+    agentTemplate: AgentTemplate
+    fileContext: ProjectFileContext
+    agentState: AgentState
+    localAgentTemplates: Record<string, AgentTemplate>
+
+    prompt: string | undefined
+    spawnParams: Record<string, any> | undefined
+    system: string
+    n?: number
+
+    trackEvent: TrackEventFn
+    promptAiSdk: PromptAiSdkFn
+    traceWriter?: TraceWriter
+    onAgentUsageReceived?: (usage: AgentUsageData) => void
+    onAgentUsageIncomplete?: () => void
+    onCompaction?: (data: ContextCompactionData) => void
+    /** A root-agent compaction pass began; `onCompactionEnd` follows whatever its outcome. */
+    onCompactionStart?: (data: Pick<ContextCompactionData, 'trigger'>) => void
+    onCompactionEnd?: () => void
+    /**
+     * A root agent's background summary finished, usually after the run
+     * returned its state. The host adds it to the state it saved
+     * (`withCompactionSummary` in the SDK), so a restart does not lose it.
+     */
+    onCompactionSummary?: (summary: ConversationSummary) => void
+  } & ParamsExcluding<
+    typeof processStream,
+    | 'agentContext'
+    | 'agentState'
+    | 'agentStepId'
+    | 'agentTemplate'
+    | 'fullResponse'
+    | 'messages'
+    | 'onCostCalculated'
+    | 'repoId'
+    | 'stream'
+    | 'stopStream'
+  > &
+    ParamsExcluding<
+      typeof getAgentStreamFromTemplate,
+      | 'agentId'
+      | 'includeCacheControl'
+      | 'messages'
+      | 'onCostCalculated'
+      | 'template'
+    > &
+    ParamsExcluding<typeof getAgentTemplate, 'agentId'> &
+    ParamsExcluding<
+      typeof getAgentPrompt,
+      'agentTemplate' | 'promptType' | 'agentState' | 'agentTemplates'
+    > &
+    ParamsExcluding<
+      typeof getMCPToolData,
+      'toolNames' | 'mcpServers' | 'writeTo'
+    > &
+    ParamsExcluding<
+      PromptAiSdkFn,
+      'messages' | 'model' | 'onCostCalculated' | 'n'
+    >,
+): Promise<{
+  agentState: AgentState
+  fullResponse: string
+  shouldEndTurn: boolean
+  messageId: string | null
+  nResponses?: string[]
+  usedWorkTools?: boolean
+}> => {
+  const {
+    agentType,
+    fileContext,
+    agentTemplate,
+    localAgentTemplates,
+    logger,
+    prompt,
+    repoId,
+    spawnParams,
+    system,
+    userId,
+    userInputId,
+    onResponseChunk,
+    promptAiSdk,
+    additionalToolDefinitions,
+  } = params
+  let agentState = params.agentState
+
+  const { agentContext } = agentState
+
+  const startTime = Date.now()
+
+  // Links logs within a single step of the agent loop.
+  const agentStepId = crypto.randomUUID()
+
+  if (agentState.stepsRemaining <= 0) {
+    logger.warn(
+      `Detected too many consecutive assistant messages without user prompt`,
+    )
+
+    onResponseChunk(`${STEP_WARNING_MESSAGE}\n\n`)
+
+    // Update message history to include the warning
+    agentState = {
+      ...agentState,
+      messageHistory: [
+        ...expireMessages(agentState.messageHistory, 'userPrompt'),
+        userMessage(
+          withSystemTags(
+            `The assistant has responded too many times in a row. The assistant's turn has automatically been ended. The maximum number of responses can be configured via maxAgentSteps.`,
+          ),
+        ),
+      ],
+    }
+    return {
+      agentState,
+      fullResponse: STEP_WARNING_MESSAGE,
+      shouldEndTurn: true,
+      messageId: null,
+    }
+  }
+
+  const stepPrompt = await getAgentPrompt({
+    ...params,
+    agentTemplate,
+    promptType: { type: 'stepPrompt' },
+    fileContext,
+    agentState,
+    agentTemplates: localAgentTemplates,
+    logger,
+    additionalToolDefinitions,
+  })
+
+  // An interrupted turn can leave a tool call with no result behind, which
+  // strict providers (DeepSeek) reject with a 400. Since history is persisted
+  // and replayed, that one orphan would fail every later turn, so drop it here
+  // — the single point every step's request is built — and assign the cleaned
+  // history back so the checkpointed state is valid too.
+  // In a long session, stub tool results older than the newest few with the
+  // omit shapes fitToolResults/getPreviouslyReadFiles already understand:
+  // read_files and terminal outputs up to 100k/50k chars otherwise stay
+  // verbatim in history and are re-sent on every request until compaction.
+  // The pass waits for real past-window volume (see simplifyOldToolResults),
+  // so a history that still fits the window comfortably keeps everything;
+  // the newest results and anything this step later appends are untouched,
+  // and unreplaced messages keep reference identity for the extension check
+  // below.
+  const history = simplifyOldToolResults({
+    messages: dropUnansweredToolCalls(
+      expireMessages(agentState.messageHistory, 'agentStep'),
+    ),
+    logger,
+  })
+
+  const agentMessagesUntruncated = buildArray<Message>(
+    ...history,
+
+    stepPrompt &&
+      userMessage({
+        content: stepPrompt,
+        tags: ['STEP_PROMPT'],
+
+        // James: Deprecate the below, only use tags, which are not prescriptive.
+        timeToLive: 'agentStep' as const,
+        keepDuringTruncation: true,
+      }),
+  )
+
+  agentState.messageHistory = agentMessagesUntruncated
+
+  const { model } = agentTemplate
+
+  // A step can start with the history ending on an assistant message — e.g. a
+  // continuation after a think-only response for an agent with no stepPrompt.
+  // Claude 4.6+ rejects such requests as unsupported assistant prefill, so end
+  // the conversation with a user message instead.
+  const lastMessage =
+    agentState.messageHistory[agentState.messageHistory.length - 1]
+  if (lastMessage?.role === 'assistant' && !supportsAssistantPrefill(model)) {
+    agentState.messageHistory = [
+      ...agentState.messageHistory,
+      userMessage({
+        content: withSystemTags('Continue from where you left off.'),
+        timeToLive: 'agentStep' as const,
+        keepDuringTruncation: true,
+      }),
+    ]
+  }
+
+  let stepCreditsUsed = 0
+
+  const onCostCalculated = async (credits: number) => {
+    stepCreditsUsed += credits
+    agentState.creditsUsed += credits
+    agentState.directCreditsUsed += credits
+  }
+
+  const iterationNum = agentState.messageHistory.length
+  // system is a plain string; count it directly rather than JSON-stringifying
+  // it (which would add quotes and escape every newline).
+  const systemTokens = countTokens(system)
+
+  let cacheDebugCorrelation:
+    ReturnType<typeof createCacheDebugSnapshot> | undefined
+  if (CACHE_DEBUG_FULL_LOGGING) {
+    try {
+      cacheDebugCorrelation = createCacheDebugSnapshot({
+        agentType: String(agentType),
+        system,
+        toolDefinitions: params.tools
+          ? Object.fromEntries(
+              Object.entries(params.tools).map(([name, tool]) => [
+                name,
+                {
+                  description: tool.description,
+                  inputSchema: tool.inputSchema as {},
+                },
+              ]),
+            )
+          : {},
+        messages: [systemMessage(system), ...agentState.messageHistory],
+        logger,
+        projectRoot: fileContext.projectRoot,
+        runId: agentState.runId,
+        userInputId,
+        agentStepId,
+        model,
+      })
+    } catch (err) {
+      logger.warn({ error: err }, '[Cache Debug] Failed to create snapshot')
+    }
+  }
+
+  const onCacheDebugProviderRequestBuilt = cacheDebugCorrelation
+    ? ({
+        provider,
+        rawBody,
+        normalizedBody,
+      }: {
+        provider: string
+        rawBody: unknown
+        normalizedBody?: unknown
+      }) => {
+        enrichCacheDebugSnapshotWithProviderRequest({
+          correlation: cacheDebugCorrelation,
+          provider,
+          rawBody,
+          normalized: normalizedBody ?? rawBody,
+          logger,
+        })
+      }
+    : undefined
+
+  const onCacheDebugUsageReceived = cacheDebugCorrelation
+    ? (usage: CacheDebugUsageData) => {
+        enrichCacheDebugSnapshotWithUsage({
+          correlation: cacheDebugCorrelation,
+          usage,
+          logger,
+        })
+      }
+    : undefined
+
+  // Full message histories go to the trace writer, which appends each message
+  // exactly once (see TraceWriter).
+  params.traceWriter?.recordStep({
+    agentId: agentState.agentId,
+    agentType: String(agentType),
+    runId: agentState.runId,
+    userInputId,
+    step: iterationNum,
+    system,
+    messages: agentState.messageHistory,
+  })
+
+  // Log a summary only: the full message history, system prompt, and agent
+  // template are large and logging them every step bloats log files
+  // quadratically over the course of a chat.
+  logger.debug(
+    {
+      iteration: iterationNum,
+      runId: agentState.runId,
+      model,
+      duration: Date.now() - startTime,
+      contextTokenCount: agentState.contextTokenCount,
+      messageCount: agentState.messageHistory.length,
+      prompt,
+      params: spawnParams,
+      systemTokens,
+      agentTemplateId: agentTemplate.id,
+      toolNames: params.tools ? Object.keys(params.tools) : undefined,
+    },
+    `Start agent ${agentType} step ${iterationNum} (${userInputId}${prompt ? ` - Prompt: ${prompt.slice(0, 20)}` : ''})`,
+  )
+
+  // Handle n parameter for generating multiple responses
+  if (params.n !== undefined) {
+    const result = await promptAiSdk({
+      ...params,
+      messages: agentState.messageHistory,
+      model,
+      n: params.n,
+      onCostCalculated,
+      cacheDebugCorrelation: cacheDebugCorrelation
+        ? serializeCacheDebugCorrelation(cacheDebugCorrelation)
+        : undefined,
+      onCacheDebugProviderRequestBuilt,
+      onCacheDebugUsageReceived,
+    })
+
+    if (result.aborted) {
+      return {
+        agentState,
+        fullResponse: '',
+        shouldEndTurn: true,
+        messageId: null,
+        nResponses: undefined,
+      }
+    }
+
+    const responsesString = result.value
+    let nResponses: string[]
+    try {
+      nResponses = JSON.parse(responsesString) as string[]
+      if (!Array.isArray(nResponses)) {
+        if (params.n > 1) {
+          throw new Error(
+            `Expected JSON array response from LLM when n > 1, got non-array: ${responsesString.slice(0, 50)}`,
+          )
+        }
+        // If it parsed but isn't an array, treat as single response
+        nResponses = [responsesString]
+      }
+    } catch (e) {
+      if (params.n > 1) {
+        throw e
+      }
+      // If parsing fails, treat as single raw response (common for n=1)
+      nResponses = [responsesString]
+    }
+
+    return {
+      agentState,
+      fullResponse: responsesString,
+      shouldEndTurn: false,
+      messageId: null,
+      nResponses,
+    }
+  }
+
+  let fullResponse = ''
+  const toolResults: ToolMessage[] = []
+
+  // Lets processStream cancel this step's request without cancelling the run
+  // (a runaway response it has decided to stop reading).
+  const streamStop = new AbortController()
+
+  // The parser appends model output AND tool results before returning. Only
+  // the former is covered by outputTokens. The persisted anchor is scalar;
+  // this request-local snapshot neither copies text nor tokenizes it.
+  const inputHistory = [...agentState.messageHistory]
+  const contextTools = toolsForContextEstimate(agentState.toolDefinitions)
+  const estimatedInputTokens =
+    countTokensMessages(inputHistory) +
+    countTokens(system) +
+    countTokensJson(contextTools)
+  let contextUsage: ModelUsageData | undefined
+  let finishReason: string | undefined
+
+  // Raw stream from AI SDK
+  const stream = getAgentStreamFromTemplate({
+    ...params,
+    signal: AbortSignal.any([params.signal, streamStop.signal]),
+    agentId: agentState.parentId ? agentState.agentId : undefined,
+    costMode: params.costMode,
+    cacheDebugCorrelation: cacheDebugCorrelation
+      ? serializeCacheDebugCorrelation(cacheDebugCorrelation)
+      : undefined,
+    includeCacheControl: supportsCacheControl(agentTemplate.model),
+    messages: [systemMessage(system), ...agentState.messageHistory],
+    onCacheDebugProviderRequestBuilt,
+    onCacheDebugUsageReceived,
+    onUsageReceived: (usage: ModelUsageData) => {
+      contextUsage = usage
+      params.onAgentUsageReceived?.({
+        ...usage,
+        isRoot: !agentState.parentId,
+        agentId: agentState.agentId,
+      })
+    },
+    onUsageIncomplete: params.onAgentUsageIncomplete,
+    onFinishReason: (reason) => {
+      finishReason = reason
+    },
+    template: agentTemplate,
+    onCostCalculated,
+  })
+
+  const {
+    fullResponse: fullResponseAfterStream,
+    hadToolCallError,
+    messageId,
+    toolCalls,
+    toolResults: newToolResults,
+  } = await processStream({
+    ...params,
+    agentContext,
+    agentState,
+    agentStepId,
+    agentTemplate,
+    fullResponse,
+    messages: agentState.messageHistory,
+    repoId,
+    stream,
+    onCostCalculated,
+    stopStream: () => streamStop.abort(),
+    streamFinishReason: () => finishReason,
+  }).finally(() => {
+    // Inline agents can replace history (set_messages). A receipt for the old
+    // request is not a baseline for a replacement summary.
+    if (
+      contextUsage &&
+      inputHistory.every((m, i) => agentState.messageHistory[i] === m)
+    ) {
+      recordContextUsage({
+        agentState,
+        model,
+        usage: contextUsage,
+        estimatedInputTokens,
+        estimatedOutputTokens: countTokensMessages(
+          agentState.messageHistory
+            .slice(inputHistory.length)
+            .filter((m) => m.role === 'assistant'),
+        ),
+      })
+    }
+    agentState.contextTokenCount = estimateContextTokens({
+      agentState,
+      model,
+      systemPrompt: system,
+      toolsForTokenCount: contextTools,
+    })
+  })
+
+  toolResults.push(...newToolResults)
+
+  fullResponse = fullResponseAfterStream
+
+  // A successful no-op is not progress. GLM can keep emitting the same to-do
+  // list (even while acknowledging the loop in prose) until the general step
+  // budget is exhausted. Give it a chance to recover, then fail explicitly.
+  if (
+    !hadToolCallError &&
+    toolCalls.length > 0 &&
+    toolCalls.every((call) => call.toolName === 'write_todos')
+  ) {
+    const consecutive = trailingIdenticalTodoCalls(agentState.messageHistory)
+    if (consecutive >= TODO_LOOP_RECOVERY_THRESHOLD) {
+      const stopped = consecutive >= TODO_LOOP_STOP_THRESHOLD
+      logger.warn(
+        {
+          metric: stopped ? 'todo_loop_stopped' : 'todo_loop_recovery',
+          consecutive,
+          model: agentTemplate.model,
+          agentId: agentTemplate.id,
+          fileEditToolsOffered: hasFileEditTool(agentTemplate.toolNames),
+          userId,
+          runId: agentState.runId,
+        },
+        stopped
+          ? 'Stopping a turn stuck repeating an unchanged to-do list'
+          : 'Model is repeating an unchanged to-do list; adding recovery guidance',
+      )
+      if (stopped) {
+        throw new TodoLoopError()
+      }
+      agentState.messageHistory.push(
+        userMessage({
+          content: withSystemTags(
+            todoLoopRecoveryMessage(agentTemplate.toolNames),
+          ),
+          tags: [TODO_LOOP_RECOVERY_TAG],
+        }),
+      )
+    }
+  }
+
+  // MEASUREMENT ONLY, and deliberately before the guard below so that a turn
+  // the guard stops still leaves this row behind. The loops users photograph
+  // are a model retrying the SAME file, varying the edit a little or reading
+  // the file in between; the guard needs byte-identical arguments and an
+  // unbroken run of edit-only steps, so most of them score below its
+  // threshold and no row is written at all. Over 2026-10-09..14 the only
+  // per-rejection signal Axiom has (write_file's "same as the old content",
+  // which is one `logger.info`) showed ~35% of same-file loops on
+  // guard-capable clients producing no guard row, over just 65 episodes —
+  // and `str_replace` rejections, the common case, log nothing, so that
+  // number is a floor on a sliver. This event makes the real rate a division:
+  // `consecutive` is the loose count, `strictConsecutive` and `guardEligible`
+  // are what the guard saw at the same moment. It changes no behaviour.
+  if (toolCalls.some((call) => isFileEditLoopTool(call.toolName))) {
+    const nearMiss = trailingRejectedEditsToSameFiles(agentState.messageHistory)
+    // Once per episode as it crosses each of the guard's own thresholds, so a
+    // long loop is two rows rather than one per step.
+    if (
+      nearMiss &&
+      (nearMiss.consecutive === FILE_EDIT_LOOP_RECOVERY_THRESHOLD ||
+        nearMiss.consecutive === FILE_EDIT_LOOP_STOP_THRESHOLD)
+    ) {
+      logger.info(
+        {
+          axiomEvent: FILE_EDIT_LOOP_EVENT,
+          metric:
+            nearMiss.consecutive === FILE_EDIT_LOOP_STOP_THRESHOLD
+              ? 'file_edit_loop_same_file_stop_depth'
+              : 'file_edit_loop_same_file',
+          consecutive: nearMiss.consecutive,
+          strictConsecutive: trailingIdenticalRejectedEdits(
+            agentState.messageHistory,
+          ),
+          guardEligible:
+            !hadToolCallError &&
+            toolCalls.every((call) => isFileEditLoopTool(call.toolName)),
+          varied: nearMiss.varied,
+          interleaved: nearMiss.interleaved,
+          mixedStep: nearMiss.mixedStep,
+          toolName: nearMiss.toolName,
+          model: agentTemplate.model,
+          agentId: agentTemplate.id,
+          runId: agentState.runId,
+        },
+        'Trailing steps re-sent a rejected edit to the same file',
+      )
+    }
+  }
+
+  // The same shape with file edits: an identical write_file/str_replace is
+  // answered with the same rejection every step, each result forces another
+  // step, and the model re-sends the edit until the step budget is gone.
+  if (
+    !hadToolCallError &&
+    toolCalls.length > 0 &&
+    toolCalls.every((call) => isFileEditLoopTool(call.toolName))
+  ) {
+    const consecutive = trailingIdenticalRejectedEdits(
+      agentState.messageHistory,
+    )
+    if (consecutive >= FILE_EDIT_LOOP_RECOVERY_THRESHOLD) {
+      const stopped = consecutive >= FILE_EDIT_LOOP_STOP_THRESHOLD
+      logger.warn(
+        {
+          metric: stopped
+            ? 'file_edit_loop_stopped'
+            : 'file_edit_loop_recovery',
+          consecutive,
+          model: agentTemplate.model,
+          agentId: agentTemplate.id,
+          userId,
+          runId: agentState.runId,
+        },
+        stopped
+          ? 'Stopping a turn stuck re-sending the same rejected file edit'
+          : 'Model is re-sending the same rejected file edit; adding recovery guidance',
+      )
+      if (stopped) {
+        throw new FileEditLoopError()
+      }
+      agentState.messageHistory.push(
+        userMessage({
+          content: withSystemTags(FILE_EDIT_LOOP_RECOVERY_MESSAGE),
+          tags: [FILE_EDIT_LOOP_RECOVERY_TAG],
+        }),
+      )
+    }
+  }
+
+  agentState.messageHistory = expireMessages(
+    agentState.messageHistory,
+    'agentStep',
+  )
+
+  const hasNoToolResults =
+    toolCalls.filter(
+      (call) => !TOOLS_WHICH_WONT_FORCE_NEXT_STEP.includes(call.toolName),
+    ).length === 0 &&
+    toolResults.filter(
+      (result) => !TOOLS_WHICH_WONT_FORCE_NEXT_STEP.includes(result.toolName),
+    ).length === 0 &&
+    !hadToolCallError // Tool call errors should also force another step so the agent can retry
+
+  const hasTaskCompleted = toolCalls.some(
+    (call) =>
+      call.toolName === 'task_completed' || call.toolName === 'end_turn',
+  )
+
+  // If the response is only <think>...</think> scaffolding (including orphan
+  // </think> closes that native-reasoning providers sometimes leak into
+  // content), the model was just thinking and should continue rather than end.
+  const isThinkOnly = hasNoToolResults && isThinkOnlyResponse(fullResponse)
+
+  // If the agent has the task_completed tool, it must be called to end its turn.
+  const requiresExplicitCompletion =
+    agentTemplate.toolNames.includes('task_completed')
+
+  let shouldEndTurn: boolean
+  if (requiresExplicitCompletion) {
+    // For models requiring explicit completion, only end turn when:
+    // - task_completed is called, OR
+    // - end_turn is called (backward compatibility)
+    shouldEndTurn = !hadToolCallError && hasTaskCompleted
+  } else {
+    // For other models, also end turn when there are no tool calls
+    // Exception: if the response is only <think> tags, continue the turn
+    shouldEndTurn =
+      !hadToolCallError &&
+      (hasTaskCompleted || (hasNoToolResults && !isThinkOnly))
+  }
+
+  // The answer to a Gravity report nudge ends the turn once its reports run;
+  // see util/gravity-report-nudge.ts.
+  if (
+    !shouldEndTurn &&
+    !hadToolCallError &&
+    endsOnGravityReport(toolCalls, agentState.messageHistory)
+  ) {
+    shouldEndTurn = true
+  }
+
+  // Ending on followup cards while the agent's own to-do list is part done
+  // stops a task the user asked to have finished (CodebuffAI/freebuff#1434).
+  // Bounded per user prompt; see util/followup-todo-nudge.ts. An explicit
+  // task_completed/end_turn is left alone.
+  if (
+    shouldEndTurn &&
+    !hasTaskCompleted &&
+    toolCalls.some((call) => call.toolName === 'suggest_followups')
+  ) {
+    const decision = decideFollowupTodoNudge(agentState.messageHistory)
+    if (decision) {
+      logger.info(
+        {
+          metric: 'followups_with_open_todos',
+          action: decision.action,
+          reason: decision.action === 'end' ? decision.reason : undefined,
+          openTodos: decision.openTodos.length,
+          nudgesSoFar: decision.nudgesSoFar,
+          model: agentTemplate.model,
+          agentId: agentTemplate.id,
+          userId,
+          runId: agentState.runId,
+        },
+        decision.action === 'nudge'
+          ? 'Turn ended on followups with unfinished to-dos; continuing'
+          : 'Turn ended on followups with unfinished to-dos; nudge limit reached',
+      )
+      if (decision.action === 'nudge') {
+        agentState.messageHistory.push(
+          userMessage({
+            content: withSystemTags(decision.message),
+            tags: [FOLLOWUP_TODO_NUDGE_TAG],
+          }),
+        )
+        shouldEndTurn = false
+      }
+    }
+  }
+
+  // Cards before the answer; see util/suggest-prompts-before-answer.ts. After
+  // the to-do nudge on purpose: an unfinished list sends the agent back to
+  // work, which beats asking it for an answer.
+  if (
+    shouldEndTurn &&
+    !hasTaskCompleted &&
+    endsOnSuggestPromptsBeforeAnswer(
+      toolCalls,
+      fullResponse,
+      agentState.messageHistory,
+    )
+  ) {
+    logger.info({ metric: 'suggest_prompts_before_answer' }, 'Continuing')
+    agentState.messageHistory.push(
+      userMessage({
+        content: withSystemTags(SUGGEST_PROMPTS_BEFORE_ANSWER_MESSAGE),
+        tags: [SUGGEST_PROMPTS_BEFORE_ANSWER_TAG],
+      }),
+    )
+    shouldEndTurn = false
+  }
+
+  // A turn that integrated a gravity_index recommendation but never reported
+  // it gets one step to do so, with the exact search_id and slug; see
+  // util/gravity-report-nudge.ts. Once per user prompt. Runs even after
+  // task_completed: the conversion is lost if the turn ends here.
+  if (shouldEndTurn && agentTemplate.toolNames.includes('gravity_index')) {
+    const nudge = decideGravityReportNudge(agentState.messageHistory)
+    if (nudge) {
+      logger.info(
+        {
+          axiomEvent: GRAVITY_REPORT_NUDGE_EVENT,
+          pending: nudge.candidates.length,
+          editsSinceRecommendation: nudge.editsSinceRecommendation,
+          model: agentTemplate.model,
+          agentId: agentTemplate.id,
+          runId: agentState.runId,
+        },
+        'Turn ending with an unreported Gravity integration; reminding',
+      )
+      agentState.messageHistory.push(
+        userMessage({
+          content: withSystemTags(nudge.message),
+          tags: [GRAVITY_REPORT_NUDGE_TAG],
+        }),
+      )
+      shouldEndTurn = false
+    }
+  }
+
+  // A to-do list the model never ticks off reads 0/N until the turn's last
+  // step; see util/todo-progress-reminder.ts. Once per list, mid-turn only.
+  if (!shouldEndTurn) {
+    const reminder = decideTodoProgressReminder(agentState.messageHistory)
+    if (reminder) {
+      logger.info(
+        {
+          axiomEvent: TODO_PROGRESS_REMINDER_EVENT,
+          done: reminder.done,
+          total: reminder.total,
+          callsSinceUpdate: reminder.callsSinceUpdate,
+          model: agentTemplate.model,
+          agentId: agentTemplate.id,
+          runId: agentState.runId,
+        },
+        'To-do list not updated for several tool calls; reminding',
+      )
+      agentState.messageHistory.push(
+        userMessage({
+          content: withSystemTags(reminder.message),
+          tags: [TODO_PROGRESS_REMINDER_TAG],
+        }),
+      )
+    }
+  }
+
+  agentState = {
+    ...agentState,
+    stepsRemaining: agentState.stepsRemaining - 1,
+    agentContext,
+  }
+
+  // Capture the assistant response and tool results added during this step
+  params.traceWriter?.recordStep({
+    agentId: agentState.agentId,
+    agentType: String(agentType),
+    runId: agentState.runId,
+    userInputId,
+    step: iterationNum,
+    system,
+    messages: agentState.messageHistory,
+  })
+
+  logger.debug(
+    {
+      iteration: iterationNum,
+      agentId: agentState.agentId,
+      model,
+      prompt,
+      shouldEndTurn,
+      duration: Date.now() - startTime,
+      fullResponse,
+      // Summarize instead of logging the full message history: logging it
+      // every step bloats log files quadratically over the course of a chat.
+      messageCount: agentState.messageHistory.length,
+      toolCalls,
+      toolResults,
+      stepCreditsUsed,
+    },
+    `End agent ${agentType} step ${iterationNum} (${userInputId}${prompt ? ` - Prompt: ${prompt.slice(0, 20)}` : ''})`,
+  )
+
+  return {
+    agentState,
+    fullResponse,
+    shouldEndTurn,
+    messageId,
+    nResponses: undefined,
+    usedWorkTools: toolCalls.some((call) =>
+      ['run_terminal_command', 'write_file', 'str_replace'].includes(
+        call.toolName,
+      ),
+    ),
+  }
+}
+
+/**
+ * Runs the agent loop.
+ *
+ * IMPORTANT: This function mutates `params.agentState` in place throughout the
+ * run (not just at return time). Fields like `messageHistory`, `systemPrompt`,
+ * `toolDefinitions`, `creditsUsed`, and `output` are updated as work progresses
+ * so that callers holding a reference to the same object (e.g. the SDK's
+ * `sessionState.mainAgentState`) see in-progress work immediately — which
+ * matters when an error is thrown mid-run and the normal return path is
+ * skipped.
+ */
+export async function loopAgentSteps(
+  params: {
+    addAgentStep: AddAgentStepFn
+    agentState: AgentState
+    agentType: string
+    clearUserPromptMessagesAfterResponse?: boolean
+    clientSessionId: string
+    content?: Array<TextPart | ImagePart>
+    costMode?: string
+    fileContext: ProjectFileContext
+    finishAgentRun: FinishAgentRunFn
+    localAgentTemplates: Record<string, AgentTemplate>
+    logger: Logger
+    parentSystemPrompt?: string
+    parentTools?: ToolSet
+    prompt: string | undefined
+    signal: AbortSignal
+    /** Host-enforced wall-clock deadline in Unix milliseconds. */
+    deadlineAt?: number
+    /** Optional steering hook. Drained at each step boundary (after a step's LLM
+     * call + tools complete, before the next one). Any returned messages are appended
+     * to the message history as user prompts and keep the turn going, letting a
+     * host "steer" a running agent without aborting or losing the current step. */
+    drainSteeringMessages?: DrainSteeringMessages
+    spawnParams: Record<string, any> | undefined
+    startAgentRun: StartAgentRunFn
+    userId: string | undefined
+    userInputId: string
+    agentTemplate?: AgentTemplate
+  } & ParamsExcluding<typeof additionalToolDefinitions, 'agentTemplate'> &
+    ParamsExcluding<
+      typeof runProgrammaticStep,
+      | 'agentState'
+      | 'onCostCalculated'
+      | 'prompt'
+      | 'runId'
+      | 'stepNumber'
+      | 'stepsComplete'
+      | 'system'
+      | 'template'
+      | 'toolCallParams'
+      | 'tools'
+    > &
+    ParamsExcluding<typeof getAgentTemplate, 'agentId'> &
+    ParamsExcluding<
+      typeof getAgentPrompt,
+      | 'agentTemplate'
+      | 'promptType'
+      | 'agentTemplates'
+      | 'additionalToolDefinitions'
+    > &
+    ParamsExcluding<
+      typeof getMCPToolData,
+      'toolNames' | 'mcpServers' | 'writeTo'
+    > &
+    ParamsExcluding<StartAgentRunFn, 'agentId' | 'ancestorRunIds'> &
+    ParamsExcluding<
+      FinishAgentRunFn,
+      'runId' | 'status' | 'totalSteps' | 'directCredits' | 'totalCredits'
+    > &
+    ParamsExcluding<
+      typeof runAgentStep,
+      | 'additionalToolDefinitions'
+      | 'agentState'
+      | 'agentTemplate'
+      | 'prompt'
+      | 'runId'
+      | 'spawnParams'
+      | 'system'
+      | 'tools'
+    > &
+    ParamsExcluding<
+      AddAgentStepFn,
+      | 'agentRunId'
+      | 'stepNumber'
+      | 'credits'
+      | 'childRunIds'
+      | 'messageId'
+      | 'status'
+      | 'startTime'
+    >,
+): Promise<{
+  agentState: AgentState
+  output: AgentOutput
+}> {
+  const loopStarted = Date.now()
+  let agentTemplate = params.agentTemplate
+  if (!agentTemplate) {
+    agentTemplate =
+      (await getAgentTemplate({
+        ...params,
+        agentId: params.agentType,
+      })) ?? undefined
+  }
+  if (!agentTemplate) {
+    throw new Error(`Agent template not found for type: ${params.agentType}`)
+  }
+
+  // The context pruner is a programmatic no-model-call agent spawned before
+  // every main-agent step. Recording its runs in the ledger cost three awaited
+  // web-API round trips (start/step/finish) per main-agent step, so it mints a
+  // local run id and skips run tracking entirely. Matches bundled and
+  // publisher-qualified ids ('context-pruner', 'codebuff/context-pruner@1.0.0')
+  // by agent name, never by substring: an untracked id is refused by the web
+  // API, so any model-calling agent whose id merely CONTAINED the name (e.g.
+  // 'context-pruner-test-agent') failed its first LLM call with
+  // "runId Not Found".
+  if (parseAgentId(agentTemplate.id).agentId === 'context-pruner') {
+    params = {
+      ...params,
+      startAgentRun: async () =>
+        `${UNTRACKED_RUN_ID_PREFIX}${crypto.randomUUID()}`,
+      addAgentStep: async () => null,
+      finishAgentRun: async () => {},
+    }
+  }
+
+  const {
+    addAgentStep,
+    agentState: initialAgentState,
+    agentType,
+    clearUserPromptMessagesAfterResponse = true,
+    clientSessionId,
+    content,
+    fileContext,
+    finishAgentRun,
+    localAgentTemplates,
+    logger,
+    parentSystemPrompt,
+    parentTools,
+    prompt,
+    signal,
+    spawnParams,
+    startAgentRun,
+    userId,
+    userInputId,
+    clientEnv,
+    ciEnv,
+  } = params
+
+  const offersProjectProfile = shouldOfferProjectProfileTool({
+    costMode: params.costMode,
+    agentId: agentTemplate.id,
+    isRoot: !initialAgentState.parentId,
+    toolNames: agentTemplate.toolNames,
+    getProjectProfile: params.getProjectProfile,
+    reportProjectProfile: params.reportProjectProfile,
+  })
+  if (offersProjectProfile) {
+    agentTemplate = {
+      ...agentTemplate,
+      toolNames: [...agentTemplate.toolNames, PROJECT_PROFILE_TOOL_NAME],
+    }
+  }
+
+  if (signal.aborted) {
+    return {
+      agentState: initialAgentState,
+      output: {
+        type: 'error',
+        message: 'Run cancelled by user',
+      },
+    }
+  }
+
+  const runId = await startAgentRun({
+    ...params,
+    agentId: agentTemplate.id,
+    ancestorRunIds: initialAgentState.ancestorRunIds,
+  })
+  if (!runId) {
+    // registration ends on the run's signal; an abort landing there is a cancel, not a failure
+    if (signal.aborted) {
+      return {
+        agentState: initialAgentState,
+        output: {
+          type: 'error',
+          message: 'Run cancelled by user',
+        },
+      }
+    }
+    throw new Error('Failed to start agent run')
+  }
+  initialAgentState.runId = runId
+
+  let cachedAdditionalToolDefinitions: CustomToolDefinitions | undefined
+  // Use parent's tools for prompt caching when inheritParentSystemPrompt is true
+  const useParentTools =
+    agentTemplate.inheritParentSystemPrompt && parentTools !== undefined
+
+  const manualCompaction = isCompactCommandPrompt(prompt)
+  // Initialize message history with user prompt and instructions on first iteration
+  const instructionsPrompt = await getAgentPrompt({
+    ...params,
+    agentTemplate,
+    promptType: { type: 'instructionsPrompt' },
+    agentTemplates: localAgentTemplates,
+    useParentTools,
+    additionalToolDefinitions: async () => {
+      if (!cachedAdditionalToolDefinitions) {
+        cachedAdditionalToolDefinitions = await additionalToolDefinitions({
+          ...params,
+          agentTemplate,
+        })
+      }
+      return cachedAdditionalToolDefinitions
+    },
+  })
+
+  // Build the initial message history with user prompt and instructions
+  // Generate system prompt once, using parent's if inheritParentSystemPrompt is true
+  let system: string
+  if (manualCompaction && initialAgentState.systemPrompt) {
+    system = initialAgentState.systemPrompt
+  } else if (agentTemplate.inheritParentSystemPrompt && parentSystemPrompt) {
+    system = parentSystemPrompt
+  } else {
+    const systemPrompt = await getAgentPrompt({
+      ...params,
+      agentTemplate,
+      promptType: { type: 'systemPrompt' },
+      agentTemplates: localAgentTemplates,
+      additionalToolDefinitions: async () => {
+        if (!cachedAdditionalToolDefinitions) {
+          cachedAdditionalToolDefinitions = await additionalToolDefinitions({
+            ...params,
+            agentTemplate,
+          })
+        }
+        return cachedAdditionalToolDefinitions
+      },
+    })
+    system = systemPrompt ?? ''
+  }
+
+  // Build agent tools (agents as direct tool calls) for non-inherited tools
+  const agentTools = useParentTools
+    ? {}
+    : await buildAgentToolSet({
+        ...params,
+        spawnableAgents: modelSpawnableAgents(agentTemplate),
+        agentTemplates: localAgentTemplates,
+      })
+
+  const tools = useParentTools
+    ? parentTools
+    : await getToolSet({
+        toolNames: agentTemplate.toolNames,
+        windowedFileReads: agentTemplate.windowedFileReads === true,
+        suppressCommitAttribution:
+          agentTemplate.suppressCommitAttribution === true,
+        additionalToolDefinitions: async () => {
+          if (!cachedAdditionalToolDefinitions) {
+            cachedAdditionalToolDefinitions = await additionalToolDefinitions({
+              ...params,
+              agentTemplate,
+            })
+          }
+          return cachedAdditionalToolDefinitions
+        },
+        agentTools,
+        skills: fileContext.skills ?? {},
+      })
+
+  const hasUserMessage =
+    !manualCompaction &&
+    Boolean(
+      prompt ||
+      (spawnParams && Object.keys(spawnParams).length > 0) ||
+      (content && content.length > 0),
+    )
+
+  // Named so that a size refusal can take it back out of the history.
+  const userPromptMessage: Message | undefined = hasUserMessage
+    ? {
+        // Actual user message!
+        role: 'user',
+        content: buildUserMessageContent(prompt, spawnParams, content),
+        tags: ['USER_PROMPT'],
+        sentAt: Date.now(),
+
+        // James: Deprecate the below, only use tags, which are not prescriptive.
+        keepDuringTruncation: true,
+      }
+    : undefined
+
+  const initialMessages = buildArray<Message>(
+    ...initialAgentState.messageHistory,
+
+    hasUserMessage && [
+      userPromptMessage,
+      prompt &&
+        prompt in additionalSystemPrompts &&
+        userMessage(
+          withSystemInstructionTags(
+            additionalSystemPrompts[
+              prompt as keyof typeof additionalSystemPrompts
+            ],
+          ),
+        ),
+      ,
+    ],
+
+    instructionsPrompt &&
+      userMessage({
+        content: instructionsPrompt,
+        tags: ['INSTRUCTIONS_PROMPT'],
+
+        // James: Deprecate the below, only use tags, which are not prescriptive.
+        keepLastTags: ['INSTRUCTIONS_PROMPT'],
+      }),
+  )
+
+  // Convert tools to a serializable format for context-pruner token counting
+  // Tool definitions live in agent state (persisted, snapshotted, shipped over
+  // the wire), so every inputSchema must be plain JSON Schema: Zod instances
+  // are cyclic and break any JSON.stringify over the state.
+  const toolDefinitions =
+    manualCompaction && initialAgentState.toolDefinitions
+      ? initialAgentState.toolDefinitions
+      : mapValues(tools, (tool) => ({
+          description:
+            typeof tool.description === 'string' ? tool.description : undefined,
+          inputSchema: toTokenCountInputSchema(tool.inputSchema) ?? {},
+        }))
+
+  const additionalToolDefinitionsWithCache = async () => {
+    if (!cachedAdditionalToolDefinitions) {
+      cachedAdditionalToolDefinitions = await additionalToolDefinitions({
+        ...params,
+        agentTemplate,
+      })
+    }
+    return cachedAdditionalToolDefinitions
+  }
+
+  // Mutate initialAgentState so that in-progress work propagates back to the
+  // caller's shared reference (e.g. SDK's sessionState.mainAgentState) even if
+  // an error is thrown before we return.
+  // What earlier turns left; a USER_PROMPT not in it is this turn's own.
+  const earlierMessages = new Set(initialAgentState.messageHistory)
+  initialAgentState.messageHistory = initialMessages
+  initialAgentState.systemPrompt = system
+  initialAgentState.toolDefinitions = toolDefinitions
+  let currentAgentState: AgentState = initialAgentState
+  if (
+    !sameContextModel(
+      currentAgentState.contextTokenBaseline?.model,
+      agentTemplate.model,
+    )
+  ) {
+    currentAgentState.contextTokenBaseline = undefined
+  }
+
+  // Estimate the wire schemas, not Zod's internal object graph.
+  const toolsForTokenCount = toolsForContextEstimate(toolDefinitions)
+
+  // Keep the persisted/displayed count aligned after cancellation and TTL edits.
+  // Uses the latest receipt plus cheap deltas; never re-tokenizes the history.
+  const recountContextTokensForTurnEnd = () => {
+    currentAgentState.contextTokenCount = recountContextTokens({
+      agentState: currentAgentState,
+      model: agentTemplate.model,
+      systemPrompt: system,
+      toolsForTokenCount,
+    })
+  }
+
+  let shouldEndTurn = false
+  let hasRetriedOutputSchema = false
+  let hasCheckedCompletion = false
+  // Only the first optional check may fall back to a completed answer. Once
+  // it produces text or invokes ANY tool, its findings/effects must be kept.
+  let completionCheckpoint: Message[] | undefined
+  let usedWorkTools = false
+  let deadlineReminderLevel = 0
+  let currentPrompt = prompt
+  let currentParams = spawnParams
+  let totalSteps = 0
+  let llmStepNumber = 0
+  let nResponses: string[] | undefined = undefined
+  let compactionWindow: CompactionWindow | undefined
+  let firstOutputLogged = false
+  const idleAtStart = isIdleReturn(currentAgentState.messageHistory)
+
+  const compactionVersion = agentTemplate.compactContext
+    ? SUMMARY_COMPACTION_VERSION
+    : 'not-enabled'
+  const inheritedMetadata = clearCompactionRequestMetadata(
+    params.extraCodebuffMetadata,
+  )
+  const runMetadata = {
+    ...inheritedMetadata,
+    ...(!initialAgentState.parentId &&
+    initialAgentState.contextTokenBaseline?.model === agentTemplate.model
+      ? {
+          compaction_root_start_context_tokens: String(
+            initialAgentState.contextTokenBaseline.tokens,
+          ),
+        }
+      : {}),
+    compaction_version: compactionVersion,
+    compaction_root_model: initialAgentState.parentId
+      ? (inheritedMetadata.compaction_root_model ?? 'unknown')
+      : agentTemplate.model,
+    compaction_root_version: initialAgentState.parentId
+      ? (inheritedMetadata.compaction_root_version ?? 'unknown')
+      : compactionVersion,
+    compaction_root_run_id: initialAgentState.parentId
+      ? (inheritedMetadata.compaction_root_run_id ?? runId)
+      : runId,
+  }
+  // Programmatic spawns also need the root cohort, even before an LLM step.
+  params = { ...params, extraCodebuffMetadata: runMetadata }
+  const telemetry = {
+    compaction_version: compactionVersion,
+    compaction_root_version: runMetadata.compaction_root_version,
+    compaction_root_run_id: runMetadata.compaction_root_run_id,
+    trace_session_id: params.extraCodebuffMetadata?.trace_session_id ?? runId,
+  }
+
+  const compactionPolicy =
+    typeof agentTemplate.compactContext === 'object'
+      ? agentTemplate.compactContext
+      : {}
+  const maxContextLength =
+    compactionPolicy.maxContextLength ??
+    contextPrunerBudgetForModel(agentTemplate.model)
+  // Keyed by conversation, so a summary that finishes after this run ended
+  // reaches the next turn of the same thread.
+  const summaries = conversationSummaries(
+    `${params.extraCodebuffMetadata?.trace_session_id ?? runId}:${initialAgentState.agentId}`,
+  )
+  let idleChecked = false
+  /** The context size the provider reported for this run's latest step:
+   *  input plus output tokens. Summary decisions use only this. */
+  let stepUsageTokens: number | undefined
+  // The server accepts a request only while its run is open, so the run
+  // finishes after the summaries it started.
+  const runSummaries: Promise<unknown>[] = []
+
+  const summarize = (options: {
+    summaryId?: string
+    history: Message[]
+    contextTokens: number | undefined
+    mode: 'background' | 'foreground'
+    midTurn: boolean
+  }) =>
+    summarizeAndLog({
+      summaryId: options.summaryId,
+      history: options.history,
+      system,
+      contextTokens: options.contextTokens,
+      targetTokens: summaryTargetTokens(maxContextLength),
+      maxOutputTokens: compactionPolicy.maxOutputTokens,
+      mode: options.mode,
+      midTurn: options.midTurn,
+      // No time limit: a summary the run waits for is its only way under the
+      // budget, and stopping a slow one ended the run (base3 eval, 10-28).
+      // A background summary is not cancelled with its run: the next turn
+      // can still use it. A dead stream ends on the SDK's idle timeout.
+      signal:
+        options.mode === 'foreground' ? signal : new AbortController().signal,
+      cancelSignal: options.mode === 'foreground' ? signal : undefined,
+      logger,
+      runId,
+      model: agentTemplate.model,
+      telemetry,
+      stream: (request) =>
+        getAgentStreamFromTemplate({
+          ...params,
+          agentId: initialAgentState.parentId
+            ? initialAgentState.agentId
+            : undefined,
+          template: {
+            ...agentTemplate,
+            reasoningOptions: summaryReasoningOptions(
+              agentTemplate.model,
+              agentTemplate.reasoningOptions,
+            ),
+          },
+          runId,
+          messages: request.messages,
+          tools,
+          includeCacheControl: supportsCacheControl(agentTemplate.model),
+          maxOutputTokens: request.maxOutputTokens,
+          signal: request.signal,
+          extraCodebuffMetadata: {
+            ...runMetadata,
+            llm_step_number: String(llmStepNumber + 1),
+            ...request.extraCodebuffMetadata,
+          },
+          onFinishReason: request.onFinishReason,
+          onUsageReceived: request.onUsageReceived,
+          onCostCalculated: async () => {},
+        }),
+    })
+
+  /** Starts a background summary when the context grew enough since the
+   *  last one. The cache is warm here: a step or a turn just ended. */
+  const startSummaryIfDue = (midTurn: boolean, fixedTokenCount: number) => {
+    if (!agentTemplate.compactContext || summaries.pending()) return
+    const history = currentAgentState.messageHistory
+    // A window too small for a summary to clear room (a large fixed prompt
+    // in a small BYOK window) waits for the hard budget instead.
+    if (
+      !automaticCompactionIsWorthwhile({
+        messages: history,
+        maxContextLength,
+        thresholdTokens: compactionThreshold(maxContextLength),
+        fixedTokenCount,
+        maxOutputTokens: compactionPolicy.maxOutputTokens,
+      })
+    )
+      return
+    const contextTokens = stepUsageTokens
+    if (contextTokens === undefined) return
+    const latest = summaries.latest(
+      currentAgentState.compactionSummary,
+      history,
+    )
+    // Swapped in and not sized by a response yet: growth has no start.
+    if (latest && latest.contextTokens === undefined) return
+    if (
+      !summaryIsDue({
+        contextTokens,
+        maxContextLength,
+        latestContextTokens: latest?.contextTokens,
+      })
+    )
+      return
+    const requestHistory = summaryRequestHistory(history)
+    const done = summaries.start(contextTokens, () =>
+      summarize({
+        history: requestHistory,
+        contextTokens,
+        mode: 'background',
+        midTurn,
+      }),
+    )
+    runSummaries.push(
+      done.then((summary) => {
+        if (!summary || initialAgentState.parentId) return
+        try {
+          params.onCompactionSummary?.(summary)
+        } catch (error) {
+          logger.warn(
+            { error: getErrorObject(error) },
+            'Saving the conversation summary failed',
+          )
+        }
+      }),
+    )
+  }
+
+  /**
+   * Replaces the covered history with the newest summary. Waits for a summary
+   * in progress. At the context limit, or on a manual request, with no usable
+   * summary it makes one now (the cache is warm). After an idle gap it never
+   * does: the cache is cold, and the full history costs the same.
+   */
+  const compactWithSummary = async (options: {
+    trigger: CompactionTrigger | 'manual'
+    thresholdTokens: number
+    /** The provider's last count, when known. Reported, never decided on. */
+    preTokens: number | undefined
+  }): Promise<boolean> => {
+    const { trigger, thresholdTokens, preTokens } = options
+    const started = Date.now()
+    const compactionId = crypto.randomUUID()
+    let outcome: 'applied' | 'noop' | 'failed' | 'cancelled' = 'noop'
+    let readySummary = false
+    let waitedForPending = false
+    let generatedForeground = false
+    let summaryId: string | undefined
+    const isRoot = !initialAgentState.parentId
+    const before = currentAgentState.messageHistory
+    // This turn's own request (and steering) stays a real message.
+    const keep = (message: Message) =>
+      message.tags?.includes('USER_PROMPT') === true &&
+      !earlierMessages.has(message)
+    // A summary is worth using when it replaces messages. Whether the result
+    // is small enough is not guessed: the next response's count says, and a
+    // context still over the limit then gets a fresh summary.
+    const usable = (
+      applied: ReturnType<typeof applyConversationSummary>,
+    ): applied is NonNullable<typeof applied> =>
+      applied !== null && applied.messages.length < before.length
+    let statusShown = false
+    const showStatus = () => {
+      if (statusShown || !isRoot) return
+      statusShown = true
+      params.onCompactionStart?.({ trigger })
+    }
+    try {
+      let summary = summaries.latest(
+        currentAgentState.compactionSummary,
+        before,
+      )
+      let applied = summary
+        ? applyConversationSummary({ messages: before, summary, keep })
+        : null
+      readySummary = usable(applied)
+      // A ready summary is used at once, even when a newer one is in
+      // progress: waiting for it cost ~1 min a swap in the base3 eval
+      // (10-28). The newer one replaces it at the next swap, when it adds
+      // something. Only with nothing ready does the run wait for it.
+      const pending = summaries.pending()
+      if (pending && !usable(applied)) {
+        waitedForPending = true
+        showStatus()
+        const completed = await untilAborted(pending.promise, signal)
+        if (!completed) outcome = 'failed'
+        summary = summaries.latest(currentAgentState.compactionSummary, before)
+        applied = summary
+          ? applyConversationSummary({ messages: before, summary, keep })
+          : null
+      }
+      if (!usable(applied) && trigger !== 'cache_expiry') {
+        generatedForeground = true
+        summaryId = crypto.randomUUID()
+        showStatus()
+        const fresh = await summarize({
+          summaryId,
+          history: summaryRequestHistory(before),
+          contextTokens: stepUsageTokens,
+          mode: 'foreground',
+          midTurn: false,
+        })
+        if (fresh) {
+          summary = fresh
+          applied = applyConversationSummary({
+            messages: before,
+            summary: fresh,
+            keep,
+          })
+        } else outcome = 'failed'
+      }
+      if (!summary || !usable(applied)) return false
+      summaryId = summary.id
+
+      if (compactionWindow)
+        closeCompactionWindow({
+          window: compactionWindow,
+          messages: before,
+          endedBy: 'compaction',
+          nextTrigger: trigger,
+          logger,
+          runId,
+          model: agentTemplate.model,
+        })
+      compactionWindow = openCompactionWindow({
+        before,
+        after: applied.messages,
+        trigger,
+        compactionId,
+      })
+      currentAgentState.messageHistory = applied.messages
+      currentAgentState.compactionSummary = applied.summary
+      summaries.replace(applied.summary)
+      currentAgentState.pendingCompactionTelemetry = {
+        id: compactionId,
+        summaryId,
+        trigger,
+      }
+      outcome = 'applied'
+      currentAgentState.contextTokenBaseline = undefined
+      // Not reported, and decides nothing: the next response's count does.
+      currentAgentState.contextTokenCount = estimateContextTokens({
+        agentState: currentAgentState,
+        model: agentTemplate.model,
+        systemPrompt: system,
+        toolsForTokenCount,
+      })
+      try {
+        logger.info(
+          {
+            axiomEvent: CONTEXT_COMPACTION_COMPLETED_EVENT,
+            ...telemetry,
+            compaction_id: compactionId,
+            summary_id: summaryId,
+            agent_run_id: runId,
+            trigger_reason: trigger,
+            context_token_count: preTokens,
+            max_context_length: maxContextLength,
+            message_count: before.length,
+            mid_turn: before
+              .slice(
+                before.findLastIndex((m) => m.tags?.includes('USER_PROMPT')) +
+                  1,
+              )
+              .some((m) => m.role === 'assistant'),
+            summary_estimated_tokens: countTokens(summary.text),
+            preserved_fresh_messages: applied.messages.length - 1,
+          },
+          'Context compaction completed',
+        )
+      } catch {
+        // Telemetry must never block the compaction.
+      }
+      if (isRoot)
+        params.onCompaction?.({
+          trigger,
+          thresholdTokens,
+          summary: summary.text,
+          preTokens,
+          durationMs: Date.now() - started,
+        })
+      return true
+    } catch (error) {
+      outcome = signal.aborted || isAbortError(error) ? 'cancelled' : 'failed'
+      throw error
+    } finally {
+      try {
+        logger.info(
+          {
+            axiomEvent: COMPACTION_ATTEMPT_EVENT,
+            ...telemetry,
+            agent_run_id: runId,
+            model: agentTemplate.model,
+            compaction_id: compactionId,
+            summary_id: summaryId,
+            trigger_reason: trigger,
+            outcome,
+            duration_ms: Date.now() - started,
+            ready_summary: readySummary,
+            waited_for_pending: waitedForPending,
+            generated_foreground: generatedForeground,
+            context_token_count: preTokens,
+            max_context_length: maxContextLength,
+          },
+          'Compaction attempt finished',
+        )
+      } catch {
+        // Telemetry must never change the turn's outcome.
+      }
+      if (statusShown) params.onCompactionEnd?.()
+    }
+  }
+
+  try {
+    while (true) {
+      totalSteps++
+      if (signal.aborted) {
+        throw new AbortError()
+      }
+
+      if (totalSteps === 1 && userPromptMessage) {
+        assertUserContentSize([userPromptMessage], agentTemplate)
+      }
+
+      const startTime = new Date()
+
+      const stepPrompt = await getAgentPrompt({
+        ...params,
+        agentTemplate,
+        promptType: { type: 'stepPrompt' },
+        fileContext,
+        agentState: currentAgentState,
+        agentTemplates: localAgentTemplates,
+        logger,
+        additionalToolDefinitions: additionalToolDefinitionsWithCache,
+      })
+      const messagesWithStepPrompt = buildArray(
+        ...currentAgentState.messageHistory,
+        stepPrompt &&
+          userMessage({
+            content: stepPrompt,
+          }),
+      )
+
+      // Each completed response supplies the baseline. Only content added or
+      // removed since then (tools, steering, step scaffolding) is estimated.
+      currentAgentState.contextTokenCount = estimateContextTokens({
+        agentState: {
+          ...currentAgentState,
+          messageHistory: messagesWithStepPrompt,
+        },
+        model: agentTemplate.model,
+        systemPrompt: system,
+        toolsForTokenCount,
+      })
+
+      if (
+        (agentTemplate.compactContext && !shouldEndTurn) ||
+        manualCompaction
+      ) {
+        const thresholdTokens = compactionThreshold(maxContextLength)
+        const fixedTokenCount =
+          countTokens(system) +
+          countTokensJson(toolsForTokenCount) +
+          (stepPrompt
+            ? countTokensMessages([userMessage({ content: stepPrompt })])
+            : 0)
+        // A summary made before an edit to a message it covers is dropped.
+        currentAgentState.compactionSummary = summaries.latest(
+          currentAgentState.compactionSummary,
+          currentAgentState.messageHistory,
+        )
+        const idle =
+          !idleChecked && isIdleReturn(currentAgentState.messageHistory)
+        idleChecked = true
+        // The provider's count for the latest response (input + output),
+        // from this run or the saved state. What was added since (tool
+        // results, a new message) is not guessed: the limit leaves 20% of
+        // the budget for it. No count yet (a new chat, right after a swap):
+        // no limit decision until the next response.
+        const baseline = currentAgentState.contextTokenBaseline
+        const contextTokens =
+          baseline && sameContextModel(baseline.model, agentTemplate.model)
+            ? baseline.tokens
+            : undefined
+        const overLimit =
+          contextTokens !== undefined &&
+          contextTokens > thresholdTokens &&
+          // The threshold is a convenience, the budget is not. When even a
+          // perfect compaction would land back near the threshold (a small
+          // BYOK window under a large fixed prompt and tool catalog), keep
+          // working until the hard budget instead.
+          (contextTokens > maxContextLength ||
+            automaticCompactionIsWorthwhile({
+              messages: currentAgentState.messageHistory,
+              maxContextLength,
+              thresholdTokens,
+              fixedTokenCount,
+              maxOutputTokens: compactionPolicy.maxOutputTokens,
+            }))
+        const trigger: CompactionTrigger | 'manual' | null = manualCompaction
+          ? 'manual'
+          : overLimit
+            ? idle
+              ? 'context_limit_and_cache_expiry'
+              : 'context_limit'
+            : idle
+              ? 'cache_expiry'
+              : null
+        const compacted = trigger
+          ? await compactWithSummary({
+              trigger,
+              thresholdTokens,
+              preTokens: contextTokens,
+            })
+          : false
+        // A manual request is a maintenance operation, never a coding turn.
+        if (manualCompaction) break
+        if (
+          !compacted &&
+          contextTokens !== undefined &&
+          contextTokens > maxContextLength
+        ) {
+          throw new Error(
+            compactionOverBudgetMessage({
+              maxContextLength,
+              byok: runId.startsWith(BYOK_RUN_ID_PREFIX),
+            }),
+          )
+        }
+      }
+
+      // 1. Run programmatic step first if it exists
+      let n: number | undefined = undefined
+
+      if (agentTemplate.handleSteps) {
+        const programmaticResult = await runProgrammaticStep({
+          ...params,
+
+          agentState: currentAgentState,
+          localAgentTemplates,
+          nResponses,
+          onCostCalculated: async (credits: number) => {
+            currentAgentState.creditsUsed += credits
+            currentAgentState.directCreditsUsed += credits
+          },
+          prompt: currentPrompt,
+          runId,
+          stepNumber: totalSteps,
+          stepsComplete: shouldEndTurn,
+          system,
+          tools,
+          template: agentTemplate,
+          toolCallParams: currentParams,
+        })
+        const {
+          agentState: programmaticAgentState,
+          endTurn,
+          stepNumber,
+          generateN,
+        } = programmaticResult
+        n = generateN
+
+        Object.assign(initialAgentState, programmaticAgentState)
+        currentAgentState = initialAgentState
+        totalSteps = stepNumber
+
+        shouldEndTurn = endTurn
+      }
+
+      // Check if output is required but missing
+      if (
+        agentTemplate.outputSchema &&
+        currentAgentState.output === undefined &&
+        shouldEndTurn &&
+        !hasRetriedOutputSchema
+      ) {
+        hasRetriedOutputSchema = true
+        logger.warn(
+          {
+            agentType,
+            agentId: currentAgentState.agentId,
+            runId,
+          },
+          'Agent finished without setting required output, restarting loop',
+        )
+
+        // Add system message instructing to use set_output
+        const outputSchemaMessage = withSystemTags(
+          `[freebuff product prompt text omitted]`,
+        )
+
+        currentAgentState.messageHistory = [
+          ...currentAgentState.messageHistory,
+          userMessage({
+            content: outputSchemaMessage,
+            keepDuringTruncation: true,
+          }),
+        ]
+
+        // Reset shouldEndTurn to continue the loop
+        shouldEndTurn = false
+      }
+
+      // One opportunity per invocation, only after concrete work. Keep normal
+      // step, spend, abort and deadline limits; never override a programmatic end.
+      if (
+        shouldEndTurn &&
+        agentTemplate.completionCheck &&
+        !agentTemplate.handleSteps &&
+        usedWorkTools &&
+        !hasCheckedCompletion &&
+        currentAgentState.stepsRemaining > 0 &&
+        (params.deadlineAt === undefined ||
+          !Number.isFinite(params.deadlineAt) ||
+          params.deadlineAt - Date.now() >= 120_000)
+      ) {
+        hasCheckedCompletion = true
+        // Require an actual answer, not just reasoning or end_turn.
+        if (
+          agentTemplate.outputMode === 'last_message' &&
+          typeof outputForParent(
+            getAgentOutput(currentAgentState, agentTemplate),
+          ) === 'string'
+        ) {
+          completionCheckpoint = [...currentAgentState.messageHistory]
+        }
+        currentAgentState.messageHistory.push(
+          userMessage({
+            content: withSystemTags(
+              "Final completion check: compare the actual deliverables with the user request: exact paths, interfaces, formats, correctness, and any performance requirements. If a necessary check or repair is missing, use the available tools to finish it. Verify the final edited files; rerun affected checks after repairs, but do not repeat passing checks when the relevant files have not changed. Preserve the tested command's exit status when filtering output (for example, Bash pipefail or explicit status capture); a successful output filter is not a passing test. Fix causes rather than skipping tests, weakening assertions, swallowing errors, or adding type/lint suppressions just to pass. If changing a check is required by the requested behavior, explain why and verify that behavior. Respect permission boundaries, refusals, and requests to stop; if awaiting user input or genuinely blocked, report that and end. Otherwise give a concise final answer stating what was verified, which checks failed or could not run, and any remaining limitations.",
+            ),
+          }),
+        )
+        shouldEndTurn = false
+      }
+
+      // End turn if programmatic step ended turn, or if the previous runAgentStep ended turn
+      if (shouldEndTurn) {
+        break
+      }
+
+      if (
+        params.deadlineAt !== undefined &&
+        Number.isFinite(params.deadlineAt)
+      ) {
+        const seconds = Math.max(
+          0,
+          Math.ceil((params.deadlineAt - Date.now()) / 1000),
+        )
+        const level = seconds <= 60 ? 3 : seconds <= 300 ? 2 : 1
+        if (level > deadlineReminderLevel) {
+          deadlineReminderLevel = level
+          currentAgentState.messageHistory.push(
+            userMessage({
+              content: withSystemTags(
+                `Time budget: approximately ${seconds} seconds remain before the host deadline. Prioritize saving usable deliverables and checking the required contract. Avoid optional exploration or starting work that cannot finish in time.`,
+              ),
+            }),
+          )
+        }
+      }
+
+      const creditsBefore = currentAgentState.directCreditsUsed
+      const childrenBefore = currentAgentState.childRunIds.length
+      stepUsageTokens = undefined
+      llmStepNumber++
+      const appliedCompaction = currentAgentState.pendingCompactionTelemetry
+      // Consume at dispatch, not on success: retries belong to this logical
+      // first request too. A manual /compact carries it to the next turn.
+      delete currentAgentState.pendingCompactionTelemetry
+      const {
+        agentState: newAgentState,
+        shouldEndTurn: llmShouldEndTurn,
+        usedWorkTools: stepUsedWorkTools,
+        messageId,
+        nResponses: generatedResponses,
+      } = await runAgentStep({
+        ...params,
+
+        onAgentUsageReceived: (usage) => {
+          // Spawned agents report through the same callback.
+          if (usage.agentId === initialAgentState.agentId)
+            stepUsageTokens = usage.inputTokens + usage.outputTokens
+          params.onAgentUsageReceived?.(usage)
+        },
+        agentState: currentAgentState,
+        agentTemplate,
+        extraCodebuffMetadata: {
+          ...runMetadata,
+          compaction_request_id: crypto.randomUUID(),
+          compaction_request_group: appliedCompaction
+            ? 'first_after_compaction'
+            : 'other',
+          ...(appliedCompaction
+            ? {
+                compaction_id: appliedCompaction.id,
+                ...(appliedCompaction.summaryId
+                  ? { compaction_summary_id: appliedCompaction.summaryId }
+                  : {}),
+                compaction_trigger: appliedCompaction.trigger,
+              }
+            : {}),
+          llm_step_number: String(llmStepNumber),
+        },
+        n,
+        prompt: currentPrompt,
+        runId,
+        spawnParams: currentParams,
+        system,
+        tools,
+        additionalToolDefinitions: additionalToolDefinitionsWithCache,
+        onResponseChunk: (chunk) => {
+          if (
+            !firstOutputLogged &&
+            !initialAgentState.parentId &&
+            (typeof chunk === 'string'
+              ? chunk.trim().length > 0
+              : chunk.type === 'reasoning_delta' &&
+                chunk.agentId === initialAgentState.agentId &&
+                chunk.text.length > 0)
+          ) {
+            firstOutputLogged = true
+            try {
+              logger.info(
+                {
+                  axiomEvent: COMPACTION_FIRST_OUTPUT_EVENT,
+                  ...telemetry,
+                  agent_run_id: runId,
+                  model: agentTemplate.model,
+                  idle_return: idleAtStart,
+                  duration_ms: Date.now() - loopStarted,
+                },
+                'Runtime first output',
+              )
+            } catch {
+              /* Telemetry must not fail output delivery. */
+            }
+          }
+          // tool_call is emitted before execution, including custom tools.
+          // Conservatively refuse fallback even for a read-only tool or an
+          // error event: either may have uncovered a failed verification.
+          if (
+            typeof chunk === 'string'
+              ? chunk.trim().length > 0
+              : chunk.type !== 'reasoning_delta' && chunk.type !== 'start'
+          ) {
+            completionCheckpoint = undefined
+          }
+          return params.onResponseChunk(chunk)
+        },
+      }).catch((error: unknown) => {
+        const { statusCode, errorCode } = extractApiErrorDetails(error)
+        const transient =
+          statusCode === 408 ||
+          (statusCode !== undefined && statusCode >= 500 && statusCode < 600) ||
+          ((statusCode === undefined || statusCode === 200) &&
+            (errorCode === 'flex_unavailable' ||
+              errorCode === 'resource_unavailable' ||
+              isTransientNetworkError(error) ||
+              isFetchIdleTimeoutError(error)))
+        // In particular, 429 can be the final per-turn spend limit, not a
+        // provider outage. Leave quota/payment/access refusals to the caller.
+        if (
+          !completionCheckpoint ||
+          !transient ||
+          signal.aborted ||
+          isAbortError(error)
+        ) {
+          throw error
+        }
+
+        const notice =
+          '\n\nThe additional completion check could not finish because the model request failed. The preceding result is preserved; no additional verification was completed.'
+        currentAgentState.messageHistory = [
+          ...completionCheckpoint,
+          assistantMessage(notice),
+        ]
+        currentAgentState.stepsRemaining--
+        logger.warn(
+          {
+            metric: 'completion_check_unavailable',
+            agentId: currentAgentState.agentId,
+            runId,
+            statusCode,
+            errorCode,
+          },
+          'Preserving completed answer after optional verification transport failure',
+        )
+        params.onResponseChunk(notice)
+        return {
+          agentState: currentAgentState,
+          shouldEndTurn: true,
+          usedWorkTools: false,
+          messageId: null,
+          nResponses: undefined,
+        }
+      })
+      completionCheckpoint = undefined
+
+      if (newAgentState.runId) {
+        await addAgentStep({
+          ...params,
+          agentRunId: newAgentState.runId,
+          stepNumber: totalSteps,
+          credits: newAgentState.directCreditsUsed - creditsBefore,
+          childRunIds: newAgentState.childRunIds.slice(childrenBefore),
+          messageId,
+          status: 'completed',
+          startTime,
+        })
+      } else {
+        logger.error('No runId found for agent state after finishing agent run')
+      }
+
+      Object.assign(initialAgentState, newAgentState)
+      currentAgentState = initialAgentState
+      shouldEndTurn = llmShouldEndTurn
+      // The first size the provider reports after a swap is where the next
+      // summary's growth is measured from. The swap may have been in an
+      // earlier run (manual /compact ends its run right after it).
+      if (
+        stepUsageTokens !== undefined &&
+        currentAgentState.compactionSummary &&
+        currentAgentState.compactionSummary.contextTokens === undefined
+      ) {
+        currentAgentState.compactionSummary = {
+          ...currentAgentState.compactionSummary,
+          contextTokens: stepUsageTokens,
+        }
+        summaries.replace(currentAgentState.compactionSummary)
+      }
+      // After the response: the size is the provider's count, and the
+      // request just warmed the cache.
+      if (!shouldEndTurn)
+        startSummaryIfDue(
+          true,
+          countTokens(system) + countTokensJson(toolsForTokenCount),
+        )
+      usedWorkTools ||= stepUsedWorkTools ?? false
+      nResponses = generatedResponses
+
+      currentPrompt = undefined
+      currentParams = undefined
+
+      // Steering: if the host fed user messages while this step ran, append them
+      // now (the step's LLM call + tools have completed, so history is in a clean
+      // state) and keep the turn going so the agent responds to them next step,
+      // rather than waiting for the whole turn to finish. Each message is
+      // framed as sent mid-turn: bare, the model read it as the whole new
+      // request and dropped the one it was working on.
+      const steered = await params.drainSteeringMessages?.()
+      if (steered?.length) {
+        const messages = steered.map((message) =>
+          userMessage({
+            content: frameSteeringContent(
+              typeof message === 'string'
+                ? buildUserMessageContent(message, undefined)
+                : buildUserMessageContent(
+                    message.prompt,
+                    undefined,
+                    message.content,
+                  ),
+            ),
+            tags: ['USER_PROMPT'],
+            keepDuringTruncation: true,
+          }),
+        )
+        assertUserContentSize(messages, agentTemplate)
+        currentAgentState.messageHistory = [
+          ...currentAgentState.messageHistory,
+          ...messages,
+        ]
+        shouldEndTurn = false
+      }
+    }
+
+    const projectProfileReport =
+      offersProjectProfile &&
+      !manualCompaction &&
+      params.getProjectProfile &&
+      params.reportProjectProfile
+        ? runProjectProfileReport({
+            history: dropUnansweredToolCalls(currentAgentState.messageHistory),
+            getProjectProfile: params.getProjectProfile,
+            reportProjectProfile: params.reportProjectProfile,
+            stream: (messages, reportSignal) =>
+              getAgentStreamFromTemplate({
+                ...params,
+                agentId: undefined,
+                template: agentTemplate,
+                runId,
+                messages: [systemMessage(system), ...messages],
+                tools,
+                toolChoice: 'required',
+                includeCacheControl: supportsCacheControl(agentTemplate.model),
+                signal: reportSignal,
+                extraCodebuffMetadata: {
+                  ...runMetadata,
+                  compaction_request_id: crypto.randomUUID(),
+                  compaction_request_group: 'other',
+                  llm_step_number: String(llmStepNumber + 1),
+                },
+                onCostCalculated: async () => {},
+              }),
+            logger,
+          })
+        : undefined
+
+    if (clearUserPromptMessagesAfterResponse) {
+      currentAgentState.messageHistory = expireMessages(
+        currentAgentState.messageHistory,
+        'userPrompt',
+      )
+    }
+
+    recountContextTokensForTurnEnd()
+
+    if (agentTemplate.compactContext && !manualCompaction) {
+      // The last step's response warmed the cache, and the user may not
+      // come back before it expires: the summary is ready for that return.
+      startSummaryIfDue(
+        false,
+        countTokens(system) + countTokensJson(toolsForTokenCount),
+      )
+      currentAgentState.compactionSummary = summaries.latest(
+        currentAgentState.compactionSummary,
+        currentAgentState.messageHistory,
+      )
+    }
+
+    const finishCompletedRun = () =>
+      finishAgentRun({
+        ...params,
+        runId,
+        status: 'completed',
+        totalSteps,
+        directCredits: currentAgentState.directCreditsUsed,
+        totalCredits: currentAgentState.creditsUsed,
+      })
+    const background = [
+      ...(projectProfileReport ? [projectProfileReport] : []),
+      ...runSummaries,
+    ]
+    if (background.length) {
+      void Promise.allSettled(background).then(finishCompletedRun)
+    } else {
+      await finishCompletedRun()
+    }
+
+    return {
+      agentState: currentAgentState,
+      output: manualCompaction
+        ? { type: 'lastMessage', value: [] }
+        : getAgentOutput(currentAgentState, agentTemplate),
+    }
+  } catch (error) {
+    // Handle user-initiated aborts separately - don't log as errors.
+    //
+    // `signal.aborted` catches the aborts `isAbortError` cannot see: a caller
+    // deadline (`AbortSignal.timeout`) rejects the fetch with a DOMException
+    // named `TimeoutError`, not `AbortError`, and that name is exactly what
+    // `isFetchIdleTimeoutError` matches below. Without this, a 20-second title
+    // deadline was reported as "no data was received from the server for 5
+    // minutes". Once the caller's own signal has fired, whatever the stream
+    // threw is the consequence of that cancellation.
+    if (isAbortError(error) || signal.aborted) {
+      if (clearUserPromptMessagesAfterResponse) {
+        currentAgentState.messageHistory = expireMessages(
+          currentAgentState.messageHistory,
+          'userPrompt',
+        )
+      }
+
+      currentAgentState.messageHistory = [
+        ...currentAgentState.messageHistory,
+        userMessage(
+          withSystemTags(
+            "User interrupted the response. The assistant's previous work has been preserved.",
+          ),
+        ),
+      ]
+
+      logger.info(
+        {
+          agentType,
+          agentId: currentAgentState.agentId,
+          runId,
+          totalSteps,
+          messageHistory: currentAgentState.messageHistory,
+        },
+        'Agent run cancelled by user (abort error)',
+      )
+
+      // Same reason as the success path, and it matters more here: the branch
+      // above just appended another message to the history the caller keeps.
+      // Not the last edit, though — the SDK's buildCancelledSessionState drops
+      // unanswered tool calls and appends again at the persistence boundary,
+      // and carries this count across those edits itself.
+      recountContextTokensForTurnEnd()
+
+      await finishAgentRun({
+        ...params,
+        runId,
+        status: 'cancelled',
+        totalSteps,
+        directCredits: currentAgentState.directCreditsUsed,
+        totalCredits: currentAgentState.creditsUsed,
+      })
+
+      return {
+        agentState: currentAgentState,
+        output: {
+          type: 'error',
+          message: 'Run cancelled by user',
+        },
+      }
+    }
+
+    logger.error(
+      {
+        error: getErrorObject(error),
+        agentType,
+        agentId: currentAgentState.agentId,
+        runId,
+        totalSteps,
+        directCreditsUsed: currentAgentState.directCreditsUsed,
+        creditsUsed: currentAgentState.creditsUsed,
+        messageCount: currentAgentState.messageHistory.length,
+        systemPromptChars: system.length,
+      },
+      'Agent execution failed',
+    )
+
+    const apiErrorDetails = extractApiErrorDetails(error)
+    const isIdleTimeout = isFetchIdleTimeoutError(error)
+    const isNetworkError = !isIdleTimeout && isTransientNetworkError(error)
+    const isModelLoop =
+      error instanceof TodoLoopError || error instanceof FileEditLoopError
+    const hasServerMessage = apiErrorDetails.message !== undefined
+    let fallbackMessage: string
+    if (isModelLoop) {
+      fallbackMessage = error.message
+    } else if (isIdleTimeout) {
+      fallbackMessage = FETCH_IDLE_TIMEOUT_USER_MESSAGE
+    } else if (isNetworkError) {
+      fallbackMessage = TRANSIENT_NETWORK_ERROR_USER_MESSAGE
+    } else if (error instanceof Error) {
+      const includeStack =
+        apiErrorDetails.statusCode === undefined && error.stack
+      fallbackMessage =
+        error.message + (includeStack ? `\n\n${error.stack}` : '')
+    } else {
+      fallbackMessage = String(error)
+    }
+    const errorMessage = apiErrorDetails.message ?? fallbackMessage
+    const statusCode = apiErrorDetails.statusCode
+
+    const status = signal.aborted ? 'cancelled' : 'failed'
+    // A refused message is not kept: the next turn would send it anyway.
+    const refused =
+      error instanceof UserContentTooLargeError ? error.refused : undefined
+    if (refused)
+      currentAgentState.messageHistory =
+        currentAgentState.messageHistory.filter((m) => !refused.includes(m))
+    // End the failed turn in the root's history, as a cancellation is ended
+    // above: left bare, its prompt joins the next one in the live request
+    // that compaction keeps verbatim. A 402 propagates; the SDK ends it.
+    if (!initialAgentState.parentId && statusCode !== 402) {
+      currentAgentState.messageHistory = [
+        ...currentAgentState.messageHistory,
+        userMessage(
+          withSystemTags(refused ? USER_PROMPT_REFUSED_NOTE : TURN_FAILED_NOTE),
+        ),
+      ]
+    }
+    // A failed turn still leaves history behind, and the host still shows the
+    // user a context reading before their next message.
+    recountContextTokensForTurnEnd()
+    await finishAgentRun({
+      ...params,
+      runId,
+      status,
+      totalSteps,
+      directCredits: currentAgentState.directCreditsUsed,
+      totalCredits: currentAgentState.creditsUsed,
+      errorMessage,
+    })
+
+    // Payment required errors (402) should propagate
+    if (statusCode === 402) {
+      throw error
+    }
+
+    return {
+      agentState: currentAgentState,
+      output: {
+        type: 'error',
+        message:
+          hasServerMessage || isIdleTimeout || isNetworkError || isModelLoop
+            ? errorMessage
+            : 'Agent run error: ' + errorMessage,
+        ...(statusCode !== undefined && { statusCode }),
+        ...(apiErrorDetails.errorCode !== undefined && {
+          error: apiErrorDetails.errorCode,
+        }),
+        ...(apiErrorDetails.countryCode !== undefined && {
+          countryCode: apiErrorDetails.countryCode,
+        }),
+        ...(apiErrorDetails.countryBlockReason !== undefined && {
+          countryBlockReason: apiErrorDetails.countryBlockReason,
+        }),
+        ...(apiErrorDetails.ipPrivacySignals !== undefined && {
+          ipPrivacySignals: apiErrorDetails.ipPrivacySignals,
+        }),
+      },
+    }
+  } finally {
+    if (compactionWindow)
+      closeCompactionWindow({
+        window: compactionWindow,
+        messages: currentAgentState.messageHistory,
+        endedBy: 'run_end',
+        logger,
+        runId,
+        model: agentTemplate.model,
+      })
+    // The endTurn path inside runProgrammaticStep handles normal completion,
+    // but abort/error exits (e.g. chat SSE disconnects) would otherwise leak
+    // the run's generator, STEP_ALL flag, and proposed file content forever.
+    clearProgrammaticRunState(runId)
+  }
+}
+
+const STEP_WARNING_MESSAGE = [
+  "I've made quite a few responses in a row.",
+  "Let me pause here to make sure we're still on the right track.",
+  "Please let me know if you'd like me to continue or if you'd like to guide me in a different direction.",
+].join(' ')
+```
+- packages/agent-runtime/src/util/simplify-tool-results.ts (218 lines):
+```
+import { getErrorObject } from '@codebuff/common/util/error'
+import { cloneDeep, isEqual } from 'lodash'
+
+import type {
+  CodebuffToolMessage,
+  CodebuffToolOutput,
+} from '@codebuff/common/tools/list'
+import type { Logger } from '@codebuff/common/types/contracts/logger'
+import type {
+  Message,
+  ToolMessage,
+} from '@codebuff/common/types/messages/codebuff-message'
+
+export function simplifyReadFileResults(
+  messageContent: CodebuffToolOutput<'read_files'>,
+): CodebuffToolOutput<'read_files'> {
+  return [
+    {
+      type: 'json',
+      value: cloneDeep(messageContent[0]).value.map(({ path }) => {
+        return {
+          path,
+          contentOmittedForLength: true,
+        }
+      }),
+    },
+  ]
+}
+
+export function simplifyTerminalCommandResults(params: {
+  messageContent: CodebuffToolOutput<'run_terminal_command'>
+  logger: Logger
+}): CodebuffToolOutput<'run_terminal_command'> {
+  const { messageContent, logger } = params
+  try {
+    const clone = cloneDeep(messageContent)
+    const content = clone[0].value
+    if ('processId' in content || 'errorMessage' in content) {
+      return clone
+    }
+    const { command, message, exitCode } = content
+    return [
+      {
+        type: 'json',
+        value: {
+          command,
+          ...(message && { message }),
+          stdoutOmittedForLength: true,
+          ...(exitCode !== undefined && { exitCode }),
+        },
+      },
+    ]
+  } catch (error) {
+    logger.error(
+      { error: getErrorObject(error), messageContent },
+      'Error simplifying terminal command results',
+    )
+    return [
+      {
+        type: 'json',
+        value: {
+          command: '',
+          stdoutOmittedForLength: true,
+        },
+      },
+    ]
+  }
+}
+
+/**
+ * simplifyReadFileResults assumes content[0] is the json file list. Real
+ * histories can also carry media parts (images read as files); never feed
+ * those to the simplifier.
+ */
+function readFilesContentSimplifiable(
+  content: CodebuffToolOutput<'read_files'>,
+): boolean {
+  const first = content[0]
+  return (
+    first?.type === 'json' &&
+    Array.isArray((first as { value?: unknown }).value)
+  )
+}
+
+// Number of terminal command outputs to keep in full form before simplifying.
+// Scanned from the newest message backwards; the per-stub baseline matches
+// simplifyTerminalHelper in util/messages.ts (background-process and error
+// results simplify to themselves and stay outside the keep budget).
+const numTerminalCommandsToKeep = 5
+
+// Number of read_files results to keep verbatim, newest first. Matches the
+// terminal-command convention (newest K verbatim, rest stubbed), with a
+// smaller window: the read-path stub retains every path, and an omitted read
+// can be re-read exactly with offset/limit, whereas a stubbed command cannot
+// be repeated safely.
+const numReadFileResultsToKeep = 3
+
+// Only apply the pass once the past-window results it would stub carry real
+// volume. Stubbing trades content for tokens on every later step: worth it
+// when a long session would otherwise re-send hundreds of kilobytes, not when
+// the savings are one modest result and the model may still want what it read
+// a moment ago. On overflow a verbatim result also keeps fitToolResults'
+// graded prefix-clip available, while a stub has nothing left to clip.
+const minSavingsCharsToSimplify = 20_000
+
+/** Approximate serialized size of a result without copying it. */
+function contentChars(content: unknown[]): number {
+  return JSON.stringify(content).length
+}
+
+/**
+ * Replaces read_files and run_terminal_command results older than the newest
+ * few with the omit stubs ({ contentOmittedForLength: true } /
+ * { stdoutOmittedForLength: true }) that getPreviouslyReadFiles and the
+ * re-read hints already understand, so a long session stops re-sending stale
+ * multi-kilobyte outputs on every step until compaction.
+ *
+ * Pure copy-on-write: messages left alone keep reference identity, and the
+ * input array itself (same reference) is returned when nothing needed
+ * stubbing, so callers that detect history extension by === or
+ * every((m, i) => history[i] === m) see exactly the edits made here. Nothing
+ * from a caller's in-flight step should be included in `messages`.
+ */
+export function simplifyOldToolResults(params: {
+  messages: Message[]
+  numTerminalCommands?: number
+  numReadFileResults?: number
+  logger: Logger
+}): Message[] {
+  const { messages, logger } = params
+  const numTerminalCommands =
+    params.numTerminalCommands ?? numTerminalCommandsToKeep
+  const numReadFileResults =
+    params.numReadFileResults ?? numReadFileResultsToKeep
+
+  const stub = (
+    message: ToolMessage,
+  ):
+    | { kind: 'run_terminal_command'; stubbed: ToolMessage }
+    | { kind: 'read_files'; stubbed: ToolMessage }
+    | undefined => {
+    if (message.toolName === 'run_terminal_command') {
+      const content = (message as CodebuffToolMessage<'run_terminal_command'>)
+        .content
+      try {
+        const stubbed = simplifyTerminalCommandResults({
+          messageContent: content,
+          logger,
+        })
+        // Already stubbed, or a background/error result the simplifier keeps
+        // verbatim (matching simplifyTerminalHelper in util/messages.ts).
+        return isEqual(stubbed, content)
+          ? undefined
+          : {
+              kind: 'run_terminal_command',
+              stubbed: { ...message, content: stubbed },
+            }
+      } catch (error) {
+        logger.error(
+          { error: getErrorObject(error), message },
+          'Error simplifying old tool result; keeping it verbatim',
+        )
+        return undefined
+      }
+    }
+    if (message.toolName === 'read_files') {
+      const content = (message as CodebuffToolMessage<'read_files'>).content
+      if (!readFilesContentSimplifiable(content)) return undefined
+      try {
+        const stubbed = simplifyReadFileResults(content)
+        // Already stubbed (nothing carries it either way).
+        return isEqual(stubbed, content)
+          ? undefined
+          : { kind: 'read_files', stubbed: { ...message, content: stubbed } }
+      } catch (error) {
+        logger.error(
+          { error: getErrorObject(error), message },
+          'Error simplifying old tool result; keeping it verbatim',
+        )
+        return undefined
+      }
+    }
+    return undefined
+  }
+
+  // The newest few results of each kind stay verbatim; everything older is
+  // stubbed. First measure what the pass would save, and bail out whole when
+  // the past-window volume is below minSavingsCharsToSimplify (the quality
+  // floor above).
+  let terminalKept = 0
+  let readKept = 0
+  let savings = 0
+  const candidates = new Map<Message, NonNullable<ReturnType<typeof stub>>>()
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i]
+    if (message.role !== 'tool') continue
+    const candidate = stub(message)
+    if (!candidate) continue
+    if (candidate.kind === 'run_terminal_command') {
+      if (terminalKept < numTerminalCommands) {
+        terminalKept++
+        continue
+      }
+    } else if (readKept < numReadFileResults) {
+      readKept++
+      continue
+    }
+    candidates.set(message, candidate)
+    savings +=
+      contentChars(message.content) - contentChars(candidate.stubbed.content)
+  }
+  if (candidates.size === 0 || savings < minSavingsCharsToSimplify) {
+    return messages
+  }
+
+  return messages.map((message) => candidates.get(message)?.stubbed ?? message)
+}
+```
+
+The change itself. Lockfiles and test-only hunks are already stripped; the full diff is on GitHub.
+```diff
+diff --git a/packages/agent-runtime/src/run-agent-step.ts b/packages/agent-runtime/src/run-agent-step.ts
+index 5863bc99c..0f10e8dcb 100644
+--- a/packages/agent-runtime/src/run-agent-step.ts
++++ b/packages/agent-runtime/src/run-agent-step.ts
+@@ -123,50 +123,51 @@ import { getAgentPrompt } from './templates/strings'
+ import { getToolSet } from './tools/prompts'
+ import { processStream } from './tools/stream-parser'
+ import { getAgentOutput, outputForParent } from './util/agent-output'
+ import {
+   createCacheDebugSnapshot,
+   enrichCacheDebugSnapshotWithProviderRequest,
+   enrichCacheDebugSnapshotWithUsage,
+ } from './util/cache-debug'
+ import {
+   withSystemInstructionTags,
+   withSystemTags as withSystemTags,
+   buildUserMessageContent,
+   expireMessages,
+   frameSteeringContent,
+ } from './util/messages'
+ import {
+   estimateContextTokens,
+   recordContextUsage,
+   recountContextTokens,
+   sameContextModel,
+ } from './util/context-token-count'
+ import {
+   assertUserContentSize,
+   UserContentTooLargeError,
+ } from './util/context-size-guard'
++import { simplifyOldToolResults } from './util/simplify-tool-results'
+ import {
+   countTokens,
+   countTokensJson,
+   countTokensMessages,
+ } from './util/token-counter'
+ 
+ import type { AgentTemplate } from '@codebuff/common/types/agent-template'
+ import type { TrackEventFn } from '@codebuff/common/types/contracts/analytics'
+ import type {
+   AddAgentStepFn,
+   FinishAgentRunFn,
+   StartAgentRunFn,
+ } from '@codebuff/common/types/contracts/database'
+ import type {
+   AgentUsageData,
+   CacheDebugUsageData,
+   ContextCompactionData,
+   ModelUsageData,
+   PromptAiSdkFn,
+ } from '@codebuff/common/types/contracts/llm'
+ import type { Logger } from '@codebuff/common/types/contracts/logger'
+ import type { TraceWriter } from '@codebuff/common/types/contracts/trace'
+ import type { ParamsExcluding } from '@codebuff/common/types/function-params'
+ import type {
+   Message,
+@@ -362,105 +363,116 @@ export const runAgentStep = async (
+     }
+     return {
+       agentState,
+       fullResponse: STEP_WARNING_MESSAGE,
+       shouldEndTurn: true,
+       messageId: null,
+     }
+   }
+ 
+   const stepPrompt = await getAgentPrompt({
+     ...params,
+     agentTemplate,
+     promptType: { type: 'stepPrompt' },
+     fileContext,
+     agentState,
+     agentTemplates: localAgentTemplates,
+     logger,
+     additionalToolDefinitions,
+   })
+ 
+   // An interrupted turn can leave a tool call with no result behind, which
+   // strict providers (DeepSeek) reject with a 400. Since history is persisted
+   // and replayed, that one orphan would fail every later turn, so drop it here
+   // — the single point every step's request is built — and assign the cleaned
+   // history back so the checkpointed state is valid too.
+-  const history = dropUnansweredToolCalls(
+-    expireMessages(agentState.messageHistory, 'agentStep'),
+-  )
++  // In a long session, stub tool results older than the newest few with the
++  // omit shapes fitToolResults/getPreviouslyReadFiles already understand:
++  // read_files and terminal outputs up to 100k/50k chars otherwise stay
++  // verbatim in history and are re-sent on every request until compaction.
++  // The pass waits for real past-window volume (see simplifyOldToolResults),
++  // so a history that still fits the window comfortably keeps everything;
++  // the newest results and anything this step later appends are untouched,
++  // and unreplaced messages keep reference identity for the extension check
++  // below.
++  const history = simplifyOldToolResults({
++    messages: dropUnansweredToolCalls(
++      expireMessages(agentState.messageHistory, 'agentStep'),
++    ),
++    logger,
++  })
+ 
+   const agentMessagesUntruncated = buildArray<Message>(
+     ...history,
+ 
+     stepPrompt &&
+       userMessage({
+         content: stepPrompt,
+         tags: ['STEP_PROMPT'],
+ 
+         // James: Deprecate the below, only use tags, which are not prescriptive.
+         timeToLive: 'agentStep' as const,
+         keepDuringTruncation: true,
+       }),
+   )
+ 
+   agentState.messageHistory = agentMessagesUntruncated
+ 
+   const { model } = agentTemplate
+ 
+   // A step can start with the history ending on an assistant message — e.g. a
+   // continuation after a think-only response for an agent with no stepPrompt.
+   // Claude 4.6+ rejects such requests as unsupported assistant prefill, so end
+   // the conversation with a user message instead.
+   const lastMessage =
+     agentState.messageHistory[agentState.messageHistory.length - 1]
+   if (lastMessage?.role === 'assistant' && !supportsAssistantPrefill(model)) {
+     agentState.messageHistory = [
+       ...agentState.messageHistory,
+       userMessage({
+         content: withSystemTags('Continue from where you left off.'),
+         timeToLive: 'agentStep' as const,
+         keepDuringTruncation: true,
+       }),
+     ]
+   }
+ 
+   let stepCreditsUsed = 0
+ 
+   const onCostCalculated = async (credits: number) => {
+     stepCreditsUsed += credits
+     agentState.creditsUsed += credits
+     agentState.directCreditsUsed += credits
+   }
+ 
+   const iterationNum = agentState.messageHistory.length
+   // system is a plain string; count it directly rather than JSON-stringifying
+   // it (which would add quotes and escape every newline).
+   const systemTokens = countTokens(system)
+ 
+   let cacheDebugCorrelation:
+-    | ReturnType<typeof createCacheDebugSnapshot>
+-    | undefined
++    ReturnType<typeof createCacheDebugSnapshot> | undefined
+   if (CACHE_DEBUG_FULL_LOGGING) {
+     try {
+       cacheDebugCorrelation = createCacheDebugSnapshot({
+         agentType: String(agentType),
+         system,
+         toolDefinitions: params.tools
+           ? Object.fromEntries(
+               Object.entries(params.tools).map(([name, tool]) => [
+                 name,
+                 {
+                   description: tool.description,
+                   inputSchema: tool.inputSchema as {},
+                 },
+               ]),
+             )
+           : {},
+         messages: [systemMessage(system), ...agentState.messageHistory],
+         logger,
+         projectRoot: fileContext.projectRoot,
+         runId: agentState.runId,
+         userInputId,
+         agentStepId,
+         model,
+       })
+     } catch (err) {
+diff --git a/packages/agent-runtime/src/util/simplify-tool-results.ts b/packages/agent-runtime/src/util/simplify-tool-results.ts
+index 8ecd1458d..33709faa8 100644
+--- a/packages/agent-runtime/src/util/simplify-tool-results.ts
++++ b/packages/agent-runtime/src/util/simplify-tool-results.ts
+@@ -1,30 +1,37 @@
+ import { getErrorObject } from '@codebuff/common/util/error'
+-import { cloneDeep } from 'lodash'
++import { cloneDeep, isEqual } from 'lodash'
+ 
+-import type { CodebuffToolOutput } from '@codebuff/common/tools/list'
++import type {
++  CodebuffToolMessage,
++  CodebuffToolOutput,
++} from '@codebuff/common/tools/list'
+ import type { Logger } from '@codebuff/common/types/contracts/logger'
++import type {
++  Message,
++  ToolMessage,
++} from '@codebuff/common/types/messages/codebuff-message'
+ 
+ export function simplifyReadFileResults(
+   messageContent: CodebuffToolOutput<'read_files'>,
+ ): CodebuffToolOutput<'read_files'> {
+   return [
+     {
+       type: 'json',
+       value: cloneDeep(messageContent[0]).value.map(({ path }) => {
+         return {
+           path,
+           contentOmittedForLength: true,
+         }
+       }),
+     },
+   ]
+ }
+ 
+ export function simplifyTerminalCommandResults(params: {
+   messageContent: CodebuffToolOutput<'run_terminal_command'>
+   logger: Logger
+ }): CodebuffToolOutput<'run_terminal_command'> {
+   const { messageContent, logger } = params
+   try {
+     const clone = cloneDeep(messageContent)
+     const content = clone[0].value
+@@ -37,25 +44,174 @@ export function simplifyTerminalCommandResults(params: {
+         type: 'json',
+         value: {
+           command,
+           ...(message && { message }),
+           stdoutOmittedForLength: true,
+           ...(exitCode !== undefined && { exitCode }),
+         },
+       },
+     ]
+   } catch (error) {
+     logger.error(
+       { error: getErrorObject(error), messageContent },
+       'Error simplifying terminal command results',
+     )
+     return [
+       {
+         type: 'json',
+         value: {
+           command: '',
+           stdoutOmittedForLength: true,
+         },
+       },
+     ]
+   }
+ }
++
++/**
++ * simplifyReadFileResults assumes content[0] is the json file list. Real
++ * histories can also carry media parts (images read as files); never feed
++ * those to the simplifier.
++ */
++function readFilesContentSimplifiable(
++  content: CodebuffToolOutput<'read_files'>,
++): boolean {
++  const first = content[0]
++  return (
++    first?.type === 'json' &&
++    Array.isArray((first as { value?: unknown }).value)
++  )
++}
++
++// Number of terminal command outputs to keep in full form before simplifying.
++// Scanned from the newest message backwards; the per-stub baseline matches
++// simplifyTerminalHelper in util/messages.ts (background-process and error
++// results simplify to themselves and stay outside the keep budget).
++const numTerminalCommandsToKeep = 5
++
++// Number of read_files results to keep verbatim, newest first. Matches the
++// terminal-command convention (newest K verbatim, rest stubbed), with a
++// smaller window: the read-path stub retains every path, and an omitted read
++// can be re-read exactly with offset/limit, whereas a stubbed command cannot
++// be repeated safely.
++const numReadFileResultsToKeep = 3
++
++// Only apply the pass once the past-window results it would stub carry real
++// volume. Stubbing trades content for tokens on every later step: worth it
++// when a long session would otherwise re-send hundreds of kilobytes, not when
++// the savings are one modest result and the model may still want what it read
++// a moment ago. On overflow a verbatim result also keeps fitToolResults'
++// graded prefix-clip available, while a stub has nothing left to clip.
++const minSavingsCharsToSimplify = 20_000
++
++/** Approximate serialized size of a result without copying it. */
++function contentChars(content: unknown[]): number {
++  return JSON.stringify(content).length
++}
++
++/**
++ * Replaces read_files and run_terminal_command results older than the newest
++ * few with the omit stubs ({ contentOmittedForLength: true } /
++ * { stdoutOmittedForLength: true }) that getPreviouslyReadFiles and the
++ * re-read hints already understand, so a long session stops re-sending stale
++ * multi-kilobyte outputs on every step until compaction.
++ *
++ * Pure copy-on-write: messages left alone keep reference identity, and the
++ * input array itself (same reference) is returned when nothing needed
++ * stubbing, so callers that detect history extension by === or
++ * every((m, i) => history[i] === m) see exactly the edits made here. Nothing
++ * from a caller's in-flight step should be included in `messages`.
++ */
++export function simplifyOldToolResults(params: {
++  messages: Message[]
++  numTerminalCommands?: number
++  numReadFileResults?: number
++  logger: Logger
++}): Message[] {
++  const { messages, logger } = params
++  const numTerminalCommands =
++    params.numTerminalCommands ?? numTerminalCommandsToKeep
++  const numReadFileResults =
++    params.numReadFileResults ?? numReadFileResultsToKeep
++
++  const stub = (
++    message: ToolMessage,
++  ):
++    | { kind: 'run_terminal_command'; stubbed: ToolMessage }
++    | { kind: 'read_files'; stubbed: ToolMessage }
++    | undefined => {
++    if (message.toolName === 'run_terminal_command') {
++      const content = (message as CodebuffToolMessage<'run_terminal_command'>)
++        .content
++      try {
++        const stubbed = simplifyTerminalCommandResults({
++          messageContent: content,
++          logger,
++        })
++        // Already stubbed, or a background/error result the simplifier keeps
++        // verbatim (matching simplifyTerminalHelper in util/messages.ts).
++        return isEqual(stubbed, content)
++          ? undefined
++          : {
++              kind: 'run_terminal_command',
++              stubbed: { ...message, content: stubbed },
++            }
++      } catch (error) {
++        logger.error(
++          { error: getErrorObject(error), message },
++          'Error simplifying old tool result; keeping it verbatim',
++        )
++        return undefined
++      }
++    }
++    if (message.toolName === 'read_files') {
++      const content = (message as CodebuffToolMessage<'read_files'>).content
++      if (!readFilesContentSimplifiable(content)) return undefined
++      try {
++        const stubbed = simplifyReadFileResults(content)
++        // Already stubbed (nothing carries it either way).
++        return isEqual(stubbed, content)
++          ? undefined
++          : { kind: 'read_files', stubbed: { ...message, content: stubbed } }
++      } catch (error) {
++        logger.error(
++          { error: getErrorObject(error), message },
++          'Error simplifying old tool result; keeping it verbatim',
++        )
++        return undefined
++      }
++    }
++    return undefined
++  }
++
++  // The newest few results of each kind stay verbatim; everything older is
++  // stubbed. First measure what the pass would save, and bail out whole when
++  // the past-window volume is below minSavingsCharsToSimplify (the quality
++  // floor above).
++  let terminalKept = 0
++  let readKept = 0
++  let savings = 0
++  const candidates = new Map<Message, NonNullable<ReturnType<typeof stub>>>()
++  for (let i = messages.length - 1; i >= 0; i--) {
++    const message = messages[i]
++    if (message.role !== 'tool') continue
++    const candidate = stub(message)
++    if (!candidate) continue
++    if (candidate.kind === 'run_terminal_command') {
++      if (terminalKept < numTerminalCommands) {
++        terminalKept++
++        continue
++      }
++    } else if (readKept < numReadFileResults) {
++      readKept++
++      continue
++    }
++    candidates.set(message, candidate)
++    savings +=
++      contentChars(message.content) - contentChars(candidate.stubbed.content)
++  }
++  if (candidates.size === 0 || savings < minSavingsCharsToSimplify) {
++    return messages
++  }
++
++  return messages.map((message) => candidates.get(message)?.stubbed ?? message)
++}
+
+```
