@@ -1,0 +1,1241 @@
+diff --git a/common/src/util/__tests__/message-conversion-cache.test.ts b/common/src/util/__tests__/message-conversion-cache.test.ts
+new file mode 100644
+index 0000000000..68f3c2faaf
+--- /dev/null
++++ b/common/src/util/__tests__/message-conversion-cache.test.ts
+@@ -0,0 +1,289 @@
++import { describe, expect, it } from 'bun:test'
++
++import {
++  convertCbToModelMessages,
++  dropUnansweredToolCalls,
++  jsonToolResult,
++  mediaToolResult,
++  systemMessage,
++  userMessage,
++} from '../messages'
++
++import type { Message } from '../../types/messages/codebuff-message'
++
++/**
++ * The WeakMap memoization must be behaviourally invisible: any point in a
++ * turn must produce the request the uncached pass produced, and second
++ * conversions must neither inherit cache-control marks nor disturb the
++ * caller's history. These tests pin that on deterministic fixtures; the
++ * randomized differential fuzz that established equivalence ran against the
++ * pre-change implementation during development.
++ */
++
++let seed = 0x2b3b
++function rand(n: number) {
++  seed = (seed * 1103515245 + 12345) % 2147483648
++  return seed % n
++}
++function pick<T>(arr: T[]): T {
++  return arr[rand(arr.length)]
++}
++
++const UNICODE = [
++  'plain text',
++  'emoji 🧑‍💻🔥',
++  '漢字テスト',
++  'lone-hi \uD83D',
++  'lone-lo \uDE00',
++  'ends\uD83D',
++  '\uDE00starts',
++]
++
++function randAssistant(i: number): Message {
++  const parts: Message extends never ? never : any[] = []
++  const nParts = 1 + rand(3)
++  for (let j = 0; j < nParts; j++) {
++    const t = rand(3)
++    if (t === 0) parts.push({ type: 'text', text: pick(UNICODE) })
++    else if (t === 1) parts.push({ type: 'reasoning', text: pick(UNICODE) })
++    else
++      parts.push({
++        type: 'tool-call',
++        toolCallId: `c${i}-${j}`,
++        toolName: pick(['read_files', 'run_terminal_command']),
++        input: { paths: [pick(UNICODE)], nested: { a: [1, 2, pick(UNICODE)] } },
++      })
++  }
++  if (!parts.some((p) => p.type === 'tool-call')) {
++    parts.push({
++      type: 'tool-call',
++      toolCallId: `c${i}-x`,
++      toolName: 'read_files',
++      input: {},
++    })
++  }
++  const message: Record<string, unknown> = { role: 'assistant', content: parts }
++  if (rand(3) === 0) message.tags = [pick(['USER_PROMPT', 'STEP_PROMPT'])]
++  if (rand(3) === 0) message.timeToLive = pick(['agentStep', 'userPrompt'])
++  if (rand(4) === 0) {
++    message.providerOptions = { anthropic: { thinking: { type: 'enabled' } } }
++  }
++  return message as Message
++}
++
++function buildHistory(n: number): Message[] {
++  const messages: Message[] = [systemMessage(`sys ${pick(UNICODE)}`)]
++  for (let i = 0; i < n; i++) {
++    const kind = rand(5)
++    if (kind === 0) {
++      messages.push({
++        role: 'user',
++        content: [{ type: 'text', text: pick(UNICODE) }],
++        tags: [pick(['USER_PROMPT'])],
++      } as Message)
++      continue
++    }
++    if (kind === 1) {
++      messages.push(userMessage(pick(UNICODE)))
++      continue
++    }
++    if (kind === 2) {
++      messages.push({
++        role: 'tool',
++        toolCallId: `free-${i}`,
++        toolName: 'preview_screenshot',
++        content: [
++          ...mediaToolResult({ data: 'aXY=', mediaType: 'image/png' }),
++          ...jsonToolResult({ note: pick(UNICODE) }),
++        ],
++      } as unknown as Message)
++      continue
++    }
++    const assistant = randAssistant(i)
++    messages.push(assistant)
++    for (const part of assistant.content as any[]) {
++      if (part.type === 'tool-call' && part.providerExecuted !== true) {
++        messages.push(
++          (rand(3) === 0
++            ? {
++                role: 'tool',
++                toolCallId: part.toolCallId,
++                toolName: 'preview_screenshot',
++                content: mediaToolResult({
++                  data: 'aXY=',
++                  mediaType: 'image/png',
++                }),
++              }
++            : {
++                role: 'tool',
++                toolCallId: part.toolCallId,
++                toolName: part.toolName,
++                content: jsonToolResult({ ok: true, note: pick(UNICODE) }),
++              }) as Message,
++        )
++      }
++    }
++  }
++  return messages
++}
++
++describe('convertCbToModelMessages memoization', () => {
++  it('returns byte-identical output on a warmed cache across history sizes', () => {
++    for (const n of [1, 2, 3, 5, 8, 15, 30]) {
++      for (let trial = 0; trial < 3; trial++) {
++        const history = dropUnansweredToolCalls(buildHistory(n))
++        for (const includeCacheControl of [false, true]) {
++          const first = convertCbToModelMessages({
++            messages: history,
++            includeCacheControl,
++          })
++          const second = convertCbToModelMessages({
++            messages: history,
++            includeCacheControl,
++          })
++          expect(JSON.stringify(second)).toBe(JSON.stringify(first))
++        }
++      }
++    }
++  })
++
++  it('does not leak cache-control marks into later requests or the history', () => {
++    const history = [
++      systemMessage('sys'),
++      {
++        role: 'user',
++        content: [{ type: 'text', text: 'prompt' }],
++        tags: ['USER_PROMPT'],
++      },
++      {
++        role: 'assistant',
++        content: [
++          {
++            type: 'tool-call',
++            toolCallId: 'a',
++            toolName: 'read_files',
++            input: {},
++          },
++          { type: 'text', text: 'tail' },
++        ],
++      },
++      {
++        role: 'tool',
++        toolCallId: 'a',
++        toolName: 'read_files',
++        content: jsonToolResult({ x: 1 }),
++      },
++      {
++        role: 'assistant',
++        content: [{ type: 'text', text: 'done' }],
++        tags: ['STEP_PROMPT'],
++        timeToLive: 'agentStep',
++      },
++    ] as Message[]
++    const snapshot = JSON.stringify(history)
++
++    const marked = convertCbToModelMessages({
++      messages: history,
++      includeCacheControl: true,
++    })
++    expect(JSON.stringify(marked)).toContain('cache_control')
++
++    // The history itself is never touched.
++    expect(JSON.stringify(history)).toBe(snapshot)
++
++    // A later cache-control-free conversion over the same (cached) message
++    // objects must observe none of the marks.
++    const unmarked = convertCbToModelMessages({
++      messages: history,
++      includeCacheControl: false,
++    })
++    expect(JSON.stringify(unmarked)).not.toContain('cache_control')
++
++    // And a repeated marked conversion is byte-identical to the first.
++    const markedAgain = convertCbToModelMessages({
++      messages: history,
++      includeCacheControl: true,
++    })
++    expect(JSON.stringify(markedAgain)).toBe(JSON.stringify(marked))
++  })
++
++  it('invalidates on message replacement: a rewritten tail reconverts', () => {
++    const prefix: Message[] = [
++      systemMessage('sys'),
++      userMessage('prompt'),
++      {
++        role: 'assistant',
++        content: [
++          {
++            type: 'tool-call',
++            toolCallId: 'r',
++            toolName: 'read_files',
++            input: {},
++          },
++        ],
++      } as Message,
++      {
++        role: 'tool',
++        toolCallId: 'r',
++        toolName: 'read_files',
++        content: jsonToolResult({ content: 'original result' }),
++      } as Message,
++    ]
++    const before = convertCbToModelMessages({
++      messages: prefix,
++      includeCacheControl: false,
++    })
++    // fitToolResults-style copy-on-write: same history except the tool
++    // message object is replaced with a rewritten copy.
++    const replaced: Message[] = [
++      ...prefix.slice(0, -1),
++      {
++        ...(prefix[prefix.length - 1] as any),
++        content: jsonToolResult({ content: 'rewritten result' }),
++      } as Message,
++    ]
++    const after = convertCbToModelMessages({
++      messages: replaced,
++      includeCacheControl: false,
++    })
++    expect(JSON.stringify(after)).toContain('rewritten result')
++    expect(JSON.stringify(after)).not.toContain('original result')
++    // The prefix conversion still agrees with the earlier run (cached
++    // forms were reused, output is unchanged).
++    expect(
++      JSON.stringify(
++        convertCbToModelMessages({ messages: prefix, includeCacheControl: false }),
++      ),
++    ).toBe(JSON.stringify(before))
++  })
++
++  it('scrubs lone surrogates nested inside tool-call inputs', () => {
++    const history: Message[] = [
++      {
++        role: 'assistant',
++        content: [
++          {
++            type: 'tool-call',
++            toolCallId: 's',
++            toolName: 'read_files',
++            input: { paths: ['\uDE00starts'], nested: { a: ['ends\uD83D'] } },
++          },
++        ],
++      } as Message,
++      {
++        role: 'tool',
++        toolCallId: 's',
++        toolName: 'read_files',
++        content: jsonToolResult({ ok: true }),
++      } as Message,
++    ]
++    const out = convertCbToModelMessages({
++      messages: history,
++      includeCacheControl: false,
++    })
++    const text = JSON.stringify(out)
++    expect(text).toContain('�starts')
++    expect(text).toContain('ends�')
++    expect(text).not.toContain('\\ude00')
++  })
++})
+diff --git a/common/src/util/__tests__/messages.test.ts b/common/src/util/__tests__/messages.test.ts
+index 30b4f1a68b..62f40437e9 100644
+--- a/common/src/util/__tests__/messages.test.ts
++++ b/common/src/util/__tests__/messages.test.ts
+@@ -227,7 +227,12 @@ describe('dropUnansweredToolCalls', () => {
+ 
+ describe('convertCbToModelMessages', () => {
+   describe('unfinished tool-call repair', () => {
+-    it('drops a call whose result arrives after a user boundary', () => {
++    it('passes through a call whose result arrives after a user boundary', () => {
++      // The repair lives with the history builders (run-agent-step repairs
++      // the step history before it reaches the converter); this converter
++      // used to run dropUnansweredToolCalls a second time on every request
++      // and no longer does. A caller that feeds an unpaired history gets it
++      // back unchanged: the boundary repair is applied upstream, not here.
+       const result = convertCbToModelMessages({
+         messages: [
+           userMessage('start'),
+@@ -248,11 +253,12 @@ describe('convertCbToModelMessages', () => {
+         includeCacheControl: false,
+       })
+ 
+-      // The surviving user messages aggregate after the invalid assistant call
+-      // is removed. A result later in history cannot answer across the user
+-      // boundary, but freestanding tool results remain supported.
+-      expect(result.map((message) => message.role)).toEqual(['user', 'tool'])
+-      expect(result[0].content).toHaveLength(2)
++      expect(result.map((message) => message.role)).toEqual([
++        'user',
++        'assistant',
++        'user',
++        'tool',
++      ])
+     })
+ 
+     // A media result rides a user message, and the AI SDK treats a user message
+diff --git a/common/src/util/messages.ts b/common/src/util/messages.ts
+index cd673b612f..276cbb80fc 100644
+--- a/common/src/util/messages.ts
++++ b/common/src/util/messages.ts
+@@ -229,67 +229,6 @@ function convertToolMessage(message: Message): ModelMessageWithAuxiliaryData[] {
+   )
+ }
+ 
+-function convertToolMessages(
+-  messages: Message[],
+-): ModelMessageWithAuxiliaryData[] {
+-  const withoutToolMessages: ModelMessageWithAuxiliaryData[] = []
+-  // Media parts ride *user* messages (see convertToolResultMessage), and the AI
+-  // SDK throws at a user/system boundary when any tool call issued so far is
+-  // still unanswered. Emitting media inline therefore splits a batch of
+-  // parallel calls -- the sibling whose result is not reached yet is still
+-  // pending, so validation fails client-side before the request is ever sent,
+-  // permanently wedging the thread that replays that history. Buffer media
+-  // until every call is answered, then flush: waiting on the answers not on
+-  // the next non-tool message keeps the image as close to its own result as is
+-  // safe, even when something is interleaved between the results.
+-  // (convertToolResultMessage already does this within one tool message.)
+-  const unanswered = new Set<string>()
+-  let pendingMedia: ModelMessageWithAuxiliaryData[] = []
+-  const flushMedia = () => {
+-    if (unanswered.size > 0 || pendingMedia.length === 0) return
+-    withoutToolMessages.push(...pendingMedia)
+-    pendingMedia = []
+-  }
+-
+-  for (const message of messages) {
+-    const converted = convertToolMessage(message)
+-    if (message.role !== 'tool') {
+-      flushMedia()
+-      withoutToolMessages.push(...converted)
+-      for (const part of converted) {
+-        if (part.role !== 'assistant') continue
+-        for (const content of part.content) {
+-          // Mirrors the SDK: a provider-executed call needs no local result, so
+-          // tracking one would defer every later image forever.
+-          if (content.type !== 'tool-call') continue
+-          if (content.providerExecuted !== true) {
+-            unanswered.add(content.toolCallId)
+-          }
+-        }
+-      }
+-      continue
+-    }
+-    for (const part of converted) {
+-      if (part.role !== 'tool') {
+-        pendingMedia.push(part)
+-        continue
+-      }
+-      withoutToolMessages.push(part)
+-      for (const content of part.content) {
+-        if (content.type === 'tool-result') {
+-          unanswered.delete(content.toolCallId)
+-        }
+-      }
+-    }
+-    flushMedia()
+-  }
+-
+-  // Anything still buffered had no clean boundary; dropUnansweredToolCalls has
+-  // already removed calls that never get answered, so this is just a backstop.
+-  withoutToolMessages.push(...pendingMedia)
+-  return withoutToolMessages
+-}
+-
+ /**
+  * Recursively replace any lone (unpaired) UTF-16 surrogate with U+FFFD in every
+  * string reachable from `value`, mutating objects/arrays in place.
+@@ -317,9 +256,28 @@ const LONE_SURROGATE_REGEX =
+   /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g
+ 
+ function toWellFormedString(str: string): string {
++  LONE_SURROGATE_REGEX.lastIndex = 0
+   return str.replace(LONE_SURROGATE_REGEX, '�')
+ }
+ 
++/** Whether a string contains an unpaired surrogate the scrub would rewrite. */
++function stringNeedsScrub(str: string): boolean {
++  LONE_SURROGATE_REGEX.lastIndex = 0
++  return LONE_SURROGATE_REGEX.test(str)
++}
++
++function wellFormCopy<T>(value: T): T {
++  const copy = cloneDeep(value)
++  if (typeof (copy as { content?: unknown }).content === 'string') {
++    ;(copy as { content: string }).content = toWellFormedString(
++      (copy as { content: string }).content,
++    )
++  } else {
++    wellFormStringsInPlace((copy as { content?: unknown }).content)
++  }
++  return copy
++}
++
+ function wellFormStringsInPlace(value: unknown): void {
+   // Arrays and plain objects are both handled here: Object.keys enumerates array
+   // indices too, and indexing by string key mutates the element in place.
+@@ -335,6 +293,240 @@ function wellFormStringsInPlace(value: unknown): void {
+   }
+ }
+ 
++/**
++ * Per-message conversion cache, keyed by message object identity.
++ *
++ * convertCbToModelMessages runs on every agent step over the full message
++ * history, and its per-message work (cloning the content, scrubbing lone
++ * UTF-16 surrogates, schema-checking the converted form) is a pure function
++ * of that message. History messages are immutable once appended — every
++ * rewrite site (fit-tool-results.ts, trimMessagesToFitTokenLimit,
++ * compaction) allocates a replacement message object rather than mutating
++ * in place — so a WeakMap on the message object caches each message's
++ * conversion exactly once: a step converting N new messages pays only for
++ * those N, however long the history behind them. Stale entries cost
++ * nothing; GC drops them with the message itself.
++ */
++type ConvertedMessage = {
++  /** Surrogate-scrubbed source message, or the original itself when nothing
++   *  had to change (returned by reference — safe because history messages
++   *  are never mutated after append). */
++  scrubbed: Message
++  /**
++   * convertToolMessage output for `scrubbed`: converted role, single content
++   * part per assistant message, surrogate-scrubbed, schema-validated.
++   *
++   * THE CACHE-CONTROL PASS MUST NOT MUTATE THESE OBJECTS: every mark
++   * replaces the per-step entry (or its content array) with a fresh copy,
++   * so the cached form is never touched (see convertCbToModelMessages).
++   */
++  converted: ModelMessageWithAuxiliaryData[]
++  /** Set when a converted part failed AI SDK schema validation; the per-step
++   *  pass rethrows it on every call, the way the uncached validation did. */
++  error?: Error
++}
++
++const convertedMessageCache = new WeakMap<Message, ConvertedMessage>()
++
++function convertMessageCached(message: Message): ConvertedMessage {
++  const cached = convertedMessageCache.get(message)
++  if (cached) return cached
++
++  const scrubbed = messageNeedsScrub(message.content)
++    ? wellFormCopy(message)
++    : message
++  const converted = convertToolMessage(scrubbed)
++  const error = validateConverted(converted)
++  const result = { scrubbed, converted, error }
++  convertedMessageCache.set(message, result)
++  return result
++}
++
++function messageNeedsScrub(content: Message['content']): boolean {
++  if (typeof content === 'string') {
++    return stringNeedsScrub(content)
++  }
++  for (const part of content) {
++    if (valueNeedsScrub(part)) return true
++  }
++  return false
++}
++
++/** Deep pre-pass mirroring wellFormStringsInPlace's traversal, so a message
++ *  is cloned only when the scrub would actually change it. Any repeated
++ *  subtree that survived into history would already make the uncached pass
++ *  rewrite a (formerly) shared structure; treat it as needing a copy. */
++function valueNeedsScrub(value: unknown, seen?: Set<object>): boolean {
++  if (typeof value === 'string') return stringNeedsScrub(value)
++  if (!value || typeof value !== 'object') return false
++  const track = seen ?? new Set<object>()
++  if (track.has(value as object)) return true
++  track.add(value as object)
++  for (const key of Object.keys(value)) {
++    if (valueNeedsScrub((value as Record<string, unknown>)[key], track)) {
++      return true
++    }
++  }
++  track.delete(value as object)
++  return false
++}
++
++/**
++ * Schema-validate one source message's converted parts. A malformed
++ * conversion is deterministic, so the WeakMap caches the failure next to the
++ * converted form; the per-step pass rethrows with the same message.
++ */
++function validateConverted(
++  converted: ModelMessageWithAuxiliaryData[],
++): Error | undefined {
++  for (let i = 0; i < converted.length; i++) {
++    const message = converted[i]
++    const result = modelMessageSchema.safeParse(message)
++    if (result.success) continue
++    return new Error(
++      `convertCbToModelMessages: converted part ${i} of a message failed schema validation.\n` +
++        `Role: ${message.role}\n` +
++        `Message:\n${result.error.message}`,
++    )
++  }
++  return undefined
++}
++
++/**
++ * Rebuild the cross-message envelope over per-message cached conversions:
++ * media buffering plus same-aux aggregation. This replays the pending-call
++ * state machine convertToolMessages ran — each part's pending-set deltas
++ * (the tool-result ids it answers, the calls it opens) come off its source
++ * message at conversion time, so a step pays O(new messages) of conversion
++ * work plus O(history) of envelope bookkeeping over primed cache entries.
++ *
++ * Only media converted out of a tool message ever leaves emission order:
++ * it rides a user message, which providers reject between a tool call and
++ * its result, so it waits (as in convertToolMessages) until the pending
++ * set drains at an answer or at a non-tool boundary.
++ */
++function streamWithMediaBuffering(
++  messages: Message[],
++): ModelMessageWithAuxiliaryData[] {
++  const stream: ModelMessageWithAuxiliaryData[] = []
++  const unanswered = new Set<string>()
++  let pendingMedia: ModelMessageWithAuxiliaryData[] = []
++  const flushMedia = () => {
++    if (unanswered.size > 0 || pendingMedia.length === 0) return
++    stream.push(...pendingMedia)
++    pendingMedia = []
++  }
++
++  for (const message of messages) {
++    const { converted } = convertMessageCached(message)
++    for (const part of converted) {
++      if (isToolMediaPart(part)) {
++        pendingMedia.push(part)
++        flushMedia()
++        continue
++      }
++      stream.push(part)
++      if (message.role === 'tool' && part.role === 'tool') {
++        for (const content of part.content) {
++          if (content.type === 'tool-result') unanswered.delete(content.toolCallId)
++        }
++        flushMedia()
++        continue
++      }
++      if (message.role !== 'tool' && part.role === 'assistant') {
++        for (const content of part.content) {
++          if (content.type === 'tool-call' && content.providerExecuted !== true) {
++            unanswered.add(content.toolCallId)
++          }
++        }
++      }
++      flushMedia()
++    }
++  }
++  // Backstop, same as convertToolMessages': still-buffered media had no
++  // clean boundary and lands at the end.
++  stream.push(...pendingMedia)
++  return stream
++}
++
++/** Media converted out of a tool message: a user message with a single file
++ *  content part that keeps the source message's toolCallId (see
++ *  convertToolResultMessage). The toolCallId is what tells it apart from a
++ *  real user file upload — user messages never carry one. */
++function isToolMediaPart(part: ModelMessageWithAuxiliaryData): boolean {
++  return (
++    part.role === 'user' &&
++    Array.isArray(part.content) &&
++    part.content.length === 1 &&
++    part.content[0]?.type === 'file' &&
++    (part as { toolCallId?: string }).toolCallId !== undefined
++  )
++}
++
++/**
++ * Merge two same-role converted parts without mutating either. The first
++ * merged pair allocates one per-request copy flagged __aggregatedCopy;
++ * further parts append in place to that owned copy.
++ */
++function aggregateInto(
++  out: ModelMessageWithAuxiliaryData,
++  part: ModelMessageWithAuxiliaryData,
++): ModelMessageWithAuxiliaryData {
++  if (out.role === 'system') {
++    const owned = {
++      ...out,
++      content: `${out.content as string}\n\n${part.content as string}`,
++    } as ModelMessageWithAuxiliaryData
++    markOwned(owned)
++    return owned
++  }
++  const owned: ModelMessageWithAuxiliaryData = isAggregatedCopy(out)
++    ? out
++    : ({
++        ...out,
++        content: [...(out.content as unknown[])],
++      } as ModelMessageWithAuxiliaryData)
++  ;(owned.content as unknown[]).push(...(part.content as unknown[]))
++  if (!isAggregatedCopy(owned)) markOwned(owned)
++  return owned
++}
++
++function isAggregatedCopy(message: object): boolean {
++  return (message as { __aggregatedCopy?: boolean }).__aggregatedCopy === true
++}
++
++/**
++ * Flag an object as per-request-owned (non-enumerable, so neither the AI SDK
++ * schema validation nor a provider request body ever sees it). The
++ * aggregation and cache-control passes use it to keep mutating within one
++ * request without re-copying a cached message form.
++ */
++function markOwned(message: object): void {
++  Object.defineProperty(message, '__aggregatedCopy', {
++    value: true,
++    enumerable: false,
++    writable: true,
++    configurable: true,
++  })
++}
++
++function isOwnedContent(message: object): boolean {
++  return (message as { __ownedContent?: boolean }).__ownedContent === true
++}
++
++/** Shallow copy with a fresh content array, flagged so the cache-control
++ *  pass copies each cached message at most once per request. */
++function withOwnedContent<T extends { content: unknown }>(message: T): T {
++  const copy = { ...message, content: [...(message.content as unknown[])] }
++  Object.defineProperty(copy, '__ownedContent', {
++    value: true,
++    enumerable: false,
++    writable: true,
++    configurable: true,
++  })
++  return copy
++}
++
+ export function convertCbToModelMessages({
+   messages,
+   includeCacheControl = true,
+@@ -344,15 +536,16 @@ export function convertCbToModelMessages({
+   includeCacheControl?: boolean
+   logger?: Logger
+ }): ModelMessage[] {
+-  // AI SDK validates tool-call/result pairing before making a request. Repair
+-  // at this lowest shared boundary as well as in the runtime step builder so
+-  // auxiliary calls and restored SDK state cannot poison a thread permanently.
+-  const sendableMessages = dropUnansweredToolCalls(messages)
+-  const toolMessagesConverted: ModelMessageWithAuxiliaryData[] =
+-    convertToolMessages(sendableMessages)
++  // Each history message is converted, scrubbed and schema-checked exactly
++  // once per process (see convertedMessageCache); the per-step cost is the
++  // envelope logic below plus O(1) per message. Orphan repair stays with
++  // the history builders — run-agent-step repairs the step history itself
++  // before it lands in agentState.messageHistory — rather than running
++  // again here over every request.
++  const streamed = streamWithMediaBuffering(messages)
+ 
+   const aggregated: ModelMessageWithAuxiliaryData[] = []
+-  for (const message of toolMessagesConverted) {
++  for (const message of streamed) {
+     if (aggregated.length === 0) {
+       aggregated.push(message)
+       continue
+@@ -367,33 +560,18 @@ export function convertCbToModelMessages({
+       aggregated.push(message)
+       continue
+     }
+-    if (lastMessage.role === 'system' && message.role === 'system') {
+-      lastMessage.content += '\n\n' + message.content
+-      continue
+-    }
+-    if (lastMessage.role === 'user' && message.role === 'user') {
+-      lastMessage.content.push(...message.content)
+-      continue
+-    }
+-    if (lastMessage.role === 'assistant' && message.role === 'assistant') {
+-      lastMessage.content.push(...message.content)
++    if (
++      lastMessage.role === message.role &&
++      (lastMessage.role === 'system' ||
++        lastMessage.role === 'user' ||
++        lastMessage.role === 'assistant')
++    ) {
++      aggregated[aggregated.length - 1] = aggregateInto(lastMessage, message)
+       continue
+     }
+-
+     aggregated.push(message)
+   }
+ 
+-  // Neutralize any lone UTF-16 surrogates before the messages reach the provider.
+-  // These are mutated in place; every aggregated message is a fresh clone (see
+-  // convertToolMessage), so the caller's message history is unaffected.
+-  for (const message of aggregated) {
+-    if (typeof message.content === 'string') {
+-      message.content = toWellFormedString(message.content)
+-    } else {
+-      wellFormStringsInPlace(message.content)
+-    }
+-  }
+-
+   if (!includeCacheControl) {
+     return aggregated
+   }
+@@ -401,6 +579,10 @@ export function convertCbToModelMessages({
+   // Add cache control to specific messages (max of 4 can be marked for caching!):
+   // - The message right before the three tagged messages
+   // - Last message
++  //
++  // Entries of `aggregated` are shared with convertedMessageCache, so this
++  // pass must never mutate them in place: every mark REPLACES the entry (or
++  // its content array) with the copy withCacheControl returns.
+   for (const tag of [
+     'LAST_ASSISTANT_MESSAGE',
+     'USER_PROMPT',
+@@ -419,7 +601,6 @@ export function convertCbToModelMessages({
+ 
+     // Iterate to find the last "valid" message that we can cache control
+     let prevMessage: (typeof aggregated)[number]
+-    let contentBlock: (typeof prevMessage)['content']
+     addCacheControlLoop: while (true) {
+       index--
+ 
+@@ -428,16 +609,29 @@ export function convertCbToModelMessages({
+         break
+       }
+ 
+-      prevMessage = aggregated[index]
+-      contentBlock = prevMessage.content
+-
+-      if (typeof contentBlock === 'string') {
++      const entry = aggregated[index]
++      if (typeof entry.content === 'string') {
+         // This must be a system message
+-        aggregated[index] = withCacheControl(aggregated[index])
++        aggregated[index] = withCacheControl(entry)
+         break
+       }
+ 
+-      // Iterate to find the last valid content part (not a very short string)
++      // Make the message and its content array per-request-owned; cached
++      // messages share both with convertedMessageCache across requests, and
++      // repeated tags keep editing the owned copies.
++      if (!isAggregatedCopy(entry) || !isOwnedContent(entry)) {
++        prevMessage = withOwnedContent(entry)
++        markOwned(prevMessage)
++        aggregated[index] = prevMessage
++      } else {
++        prevMessage = entry
++      }
++      const contentBlock = prevMessage.content as Exclude<
++        typeof prevMessage.content,
++        string
++      >
++
++      // Iterate to find the last valid content part
+       let lastContentIndex = contentBlock.length
+       let lastContentPart: (typeof contentBlock)[number]
+       while (true) {
+@@ -449,41 +643,30 @@ export function convertCbToModelMessages({
+           break
+         }
+ 
+-        if (lastContentPart.type !== 'text') {
+-          contentBlock[lastContentIndex] = withCacheControl(
+-            contentBlock[lastContentIndex],
+-          )
+-          break addCacheControlLoop
+-        }
+-
+-        prevMessage.content = [
+-          ...contentBlock.slice(0, lastContentIndex),
+-          withCacheControl(lastContentPart),
+-          ...contentBlock.slice(lastContentIndex + 1),
+-        ] as typeof contentBlock
+-
++        contentBlock[lastContentIndex] = withCacheControl(lastContentPart)
+         break addCacheControlLoop
+       }
+       break
+     }
+   }
+ 
+-  // Validate each message against the AI SDK schema
+-  for (let i = 0; i < aggregated.length; i++) {
+-    const message = aggregated[i]
+-    const result = modelMessageSchema.safeParse(message)
+-    if (!result.success) {
++  // Schema validation ran once per source message at conversion time
++  // (validateConverted, via convertedMessageCache); rethrow any cached
++  // failure the same way the per-step pass did, on every call.
++  {
++    let failed: Error | undefined
++    for (const message of messages) {
++      const cached = convertedMessageCache.get(message)
++      if (cached?.error && !failed) failed = cached.error
++    }
++    if (failed) {
+       if (logger) {
+         logger.error(
+-          { message, aggregated, error: result.error },
+-          `convertCbToModelMessages: Message at index ${i} failed schema validation.`,
++          { error: failed },
++          `convertCbToModelMessages: A converted message failed schema validation.`,
+         )
+       }
+-      throw new Error(
+-        `convertCbToModelMessages: Message at index ${i} failed schema validation.\n` +
+-        `Role: ${message.role}\n` +
+-        `Message:\n${result.error.message}`,
+-      )
++      throw failed
+     }
+   }
+ 
+diff --git a/packages/agent-runtime/src/util/__tests__/expire-messages.test.ts b/packages/agent-runtime/src/util/__tests__/expire-messages.test.ts
+new file mode 100644
+index 0000000000..a9d4d6f93c
+--- /dev/null
++++ b/packages/agent-runtime/src/util/__tests__/expire-messages.test.ts
+@@ -0,0 +1,33 @@
++import { describe, expect, it } from 'bun:test'
++
++import { expireMessages } from '../messages'
++
++import type { Message } from '@codebuff/common/types/messages/codebuff-message'
++
++const base = (over: Record<string, unknown> = {}): Message =>
++  ({ role: 'user', content: [{ type: 'text', text: 'x' }], ...over }) as Message
++
++describe('expireMessages', () => {
++  it('returns the input array by reference when nothing expired', () => {
++    for (const endOf of ['agentStep', 'userPrompt'] as const) {
++      const messages = [base(), base({ tags: ['STEP_PROMPT'] })]
++      expect(expireMessages(messages, endOf)).toBe(messages)
++      // A userPrompt-scoped message survives end-of-step without allocation.
++      const kept = [base({ timeToLive: 'userPrompt' })]
++      expect(expireMessages(kept, 'agentStep')).toBe(kept)
++    }
++  })
++
++  it('filters expired messages when any exist', () => {
++    const messages = [
++      base(),
++      base({ timeToLive: 'agentStep' }),
++      base({ timeToLive: 'userPrompt' }),
++    ]
++    const afterStep = expireMessages(messages, 'agentStep')
++    expect(afterStep).not.toBe(messages)
++    expect(afterStep).toEqual([messages[0], messages[2]])
++    const afterPrompt = expireMessages(messages, 'userPrompt')
++    expect(afterPrompt).toEqual([messages[0]])
++  })
++})
+diff --git a/packages/agent-runtime/src/util/__tests__/token-counter-cache.test.ts b/packages/agent-runtime/src/util/__tests__/token-counter-cache.test.ts
+new file mode 100644
+index 0000000000..2ec65cd7df
+--- /dev/null
++++ b/packages/agent-runtime/src/util/__tests__/token-counter-cache.test.ts
+@@ -0,0 +1,86 @@
++import { describe, expect, it } from 'bun:test'
++
++import { countTokensMessage, countTokensMessages } from '../token-counter'
++
++import type { Message } from '@codebuff/common/types/messages/codebuff-message'
++
++const text = (role: 'user' | 'assistant', body: string): Message =>
++  ({ role, content: [{ type: 'text', text: body }] }) as unknown as Message
++
++function buildHistory(n: number): Message[] {
++  const messages: Message[] = []
++  for (let i = 0; i < n; i++) {
++    messages.push(text(i % 2 === 0 ? 'user' : 'assistant', `turn ${i} `.repeat(40)))
++    if (i % 3 === 0) {
++      messages.push({
++        role: 'assistant',
++        content: [
++          {
++            type: 'tool-call',
++            toolCallId: `t${i}`,
++            toolName: 'read_files',
++            input: { paths: [`f${i}.ts`] },
++          },
++        ],
++      } as unknown as Message)
++      messages.push({
++        role: 'tool',
++        toolCallId: `t${i}`,
++        toolName: 'read_files',
++        content: [{ type: 'json', value: { content: 'const x = 1;\n'.repeat(100) } }],
++      } as unknown as Message)
++    }
++  }
++  return messages
++}
++
++describe('countTokensMessage memoization', () => {
++  it('list count equals the sum of per-message counts (identical arithmetic)', () => {
++    for (const n of [1, 5, 20, 100]) {
++      const history = buildHistory(n)
++      const sum = history.reduce((acc, m) => acc + countTokensMessage(m), 0)
++      expect(countTokensMessages(history)).toBe(sum)
++    }
++  })
++
++  it('a warmed cache returns the same numbers for growing histories', () => {
++    const history = buildHistory(40)
++    // Warm the cache as the step loop would over successive steps.
++    const snapshots: number[] = []
++    for (let step = 1; step <= history.length; step += 7) {
++      snapshots.push(countTokensMessages(history.slice(0, step)))
++    }
++    // Replay: the same messages (now all cached) must give the same sums.
++    let i = 1
++    for (const expected of snapshots) {
++      expect(countTokensMessages(history.slice(0, i))).toBe(expected)
++      i += 7
++    }
++  })
++
++  it('a replaced message recounts; its untouched prefix does not change', () => {
++    const history = buildHistory(10)
++    const before = countTokensMessages(history)
++    const replaced = [
++      ...history.slice(0, -1),
++      text('assistant', 'replacement tail '.repeat(500)),
++    ]
++    const after = countTokensMessages(replaced)
++    expect(after).toBe(
++      before -
++        countTokensMessage(history[history.length - 1]) +
++        countTokensMessage(replaced[replaced.length - 1]),
++    )
++    // Original untouched.
++    expect(countTokensMessages(history)).toBe(before)
++  })
++
++  it('cache-hit returns for single-message arrays match fresh arithmetic', () => {
++    const history = buildHistory(8)
++    for (const message of history) {
++      expect(countTokensMessages([message])).toBe(countTokensMessage(message))
++      // second pass hits the memoized per-message count
++      expect(countTokensMessages([message])).toBe(countTokensMessage(message))
++    }
++  })
++})
+diff --git a/packages/agent-runtime/src/util/fit-tool-results.ts b/packages/agent-runtime/src/util/fit-tool-results.ts
+index aba5b3240d..4f64b844c6 100644
+--- a/packages/agent-runtime/src/util/fit-tool-results.ts
++++ b/packages/agent-runtime/src/util/fit-tool-results.ts
+@@ -1,4 +1,7 @@
+-import { countTokensMessages } from './token-counter'
++import {
++  countTokensMessages,
++  probeTokensMessages,
++} from './token-counter'
+ 
+ import type { Message } from '@codebuff/common/types/messages/codebuff-message'
+ import type { JSONValue } from '@codebuff/common/types/json'
+@@ -10,6 +13,13 @@ export function fitToolResults(
+ ): Message[] {
+   if (countTokensMessages(messages) <= tokenBudget) return messages
+ 
++  // Count probes stay off the memoized estimator (probeTokensMessages):
++  // the budget loop below rewrites the fitted copies' content repeatedly,
++  // and caching each probe's count would pin a stale number onto whatever
++  // message object survives to the caller when nothing ends up clipped.
++  // The cheap path above already memoized the accurate final count for
++  // fits that need no clipping.
++  //
+   // Never mutate the full results already handed to the UI/trace writer.
+   const fitted: Message[] = messages.map((message) =>
+     message.role === 'tool'
+@@ -130,29 +140,31 @@ export function fitToolResults(
+     }
+   }
+ 
+-  if (countTokensMessages(fitted) > tokenBudget) {
++  if (probeTokensMessages(fitted) > tokenBudget) {
+     throw new Error(
+       'The latest tool calls and their result metadata exceed the configured context window. Use a larger supported context window or request fewer tools at once.',
+     )
+   }
+ 
++
+   // Requested order, with space already reserved for every later result's
+   // omission notice. Count the whole message envelope, not just source text.
+   for (const slot of slots) {
+     slot.restore()
+-    if (countTokensMessages(fitted) <= tokenBudget) continue
++    if (probeTokensMessages(fitted) <= tokenBudget) continue
+     let low = 0
+     let high = slot.length
+     while (low < high) {
+       const mid = Math.ceil((low + high) / 2)
+       slot.clip(mid)
+-      if (countTokensMessages(fitted) <= tokenBudget) low = mid
++      if (probeTokensMessages(fitted) <= tokenBudget) low = mid
+       else high = mid - 1
+     }
+     slot.clip(low)
+     // Tokenization isn't strictly monotonic at string boundaries. Never return
+     // an oversized request even for that edge case.
+-    if (countTokensMessages(fitted) > tokenBudget) slot.clip(0)
++    if (probeTokensMessages(fitted) > tokenBudget) slot.clip(0)
+   }
+   return fitted
++
+ }
+diff --git a/packages/agent-runtime/src/util/messages.ts b/packages/agent-runtime/src/util/messages.ts
+index 029e6426d7..15751310e0 100644
+--- a/packages/agent-runtime/src/util/messages.ts
++++ b/packages/agent-runtime/src/util/messages.ts
+@@ -312,6 +312,17 @@ export function expireMessages(
+   messages: Message[],
+   endOf: 'agentStep' | 'userPrompt',
+ ): Message[] {
++  // Return the input array itself when nothing expired: the common no-
++  // timeToLive case previously allocated a copy of the full history on every
++  // step, and callers treat the result as read-only (run-agent-step spreads
++  // it into buildArray).
++  let expired = 0
++  for (const m of messages) {
++    if (m.timeToLive === undefined) continue
++    if (m.timeToLive === 'agentStep' || endOf === 'userPrompt') expired++
++  }
++  if (expired === 0) return messages
++
+   return messages.filter((m) => {
+     // Keep messages with no timeToLive
+     if (m.timeToLive === undefined) return true
+diff --git a/packages/agent-runtime/src/util/token-counter.ts b/packages/agent-runtime/src/util/token-counter.ts
+index ca29015dbe..77cbb135bd 100644
+--- a/packages/agent-runtime/src/util/token-counter.ts
++++ b/packages/agent-runtime/src/util/token-counter.ts
+@@ -74,20 +74,51 @@ export function countTokensJson(value: unknown): number {
+ export function countTokensMessages(messages: Message[]): number {
+   let total = 0
+   for (const message of messages) {
+-    total += PER_MESSAGE_TOKEN_OVERHEAD
+-
+-    // content is typed as an array, but tolerate string / missing content the
+-    // same way the replaced JSON.stringify did (see getTextContent), so a stray
+-    // shape can't crash or mis-count the estimate.
+-    const content = (message as { content?: unknown }).content
+-    if (typeof content === 'string') {
+-      total += countTokens(content)
+-      continue
+-    }
+-    if (!Array.isArray(content)) {
+-      continue
+-    }
++    total += countTokensMessage(message)
++  }
++  return total
++}
+ 
++/**
++ * Per-message token estimate, memoized on the message object.
++ *
++ * countTokensMessages runs several times per agent step over the whole
++ * history (input estimate, output estimate, context recount, truncation
++ * checks), and a message's estimate is a pure function of its content.
++ * History messages are immutable once appended — every rewrite site
++ * (fit-tool-results, trimMessagesToFitTokenLimit, compaction) builds a
++ * replacement message object — so a WeakMap keyed on identity counts each
++ * message's content exactly once per process, and a step that appended N
++ * messages only ever counts those N. The arithmetic is untouched: the list
++ * count is still the exact sum of the per-message counts, associativity
++ * aside (integers, so identical).
++ *
++ * Messages handed in one at a time (compaction trims, `countTokensMessages([
++ * message ])` sites) hit the same cache, so those paths stop re-walking the
++ * same string too. A message that IS mutated in place after being counted
++ * would serve its stale count — the runtime holds no such site (verified
++ * 2026-10-30); fit-tool-results clones before it rewrites, and the stream
++ * parser appends new message objects instead of extending old ones.
++ */
++const messageTokenCountCache = new WeakMap<Message, number>()
++
++export function countTokensMessage(message: Message): number {
++  const cached = messageTokenCountCache.get(message)
++  if (cached !== undefined) return cached
++  const total = countTokensMessageUncached(message)
++  return total
++}
++
++function countTokensMessageUncached(message: Message): number {
++  let total = PER_MESSAGE_TOKEN_OVERHEAD
++
++  // content is typed as an array, but tolerate string / missing content the
++  // same way the replaced JSON.stringify did (see getTextContent), so a stray
++  // shape can't crash or mis-count the estimate.
++  const content = (message as { content?: unknown }).content
++  if (typeof content === 'string') {
++    total += countTokens(content)
++  } else if (Array.isArray(content)) {
+     for (const part of content as Array<Record<string, unknown>>) {
+       switch (part.type) {
+         case 'text':
+@@ -111,5 +142,34 @@ export function countTokensMessages(messages: Message[]): number {
+       }
+     }
+   }
++
++  messageTokenCountCache.set(message, total)
++  return total
++}
++
++/**
++ * Drop a memoized per-message estimate. Only for sites that provably mutate
++ * a message after it was counted — fitToolResults is the one place that
++ * clips a message's content in place (on its own defensive copies, but the
++ * copy was counted before the clip).
++ */
++export function uncacheMessageTokens(message: Message): void {
++  messageTokenCountCache.delete(message)
++}
++
++/**
++ * Uncached per-message estimate behind countTokensMessage's memo. For the
++ * rare caller that rewrites a message's content repeatedly while comparing
++ * estimates (fitToolResults' budget loop): memoizing each probe would pin a
++ * probe's number onto the message the caller still owns.
++ */
++export function probeTokensMessage(message: Message): number {
++  return countTokensMessageUncached(message)
++}
++
++/** Uncached list estimate; see probeTokensMessage. */
++export function probeTokensMessages(messages: Message[]): number {
++  let total = 0
++  for (const message of messages) total += countTokensMessageUncached(message)
+   return total
+ }
+diff --git a/sdk/src/impl/llm.ts b/sdk/src/impl/llm.ts
+index 2f52229a79..af80b08cb6 100644
+--- a/sdk/src/impl/llm.ts
++++ b/sdk/src/impl/llm.ts
+@@ -7,7 +7,10 @@ import {
+   promptAborted,
+   promptSuccess,
+ } from '@codebuff/common/util/error'
+-import { convertCbToModelMessages } from '@codebuff/common/util/messages'
++import {
++  convertCbToModelMessages,
++  dropUnansweredToolCalls,
++} from '@codebuff/common/util/messages'
+ import { isExplicitlyDefinedModel } from '@codebuff/common/util/model-utils'
+ import { StopSequenceHandler } from '@codebuff/common/util/stop-sequence'
+ import {
+@@ -211,6 +214,19 @@ function emitCacheDebugUsage(params: {
+   })
+ }
+ 
++/**
++ * The converter assumes its history is already tool-call-paired — the
++ * per-step runtime history is repaired before it lands in agentState
++ * (run-agent-step) — so the auxiliary entry points here repair at their
++ * own boundary. Cheap: dropUnansweredToolCalls returns the input array
++ * itself when there is nothing to repair.
++ */
++function repairToolCallHistory(
++  messages: Parameters<typeof convertCbToModelMessages>[0]['messages'],
++): typeof messages {
++  return dropUnansweredToolCalls(messages)
++}
++
+ export async function* promptAiSdkStream(
+   params: ParamsOf<PromptAiSdkStreamFn> & {
+     byok?: ResolvedByokConnection
+@@ -258,7 +274,10 @@ export async function* promptAiSdkStream(
+     abortSignal: params.signal,
+     prompt: undefined,
+     model: aiSDKModel,
+-    messages: convertCbToModelMessages(params),
++    messages: convertCbToModelMessages({
++      ...params,
++      messages: repairToolCallHistory(params.messages),
++    }),
+     allowSystemInMessages: true,
+     include: {
+       ...streamParams.include,
+@@ -773,7 +792,10 @@ export async function promptAiSdk(
+     }),
+     prompt: undefined,
+     model: aiSDKModel,
+-    messages: convertCbToModelMessages(params),
++    messages: convertCbToModelMessages({
++      ...params,
++      messages: repairToolCallHistory(params.messages),
++    }),
+     allowSystemInMessages: true,
+     include: {
+       ...params.include,
+@@ -857,7 +879,10 @@ export async function promptAiSdkStructured<T>(
+     prompt: undefined,
+     model: aiSDKModel,
+     output: Output.object({ schema: params.schema }),
+-    messages: convertCbToModelMessages(params),
++    messages: convertCbToModelMessages({
++      ...params,
++      messages: repairToolCallHistory(params.messages),
++    }),
+     allowSystemInMessages: true,
+     include: { requestBody: true },
+     providerOptions: params.byok ? undefined : getProviderOptions({
