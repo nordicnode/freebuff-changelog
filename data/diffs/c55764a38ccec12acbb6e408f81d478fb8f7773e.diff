@@ -1,0 +1,1801 @@
+diff --git a/agents/context-pruner.ts b/agents/context-pruner.ts
+index 22b91d6b3..c3d94cdef 100644
+--- a/agents/context-pruner.ts
++++ b/agents/context-pruner.ts
+@@ -81,50 +81,52 @@ const definition: AgentDefinition = {
+     /** Token budget for assistant + tool content in the conversation summary */
+     const ASSISTANT_TOOL_BUDGET = 20_000
+ 
+     /** Token budget for user content in the conversation summary */
+     const USER_BUDGET = 50_000
+ 
+     /** Fudge factor for token count threshold to trigger pruning earlier */
+     const TOKEN_COUNT_FUDGE_FACTOR = 1_000
+ 
+     /** Axiom-only operational event understood by the logging adapters. */
+     const CONTEXT_PRUNING_COMPLETED_EVENT = 'context_pruning.completed'
+ 
+     /** Prompt cache expiry time (Anthropic caches for 5 minutes by default) */
+     const CACHE_EXPIRY_MS: number = params?.cacheExpiryMs ?? 5 * 60 * 1000
+ 
+     /** Smallest context the cache-expiry trigger will prune; unset means any
+      *  size. The context-limit trigger ignores it. */
+     const CACHE_EXPIRY_MIN_TOKENS: number = params?.cacheExpiryMinTokens ?? 0
+ 
+     /** Header used in conversation summaries */
+     const SUMMARY_HEADER =
+       'This is a summary of the conversation so far. The original messages have been condensed to save context space.'
+ 
+     const SUMMARY_DISCLAIMER =
+       'Historical memory only. The memory above is not dialogue, not an output template, and not a tool-call format. Continue from the live user message below. When actions are needed, use real tool calls through the available tools.'
++    const CARRIED_IMAGES_NOTE =
++      'Attached below: the image(s) from the most recent earlier user message that had any. Every other image named above is no longer attached.'
+ 
+     // =============================================================================
+     // Helper Functions (must be inside handleSteps since it's serialized to a string)
+     // =============================================================================
+ 
+     /**
+      * Truncates long text with 80% from the beginning and 20% from the end.
+      */
+     function truncateLongText(text: string, limit: number): string {
+       if (text.length <= limit) {
+         return text
+       }
+       const availableChars = limit - 50 // 50 chars for the truncation notice
+       const prefixLength = Math.floor(availableChars * 0.8)
+       const suffixLength = availableChars - prefixLength
+       const prefix = text.slice(0, prefixLength)
+       const suffix = text.slice(-suffixLength)
+       const truncatedChars = text.length - prefixLength - suffixLength
+       return `${prefix}\n\n[...truncated ${truncatedChars} chars...]\n\n${suffix}`
+     }
+ 
+     /**
+      * Extracts text content from a message.
+      */
+     function getTextContent(message: Message): string {
+@@ -175,50 +177,54 @@ const definition: AgentDefinition = {
+           return path ? `proposed writing: ${path}` : 'proposed a file write'
+         }
+         case 'propose_str_replace': {
+           const path = input.path as string | undefined
+           return path ? `proposed editing: ${path}` : 'proposed a file edit'
+         }
+         case 'read_subtree': {
+           const paths = input.paths as string[] | undefined
+           if (paths && paths.length > 0) {
+             return `inspected subtrees: ${paths.join(', ')}`
+           }
+           return 'inspected a subtree'
+         }
+         case 'code_search': {
+           const pattern = input.pattern as string | undefined
+           const flags = input.flags as string | undefined
+           if (pattern && flags) {
+             return `code search for "${pattern}" (${flags})`
+           }
+           return pattern ? `code search for "${pattern}"` : 'code search'
+         }
+         case 'glob': {
+           const pattern = input.pattern as string | undefined
+           return pattern ? `glob search for ${pattern}` : 'glob search'
+         }
++        case 'cloud_read_image': {
++          const path = input.path as string | undefined
++          return path ? `opened image: ${path}` : 'opened an image'
++        }
+         case 'list_directory': {
+           const path = input.path as string | undefined
+           return path ? `listed directory: ${path}` : 'listed a directory'
+         }
+         case 'find_files': {
+           const prompt = input.prompt as string | undefined
+           return prompt
+             ? `file-finding request: "${prompt}"`
+             : 'file-finding request'
+         }
+         case 'run_terminal_command': {
+           const command = input.command as string | undefined
+           if (command) {
+             const shortCmd =
+               command.length > 50 ? command.slice(0, 50) + '...' : command
+             return `ran command: ${shortCmd}`
+           }
+           return 'ran a terminal command'
+         }
+         case 'spawn_agents':
+         case 'spawn_agent_inline': {
+           const agents = input.agents as
+             | Array<{
+                 agent_type: string
+                 prompt?: string
+@@ -526,140 +532,190 @@ const definition: AgentDefinition = {
+     )
+     const latestLiveUserPromptMessage =
+       latestLiveUserPromptIndex !== -1
+         ? currentMessages[latestLiveUserPromptIndex]
+         : null
+     const isMidTurnPrune =
+       latestLiveUserPromptIndex !== -1 &&
+       currentMessages
+         .slice(latestLiveUserPromptIndex + 1)
+         .some(
+           (message) =>
+             !shouldExcludeMessage(message) && !isConversationSummary(message),
+         )
+ 
+     // Filter out excluded, conversation summary, and live-prompt messages for summarization
+     const messagesToSummarize = currentMessages
+       .filter(
+         (_message, index) =>
+           isMidTurnPrune || index !== latestLiveUserPromptIndex,
+       )
+       .filter(
+         (message) =>
+           !shouldExcludeMessage(message) && !isConversationSummary(message),
+       )
+ 
++    function isImagePart(part: Record<string, unknown>): boolean {
++      return (
++        part.type === 'image' ||
++        part.type === 'media' ||
++        (part.type === 'file' &&
++          typeof part.mediaType === 'string' &&
++          part.mediaType.startsWith('image/'))
++      )
++    }
++
++    function userImageNote(message: Message): string {
++      if (!Array.isArray(message.content)) return ''
++      const images = (
++        message.content as Array<Record<string, unknown>>
++      ).filter(isImagePart)
++      if (images.length === 0) return ''
++      const names = images.flatMap((part) =>
++        typeof part.filename === 'string' && part.filename
++          ? [part.filename]
++          : [],
++      )
++      return names.length > 0
++        ? ` [image(s) were attached: ${names.join(', ')}]`
++        : ' [image(s) were attached]'
++    }
++
++    function toolImageNote(toolMessage: ToolMessage): string | undefined {
++      if (!Array.isArray(toolMessage.content)) return undefined
++      const paths: string[] = []
++      let attached = false
++      for (const part of toolMessage.content) {
++        if (part.type === 'media') attached = true
++        if (
++          toolMessage.toolName !== 'read_files' ||
++          part.type !== 'json' ||
++          !Array.isArray(part.value)
++        )
++          continue
++        for (const file of part.value as Array<Record<string, unknown>>) {
++          if (
++            typeof file?.path === 'string' &&
++            typeof file?.content === 'string' &&
++            file.content.startsWith('[IMAGE]')
++          )
++            paths.push(file.path)
++        }
++      }
++      const named = paths.length > 0 ? `: ${paths.join(', ')}` : ''
++      if (attached)
++        return `Image(s) shown by ${toolMessage.toolName}${named}. These were pictures, not text, and are no longer attached; open them again to look.`
++      return paths.length > 0 ? `Image(s) not shown${named}` : undefined
++    }
++
+     // Find the last user message with images to preserve in the final output
+     let lastUserImageParts: Array<Record<string, unknown>> = []
+     for (let i = messagesToSummarize.length - 1; i >= 0; i--) {
+       const msg = messagesToSummarize[i]
+       if (msg.role === 'user' && Array.isArray(msg.content)) {
+-        const imageParts = msg.content.filter(
+-          (part: Record<string, unknown>) =>
+-            part.type === 'image' || part.type === 'media',
+-        )
++        const imageParts = (
++          msg.content as Array<Record<string, unknown>>
++        ).filter(isImagePart)
+         if (imageParts.length > 0) {
+           lastUserImageParts = imageParts
+           break
+         }
+       }
+     }
+ 
+     // Phase 1: Summarize ALL messages into tagged entries
+     type SummaryEntry = {
+       role: 'user' | 'assistant_tool'
+       parts: string[]
+     }
+     const summarizedEntries: SummaryEntry[] = []
+     let liveUserPromptEntry: SummaryEntry | undefined
+ 
+     for (const message of messagesToSummarize) {
+       if (message.role === 'user') {
+         let text = getTextContent(message).trim()
+-        if (text) {
++        const imageNote = userImageNote(message)
++        if (text || imageNote) {
+           text = truncateLongText(text, USER_MESSAGE_LIMIT * CHARS_PER_TOKEN)
+-          let hasImages = false
+-          if (Array.isArray(message.content)) {
+-            hasImages = message.content.some(
+-              (part: Record<string, unknown>) =>
+-                part.type === 'image' || part.type === 'media',
+-            )
+-          }
+-          const imageNote = hasImages ? ' [image(s) were attached]' : ''
+           const entry: SummaryEntry = {
+             role: 'user',
+-            parts: [`[USER]${imageNote}\n${text}`],
++            parts: [
++              text ? `[USER]${imageNote}\n${text}` : `[USER]${imageNote}`,
++            ],
+           }
+           if (message === latestLiveUserPromptMessage) {
+             liveUserPromptEntry = entry
+           }
+           summarizedEntries.push(entry)
+         }
+       } else if (message.role === 'assistant') {
+         const textParts: string[] = []
+         const toolSummaries: string[] = []
+ 
+         if (Array.isArray(message.content)) {
+           for (const part of message.content) {
+             if (part.type === 'text' && typeof part.text === 'string') {
+               const textWithoutThinkTags = (part.text as string)
+                 .replace(/<think>[\s\S]*?<\/think>/g, '')
+                 .trim()
+               if (textWithoutThinkTags) {
+                 textParts.push(textWithoutThinkTags)
+               }
+             } else if (part.type === 'tool-call') {
+               const toolName = part.toolName as string
+               const input = (part.input as Record<string, unknown>) || {}
+               toolSummaries.push(summarizeToolCall(toolName, input))
+             }
+           }
+         }
+ 
+         const parts: string[] = []
+         if (textParts.length > 0) {
+           let combinedText = textParts.join('\n')
+           combinedText = truncateLongText(
+             combinedText,
+             ASSISTANT_MESSAGE_LIMIT * CHARS_PER_TOKEN,
+           )
+           parts.push(`Progress note:\n${combinedText}`)
+         }
+         if (toolSummaries.length > 0) {
+           parts.push(toolSummaries.join('\n'))
+         }
+ 
+         if (parts.length > 0) {
+           summarizedEntries.push({
+             role: 'assistant_tool',
+             parts,
+           })
+         }
+       } else if (message.role === 'tool') {
+         const toolMessage = message as ToolMessage
+         const entryParts: string[] = []
+ 
++        const imageNote = toolImageNote(toolMessage)
++        if (imageNote) entryParts.push(imageNote)
++
+         if (Array.isArray(toolMessage.content)) {
+           for (const part of toolMessage.content) {
+             if (part.type === 'json' && part.value) {
+               const value = part.value as Record<string, unknown>
+ 
+               if (value.errorMessage || value.error) {
+                 let errorText = String(value.errorMessage || value.error)
+                 if (errorText.length > 100) {
+                   errorText = errorText.slice(0, 100) + '...'
+                 }
+                 entryParts.push(
+                   `Tool error from ${toolMessage.toolName}: ${errorText}`,
+                 )
+               }
+ 
+               if (
+                 toolMessage.toolName === 'run_terminal_command' &&
+                 'exitCode' in value
+               ) {
+                 const exitCode = value.exitCode as number
+                 if (exitCode !== 0) {
+                   entryParts.push(`Command failed with exit code: ${exitCode}`)
+                 }
+               }
+ 
+@@ -853,51 +909,51 @@ const definition: AgentDefinition = {
+       newestEntryForced = true
+     }
+ 
+     // Phase 3: Build final summary from included entries
+     const summaryParts: string[] = []
+ 
+     for (let i = includedEntries.length - 1; i >= 0; i--) {
+       summaryParts.push(...includedEntries[i].parts)
+     }
+ 
+     const summaryText = summaryParts.join('\n\n---\n\n')
+ 
+     // Create the summarized message with fresh sentAt timestamp
+     // Include any images from the last user message that had images
+     const now = Date.now()
+     const textPart: TextPart = {
+       type: 'text',
+       text: `<conversation_summary>
+ ${SUMMARY_HEADER}
+ 
+ <historical_memory>
+ ${summaryText}
+ </historical_memory>
+ </conversation_summary>
+ 
+-${SUMMARY_DISCLAIMER}`,
++${SUMMARY_DISCLAIMER}${lastUserImageParts.length > 0 ? `\n\n${CARRIED_IMAGES_NOTE}` : ''}`,
+     }
+     // Build content array with text and any preserved images
+     const summaryContentParts: (TextPart | ImagePart | FilePart)[] = [textPart]
+     // Append image parts (they're already typed correctly from the original message)
+     for (const part of lastUserImageParts) {
+       summaryContentParts.push(part as ImagePart | FilePart)
+     }
+     const summarizedMessage: UserMessage = {
+       role: 'user',
+       content: summaryContentParts,
+       sentAt: now,
+     }
+ 
+     const continuationMessage: UserMessage = {
+       role: 'user',
+       content: [
+         {
+           type: 'text',
+           text: 'Continue the existing assistant turn from the historical memory above. The original user request and completed assistant/tool work are recorded there. Do not restart completed work; resume with the next necessary real tool call or final response.',
+         },
+       ],
+       sentAt: now,
+     }
+ 
+     // Build final messages array: summary first, then INSTRUCTIONS_PROMPT if it
+diff --git a/common/src/constants/compaction-summary.ts b/common/src/constants/compaction-summary.ts
+index 332a15ec0..95929257b 100644
+--- a/common/src/constants/compaction-summary.ts
++++ b/common/src/constants/compaction-summary.ts
+@@ -35,29 +35,30 @@ Use exactly this format. Write "(none)" for an empty section.
+ ### Completed
+ - [finished goals]
+ ### Active
+ - [goals in progress, and how far they got]
+ ### Blocked
+ - [what blocks progress, and why]
+ 
+ ## Next Move
+ 1. [the next actions, in order]
+ 
+ ## Relevant Files
+ - \`path\`: [why it matters, what changed in it]
+ 
+ ## Important Context
+ - [facts the next agent cannot easily find again: exact commands, error messages, values, identifiers, URLs, and test or build results]
+ 
+ ## Latest Exchange
+ - [the user's latest message, and what the assistant last did or answered]
+ 
+ Rules:
+ - Use short single-line bullets, not paragraphs.
+ - Prefer short references over restating details. Leave out what the next agent can get again from the code or files.
+ - Keep exact file paths, symbols, commands, error text and identifiers.
+ - Keep user requests that are still open, with their exact wording. Drop the ones newer messages resolved.
+ - Keep the state of changes: uncommitted, committed, pushed, in review or merged.
++- Name each image the user attached or a tool showed, by file name when it has one, with what it showed. The next agent cannot see any of them and must open the file again to look.
+ - Keep every heading exactly as written here, in English. Write the text under the headings in the language the user writes in.
+ - Keep the summary under about ${targetTokens} tokens.
+ - Do not call tools. Do not continue the task. Return only the summary, with no preamble.`
+ }
+diff --git a/packages/agent-runtime/src/__tests__/compact-history.test.ts b/packages/agent-runtime/src/__tests__/compact-history.test.ts
+index 0c9247201..466137300 100644
+--- a/packages/agent-runtime/src/__tests__/compact-history.test.ts
++++ b/packages/agent-runtime/src/__tests__/compact-history.test.ts
+@@ -240,50 +240,184 @@ describe('compactMessages', () => {
+ 
+     expect(stats.newest_entry_forced).toBe(true)
+     expect(textOf(messages[0])).toContain('HUGE')
+   })
+ 
+   it('carries the most recent images forward as real image parts', () => {
+     const withImage: Message = {
+       role: 'user',
+       content: [
+         { type: 'text', text: 'look at this' },
+         { type: 'image', image: 'data:image/png;base64,AAAA' },
+       ],
+       sentAt: 1,
+     }
+     const result = compact([
+       withImage,
+       assistant('I see it'),
+       user('now?', ['USER_PROMPT']),
+     ])
+ 
+     const imageParts = (result[0].content as any[]).filter(
+       (part) => part.type === 'image',
+     )
+     expect(imageParts).toHaveLength(1)
+     expect(textOf(result[0])).toContain('[image(s) were attached]')
++    expect(textOf(result[0])).toContain('Attached below: the image(s)')
++  })
++
++  it('claims no attached image when none was carried', () => {
++    expect(
++      textOf(compact([user('hello'), user('now?', ['USER_PROMPT'])])[0]),
++    ).not.toContain('Attached below')
++  })
++
++  it('a later pass keeps the note and stops claiming the image is attached', () => {
++    const first = compact([
++      {
++        role: 'user',
++        content: [
++          { type: 'text', text: 'look at this' },
++          { type: 'image', image: 'data:image/png;base64,AAAA' },
++        ],
++        sentAt: 1,
++      },
++      assistant('I see it'),
++      user('now?', ['USER_PROMPT']),
++    ])
++    const second = compact([
++      ...first,
++      assistant('working'),
++      user('and now?', ['USER_PROMPT']),
++    ])
++    expect(textOf(second[0])).toContain('[USER] [image(s) were attached]')
++    expect(textOf(second[0])).not.toContain('Attached below')
++    expect(
++      (second[0].content as any[]).filter((part) => part.type === 'image'),
++    ).toHaveLength(0)
++  })
++
++  it('keeps a note for an image sent with no text, and names a file part', () => {
++    const result = compact([
++      {
++        role: 'user',
++        content: [
++          {
++            type: 'file',
++            data: 'data:image/png;base64,AAAA',
++            mediaType: 'image/png',
++            filename: 'wireframe.png',
++          },
++        ],
++        sentAt: 1,
++      },
++      assistant('I see it'),
++      user('now?', ['USER_PROMPT']),
++    ])
++    expect(textOf(result[0])).toContain(
++      '[USER] [image(s) were attached: wireframe.png]',
++    )
++    expect(
++      (result[0].content as any[]).filter((part) => part.type === 'file'),
++    ).toHaveLength(1)
++  })
++
++  it('does not take a PDF for an image', () => {
++    const { summaryText } = compactMessages({
++      messages: [
++        {
++          role: 'user',
++          content: [
++            { type: 'text', text: 'read this' },
++            { type: 'file', data: 'AAAA', mediaType: 'application/pdf' },
++          ],
++          sentAt: 1,
++        },
++        user('now?', ['USER_PROMPT']),
++      ],
++    })
++    expect(summaryText).not.toContain('image(s)')
++  })
++
++  it('labels an image a tool showed as a picture that is gone, with its name', () => {
++    const { summaryText } = compactMessages({
++      messages: [
++        assistantToolCall('read_files', { paths: ['logo.png'] }),
++        {
++          role: 'tool',
++          toolCallId: 'call-0',
++          toolName: 'read_files',
++          content: [
++            {
++              type: 'json',
++              value: [
++                {
++                  path: 'logo.png',
++                  content:
++                    '[IMAGE] image/png, 2 KB. The image is attached after this result.',
++                },
++              ],
++            },
++            { type: 'media', mediaType: 'image/png', data: 'AAAA' },
++          ],
++        },
++        assistantToolCall('cloud_read_image', { path: 'shot.png' }),
++        {
++          role: 'tool',
++          toolCallId: 'call-0',
++          toolName: 'cloud_read_image',
++          content: [{ type: 'media', mediaType: 'image/png', data: 'BBBB' }],
++        },
++        user('now?', ['USER_PROMPT']),
++      ],
++    })
++    expect(summaryText).toContain(
++      'Image(s) shown by read_files: logo.png. These were pictures, not text, and are no longer attached',
++    )
++    expect(summaryText).toContain('opened image: shot.png')
++    expect(summaryText).toContain('Image(s) shown by cloud_read_image.')
++    // Neither the base64 nor the sentence that was true only before compaction.
++    expect(summaryText).not.toContain('AAAA')
++    expect(summaryText).not.toContain('attached after this result')
++  })
++
++  it('does not record a refused image read as a look at it', () => {
++    const { summaryText } = compactMessages({
++      messages: [
++        assistantToolCall('read_files', { paths: ['logo.png'] }),
++        toolResult('read_files', [
++          {
++            path: 'logo.png',
++            content:
++              '[IMAGE] logo.png was not opened: this model cannot view images.',
++          },
++        ]),
++        user('now?', ['USER_PROMPT']),
++      ],
++    })
++    expect(summaryText).toContain('Image(s) not shown: logo.png')
++    expect(summaryText).not.toContain('Image(s) shown by')
+   })
+ 
+   it('produces a summary well under the budget it was called for', () => {
+     const { summaryText } = compactMessages({
+       messages: [
+         user('do the thing', ['USER_PROMPT']),
+         ...Array.from({ length: 400 }, (_, i) =>
+           i % 2 === 0
+             ? assistant(`assistant turn ${i} ${'z'.repeat(2_000)}`)
+             : toolResult('read_files', { content: 'z'.repeat(20_000) }),
+         ),
+       ],
+     })
+ 
+     // Default budgets are 20k assistant/tool + 50k user estimated tokens.
+     expect(Math.ceil(summaryText.length / 3)).toBeLessThan(75_000)
+   })
+ })
+ 
+ describe('promptCacheGapMs', () => {
+   it('measures from the last assistant message to the live prompt', () => {
+     expect(promptCacheGapMs(idleTurn(42))).toBe(42 * MINUTE)
+   })
+ 
+   it('skips tool messages, which carry no timestamp', () => {
+diff --git a/packages/agent-runtime/src/__tests__/compaction-working-set.test.ts b/packages/agent-runtime/src/__tests__/compaction-working-set.test.ts
+index 2ca1adf3a..5b630bede 100644
+--- a/packages/agent-runtime/src/__tests__/compaction-working-set.test.ts
++++ b/packages/agent-runtime/src/__tests__/compaction-working-set.test.ts
+@@ -270,50 +270,52 @@ describe('mechanical compaction working set', () => {
+         ...read('r3', { 'a.ts': source('a', 12) }),
+         said('FILLER '.repeat(30_000)),
+         user('And log the retries.', true),
+       ],
+       maxContextLength: 400_000,
+     })!
+     const files = workingSet(second.messages)!
+     expect(files.map((f) => f.path).sort()).toEqual(['a.ts', 'b.ts'])
+     // The newest read of a.ts wins; the earlier stub of b.ts carries forward.
+     expect(files.find((f) => f.path === 'a.ts')!.content).toBe(source('a', 12))
+     expect(files.find((f) => f.path === 'b.ts')!.content).toBe(
+       workingSet(first.messages)!.find((f) => f.path === 'b.ts')!.content,
+     )
+     // The previous working set is reads, not a tool call to log again.
+     expect(
+       second.summaryText.match(/inspected files: a\.ts, b\.ts/g),
+     ).toBeNull()
+   })
+ 
+   it('leaves out status results and files the fresh exchange already holds', () => {
+     const compacted = compactHistoryNow({
+       messages: [
+         ...session(
+           read('r1', {
+             'gone.ts': '[FILE_DOES_NOT_EXIST]',
++            'huge.png': '[FILE_TOO_LARGE] [Images over 11 MB cannot be attached.]',
++            'logo.png': '[IMAGE] image/png, 2 KB. The image is attached after this result.',
+             'both.ts': source('old', 5),
+           }),
+         ),
+         ...read('fresh', { 'both.ts': source('both', 5) }),
+       ],
+       maxContextLength: 400_000,
+     })
+     expect(workingSet(compacted!.messages)).toBeUndefined()
+   })
+ 
+   it('aims the rewritten part at the target without clipping unread results', () => {
+     const fresh = read('fresh', { 'huge.ts': source('huge', 3_000) })
+     const compacted = compactHistoryNow({
+       messages: [
+         ...session(read('r1', { 'a.ts': source('a', 2_000) })),
+         ...fresh,
+       ],
+       maxContextLength: 400_000,
+       targetTokens: 10_000,
+     })!
+     expect(compacted.messages.slice(-2)).toEqual(fresh)
+     // Over the target only by the fresh exchange the pass may not touch.
+     expect(
+       compacted.nextTokens - countTokensMessages(fresh),
+     ).toBeLessThanOrEqual(10_000)
+diff --git a/packages/agent-runtime/src/__tests__/context-pruner-parity.test.ts b/packages/agent-runtime/src/__tests__/context-pruner-parity.test.ts
+index f6aea82c4..ab7eb9ead 100644
+--- a/packages/agent-runtime/src/__tests__/context-pruner-parity.test.ts
++++ b/packages/agent-runtime/src/__tests__/context-pruner-parity.test.ts
+@@ -123,50 +123,52 @@ const assistant = (
+ const toolMessage = (toolName: string, value: unknown): Message => ({
+   role: 'tool',
+   toolCallId: 'call-0',
+   toolName,
+   content: [{ type: 'json', value: value as any }],
+ })
+ 
+ /**
+  * One call per `case` in summarizeToolCall, with inputs chosen to reach the
+  * interesting sub-branches (both arms of each ternary, the array and the
+  * single-agent spawn shapes, todos with and without leftovers).
+  */
+ const EVERY_TOOL_CALL: Array<{
+   toolName: string
+   input: Record<string, unknown>
+ }> = [
+   { toolName: 'read_files', input: { paths: ['a.ts', { path: 'b.ts' }] } },
+   { toolName: 'write_file', input: { path: 'new.ts' } },
+   { toolName: 'str_replace', input: { path: 'edit.ts' } },
+   { toolName: 'propose_write_file', input: { path: 'proposed.ts' } },
+   { toolName: 'propose_str_replace', input: { path: 'proposed-edit.ts' } },
+   { toolName: 'read_subtree', input: { paths: ['src', 'test'] } },
+   { toolName: 'code_search', input: { pattern: 'needle', flags: '-i' } },
+   { toolName: 'code_search', input: { pattern: 'no flags' } },
+   { toolName: 'glob', input: { pattern: '**/*.ts' } },
++  { toolName: 'cloud_read_image', input: { path: 'shot.png' } },
++  { toolName: 'cloud_read_image', input: {} },
+   { toolName: 'list_directory', input: { path: 'src' } },
+   { toolName: 'find_files', input: { prompt: 'where is the parser' } },
+   { toolName: 'run_terminal_command', input: { command: 'bun test' } },
+   {
+     toolName: 'run_terminal_command',
+     input: { command: `echo ${'long '.repeat(40)}` },
+   },
+   {
+     toolName: 'spawn_agents',
+     input: {
+       agents: [
+         { agent_type: 'file-picker', prompt: 'x'.repeat(2_000) },
+         { agent_type: 'thinker', params: { depth: 3 } },
+         { agent_type: 'bare' },
+       ],
+     },
+   },
+   {
+     toolName: 'spawn_agent_inline',
+     input: { agent_type: 'context-pruner', params: { maxContextLength: 1 } },
+   },
+   { toolName: 'spawn_agent_inline', input: { agent_type: 'solo' } },
+   {
+     toolName: 'write_todos',
+     input: {
+@@ -265,50 +267,123 @@ const FIXTURES: Record<string, Message[]> = {
+     assistant('older answer'),
+     user('THE PARENT INSTRUCTIONS', ['INSTRUCTIONS_PROMPT']),
+     user('THE STEP SCAFFOLD', ['STEP_PROMPT']),
+     user('the live question', ['USER_PROMPT']),
+   ],
+ 
+   'long text that gets truncated': [
+     user(`a very long request ${'x'.repeat(60_000)}`),
+     assistant(`a very long answer ${'y'.repeat(20_000)}`),
+     user('the live question', ['USER_PROMPT']),
+   ],
+ 
+   'an image attachment': [
+     {
+       role: 'user',
+       content: [
+         { type: 'text', text: 'look at this' },
+         { type: 'image', image: 'data:image/png;base64,AAAA' },
+       ],
+       sentAt: 1,
+     },
+     assistant('I see it'),
+     user('and now?', ['USER_PROMPT']),
+   ],
+ 
++  'an image with no text, a named file part and a PDF': [
++    {
++      role: 'user',
++      content: [{ type: 'image', image: 'data:image/png;base64,AAAA' }],
++      sentAt: 1,
++    },
++    {
++      role: 'user',
++      content: [
++        {
++          type: 'file',
++          data: 'AAAA',
++          mediaType: 'image/png',
++          filename: 'wireframe.png',
++        },
++      ],
++      sentAt: 1,
++    },
++    {
++      role: 'user',
++      content: [
++        { type: 'text', text: 'and the spec' },
++        { type: 'file', data: 'AAAA', mediaType: 'application/pdf' },
++      ],
++      sentAt: 1,
++    },
++    user('and now?', ['USER_PROMPT']),
++  ],
++
++  'images a tool showed, and one it did not': [
++    user('look at the logo', ['USER_PROMPT']),
++    assistant('reading', [
++      { toolName: 'read_files', input: { paths: ['logo.png'] } },
++    ]),
++    {
++      role: 'tool',
++      toolCallId: 'call-0',
++      toolName: 'read_files',
++      content: [
++        {
++          type: 'json',
++          value: [
++            {
++              path: 'logo.png',
++              content:
++                '[IMAGE] image/png, 2 KB. The image is attached after this result.',
++            },
++          ],
++        },
++        { type: 'media', mediaType: 'image/png', data: 'AAAA' },
++      ],
++    },
++    assistant('viewing', [
++      { toolName: 'cloud_read_image', input: { path: 'shot.png' } },
++    ]),
++    {
++      role: 'tool',
++      toolCallId: 'call-0',
++      toolName: 'cloud_read_image',
++      content: [{ type: 'media', mediaType: 'image/png', data: 'BBBB' }],
++    },
++    assistant('refused', [
++      { toolName: 'read_files', input: { paths: ['other.png'] } },
++    ]),
++    toolMessage('read_files', [
++      {
++        path: 'other.png',
++        content:
++          '[IMAGE] other.png was not opened: this model cannot view images.',
++      },
++    ]),
++  ],
++
+   // Every branch of summarizeToolCall, which is the bulk of the duplicated
+   // code and where a one-sided edit is most likely. Both the populated and the
+   // empty-input form of each case, so the fallback strings are compared too.
+   'every tool the summarizer knows about': [
+     user('exercise everything', ['USER_PROMPT']),
+     assistant(
+       'doing lots',
+       EVERY_TOOL_CALL.map(({ toolName, input }) => ({ toolName, input })),
+     ),
+     assistant(
+       'and again with nothing filled in',
+       EVERY_TOOL_CALL.map(({ toolName }) => ({ toolName, input: {} })),
+     ),
+     assistant('one the switch has never heard of', [
+       { toolName: 'some_future_tool', input: { whatever: true } },
+     ]),
+   ],
+ }
+ 
+ /**
+  * Deliberate divergence #1. With no USER_PROMPT left to restore, the pruner
+  * ends the history on the memory blob (base2 always has an INSTRUCTIONS_PROMPT
+  * after it, so it never ends on the condensed format). base3 has no
+  * instructions prompt, and a second compaction of the runtime's own output has
+  * no USER_PROMPT either — so the runtime appends the continuation prompt
+diff --git a/packages/agent-runtime/src/__tests__/conversation-summary.test.ts b/packages/agent-runtime/src/__tests__/conversation-summary.test.ts
+index b21f09ad9..85f005b8a 100644
+--- a/packages/agent-runtime/src/__tests__/conversation-summary.test.ts
++++ b/packages/agent-runtime/src/__tests__/conversation-summary.test.ts
+@@ -1,74 +1,85 @@
++import { buildCompactionSummaryPrompt } from '@codebuff/common/constants/compaction-summary'
+ import { promptSuccess } from '@codebuff/common/util/error'
+ import { assistantMessage, userMessage } from '@codebuff/common/util/messages'
+ import { beforeEach, describe, expect, it } from 'bun:test'
+ 
+ import {
+   applyConversationSummary,
+   conversationSummaries,
+   generateConversationSummary,
+   isIdleReturn,
+   messageFingerprint,
+   resetConversationSummariesForTest,
+   summaryIsDue,
+   summaryReasoningOptions,
+   summaryRequestHistory,
+   summaryThresholds,
+ } from '../conversation-summary'
+ 
+ import type { SummaryStream } from '../conversation-summary'
+ import type { Message } from '@codebuff/common/types/messages/codebuff-message'
+ import type { ConversationSummary } from '@codebuff/common/types/session-state'
+ 
+ const MINUTE = 60_000
+ const TEXT = `## Objective\n- ${'keep going '.repeat(30)}`
+ 
+ const prompt = (text: string, sentAt: number): Message => ({
+   ...userMessage(text),
+   tags: ['USER_PROMPT'],
+   sentAt,
+ })
+ 
+ const streamOf =
+   (chunks: unknown[], finishReason = 'stop'): SummaryStream =>
+   (request) =>
+     (async function* () {
+       for (const chunk of chunks) yield chunk as any
+       request.onFinishReason(finishReason)
+       return promptSuccess('id')
+     })()
+ 
+ const generate = (history: Message[], stream: SummaryStream) =>
+   generateConversationSummary({
+     history,
+     system: 'system',
+     contextTokens: 50_000,
+     targetTokens: 6_000,
+     stream,
+     signal: new AbortController().signal,
+   })
+ 
++describe('buildCompactionSummaryPrompt', () => {
++  // The summary is all that survives a swap: on a base3 root this rule, not
++  // the mechanical pass's labels, is what keeps an image's name.
++  it('asks for every image by name, since the next agent cannot see them', () => {
++    expect(buildCompactionSummaryPrompt(2_000)).toContain(
++      'Name each image the user attached or a tool showed, by file name when it has one',
++    )
++  })
++})
++
+ describe('summaryThresholds', () => {
+   it('uses 40k and 30k for large windows, shares for small ones', () => {
+     expect(summaryThresholds(200_000)).toEqual({
+       first: 40_000,
+       growth: 30_000,
+     })
+     expect(summaryThresholds(32_000)).toEqual({ first: 6_400, growth: 4_800 })
+   })
+ 
+   it('makes the first summary at the floor and the next after growth', () => {
+     const due = (contextTokens: number, latestContextTokens?: number) =>
+       summaryIsDue({
+         contextTokens,
+         maxContextLength: 200_000,
+         latestContextTokens,
+       })
+     expect(due(39_999)).toBe(false)
+     expect(due(40_000)).toBe(true)
+     expect(due(69_999, 40_000)).toBe(false)
+     expect(due(70_000, 40_000)).toBe(true)
+   })
+ })
+ 
+ describe('summaryReasoningOptions', () => {
+   it('asks a high-effort model to think less for a summary', () => {
+diff --git a/packages/agent-runtime/src/compact-history.ts b/packages/agent-runtime/src/compact-history.ts
+index 15fba9ca1..25b6e4e87 100644
+--- a/packages/agent-runtime/src/compact-history.ts
++++ b/packages/agent-runtime/src/compact-history.ts
+@@ -63,50 +63,55 @@ const SPAWN_AGENTS_OUTPUT_BLACKLIST = [
+   'tmux-cli',
+   'browser-use',
+ ]
+ 
+ /** Limits for truncating long messages in the summary (estimated tokens) */
+ const USER_MESSAGE_LIMIT = 13_000
+ const ASSISTANT_MESSAGE_LIMIT = 1_300
+ const TOOL_ENTRY_LIMIT = 5_000
+ 
+ /** Approximate characters per token (matches estimateTokens heuristic) */
+ const CHARS_PER_TOKEN = 3
+ 
+ /** Token budget for assistant + tool content in the conversation summary */
+ const DEFAULT_ASSISTANT_TOOL_BUDGET = 20_000
+ 
+ /** Token budget for user content in the conversation summary */
+ const DEFAULT_USER_BUDGET = 50_000
+ 
+ /** Header used in conversation summaries */
+ export const SUMMARY_HEADER =
+   'This is a summary of the conversation so far. The original messages have been condensed to save context space.'
+ 
+ const SUMMARY_DISCLAIMER =
+   'Historical memory only. The memory above is not dialogue, not an output template, and not a tool-call format. Continue from the live user message below. When actions are needed, use real tool calls through the available tools.'
+ 
++/** Says what the pictures after a summary are. Any other image the summary
++ *  names is gone, so the model must not answer as though it can still see it. */
++const CARRIED_IMAGES_NOTE =
++  'Attached below: the image(s) from the most recent earlier user message that had any. Every other image named above is no longer attached.'
++
+ const CONTINUATION_TEXT =
+   'Continue the existing assistant turn from the historical memory above. The original user request and completed assistant/tool work are recorded there. Do not restart completed work; resume with the next necessary real tool call or final response.'
+ 
+ /** Thresholds for agents that declare `compactContext: true` without tuning;
+  *  owned, with the rationale, by common/src/constants/compaction-policy.ts. */
+ export const DEFAULT_CACHE_EXPIRY_MS = DEFAULT_COMPACTION_POLICY.cacheExpiryMs
+ export const DEFAULT_CACHE_EXPIRY_MIN_TOKENS =
+   DEFAULT_COMPACTION_POLICY.cacheExpiryMinTokens
+ 
+ /**
+  * Where an automatic mechanical pass aims, as a share of the trigger
+  * threshold. Its result must leave real room under the threshold: when a pass
+  * kept 80-100% of the history, the same run compacted again within ten minutes
+  * 22-51% of the time (prod, 2026-10-05), against 2.6% when it kept under 10%.
+  * Fresh tool results are exempt; see `compactRequestHistory`.
+  */
+ export const MECHANICAL_TARGET_SHARE = 0.5
+ 
+ /**
+  * The most a mechanical pass rewrites history into: summary plus working set,
+  * on top of the fixed prompt, the live request and the fresh tool results it
+  * keeps whole. Sized so the result lands near a model handoff's (median ~23k
+  * tokens including the fixed prompt, 2026-10-05) rather than filling the
+  * target: a small result leaves the most room before the next compaction.
+  */
+@@ -217,50 +222,54 @@ function summarizeToolCall(
+       return path ? `proposed writing: ${path}` : 'proposed a file write'
+     }
+     case 'propose_str_replace': {
+       const path = input.path as string | undefined
+       return path ? `proposed editing: ${path}` : 'proposed a file edit'
+     }
+     case 'read_subtree': {
+       const paths = input.paths as string[] | undefined
+       if (paths && paths.length > 0) {
+         return `inspected subtrees: ${paths.join(', ')}`
+       }
+       return 'inspected a subtree'
+     }
+     case 'code_search': {
+       const pattern = input.pattern as string | undefined
+       const flags = input.flags as string | undefined
+       if (pattern && flags) {
+         return `code search for "${pattern}" (${flags})`
+       }
+       return pattern ? `code search for "${pattern}"` : 'code search'
+     }
+     case 'glob': {
+       const pattern = input.pattern as string | undefined
+       return pattern ? `glob search for ${pattern}` : 'glob search'
+     }
++    case 'cloud_read_image': {
++      const path = input.path as string | undefined
++      return path ? `opened image: ${path}` : 'opened an image'
++    }
+     case 'list_directory': {
+       const path = input.path as string | undefined
+       return path ? `listed directory: ${path}` : 'listed a directory'
+     }
+     case 'find_files': {
+       const prompt = input.prompt as string | undefined
+       return prompt
+         ? `file-finding request: "${prompt}"`
+         : 'file-finding request'
+     }
+     case 'run_terminal_command': {
+       const command = input.command as string | undefined
+       if (command) {
+         const shortCmd =
+           command.length > 50 ? command.slice(0, 50) + '...' : command
+         return `ran command: ${shortCmd}`
+       }
+       return 'ran a terminal command'
+     }
+     case 'spawn_agents':
+     case 'spawn_agent_inline': {
+       const agents = input.agents as
+         | Array<{
+             agent_type: string
+             prompt?: string
+@@ -403,64 +412,120 @@ const SCAFFOLDING_TAGS = [
+  * (see the parity test): it matters much more here, because the cache-expiry
+  * trigger compacts on ordinary idle turns rather than only near the context
+  * limit, so a user message can meet a compaction pass within minutes.
+  */
+ function isConversationSummary(message: Message): boolean {
+   if (message.role !== 'user') return false
+   const text = getTextContent(message)
+   return (
+     text.includes('<conversation_summary>') && text.includes(SUMMARY_HEADER)
+   )
+ }
+ 
+ /**
+  * Real conversation, as opposed to per-step scaffolding the runtime re-adds
+  * anyway or a summary this pass is about to rebuild. Both are excluded from the
+  * historical memory, and neither counts as evidence that the assistant has
+  * started working on the live prompt.
+  */
+ function isRealHistory(message: Message): boolean {
+   return (
+     !message.tags?.some((tag) => SCAFFOLDING_TAGS.includes(tag)) &&
+     !isConversationSummary(message)
+   )
+ }
+ 
++/** A file part counts only when it is a picture: a PDF is not one. */
++function isImagePart(part: Record<string, unknown>): boolean {
++  return (
++    part.type === 'image' ||
++    part.type === 'media' ||
++    (part.type === 'file' &&
++      typeof part.mediaType === 'string' &&
++      part.mediaType.startsWith('image/'))
++  )
++}
++
+ /** The images on the most recent user message that had any. */
+ function lastUserImageParts(messages: Message[]): Array<ImagePart | FilePart> {
+   for (let i = messages.length - 1; i >= 0; i--) {
+     const message = messages[i]
+     if (message.role !== 'user' || !Array.isArray(message.content)) continue
+-    const imageParts = message.content.filter(
+-      (part: Record<string, unknown>) =>
+-        part.type === 'image' || part.type === 'media',
+-    )
++    const imageParts = message.content.filter(isImagePart)
+     if (imageParts.length > 0) return imageParts as Array<ImagePart | FilePart>
+   }
+   return []
+ }
+ 
++/** The history's note for a user message's images, with any file names. */
++function userImageNote(message: Message): string {
++  if (!Array.isArray(message.content)) return ''
++  const images = (message.content as Array<Record<string, unknown>>).filter(
++    isImagePart,
++  )
++  if (images.length === 0) return ''
++  const names = images.flatMap((part) =>
++    typeof part.filename === 'string' && part.filename ? [part.filename] : [],
++  )
++  return names.length > 0
++    ? ` [image(s) were attached: ${names.join(', ')}]`
++    : ' [image(s) were attached]'
++}
++
++/**
++ * The history's note for a tool result that held an image. A read_files result
++ * names its images; any other tool's call, one entry up, says what it opened.
++ * Pixels the model saw must not read as text it can consult, and a read that
++ * returned no pixels must not read as a look at the image.
++ */
++function toolImageNote(toolMessage: ToolMessage): string | undefined {
++  if (!Array.isArray(toolMessage.content)) return undefined
++  const paths: string[] = []
++  let attached = false
++  for (const part of toolMessage.content) {
++    if (part.type === 'media') attached = true
++    if (
++      toolMessage.toolName !== 'read_files' ||
++      part.type !== 'json' ||
++      !Array.isArray(part.value)
++    )
++      continue
++    for (const file of part.value as Array<Record<string, unknown>>) {
++      if (
++        typeof file?.path === 'string' &&
++        typeof file?.content === 'string' &&
++        file.content.startsWith('[IMAGE]')
++      )
++        paths.push(file.path)
++    }
++  }
++  const named = paths.length > 0 ? `: ${paths.join(', ')}` : ''
++  if (attached)
++    return `Image(s) shown by ${toolMessage.toolName}${named}. These were pictures, not text, and are no longer attached; open them again to look.`
++  return paths.length > 0 ? `Image(s) not shown${named}` : undefined
++}
++
+ /** Pulls the historical memory back out of a summary message. */
+ function extractSummaryContent(message: Message): string {
+   const text = getTextContent(message)
+   const match = text.match(
+     /<conversation_summary>([\s\S]*?)<\/conversation_summary>/,
+   )
+   if (!match) return ''
+   let content = match[1].trim()
+   if (content.startsWith(SUMMARY_HEADER)) {
+     content = content.slice(SUMMARY_HEADER.length).trim()
+   }
+   const memoryMatch = content.match(
+     /<historical_memory>([\s\S]*?)<\/historical_memory>/,
+   )
+   if (memoryMatch) {
+     content = memoryMatch[1].trim()
+   }
+   return content
+ }
+ 
+ /**
+  * Parses a previous summary text blob back into role-tagged entries, so a
+  * second compaction can re-apply the budgets over old and new history alike.
+  */
+ function parseSummaryIntoEntries(summaryText: string): SummaryEntry[] {
+@@ -471,60 +536,57 @@ function parseSummaryIntoEntries(summaryText: string): SummaryEntry[] {
+   return chunks.map((chunk) => {
+     const trimmed = chunk.trim()
+     const isUser =
+       trimmed.startsWith('[USER]') ||
+       trimmed.startsWith('User request') ||
+       trimmed.startsWith('User message') ||
+       trimmed.startsWith('Current unresolved user request')
+     return {
+       role: isUser ? ('user' as const) : ('assistant_tool' as const),
+       parts: [trimmed],
+     }
+   })
+ }
+ 
+ /**
+  * Condenses each message into a role-tagged entry. Tool calls become one-line
+  * descriptions, tool results retain user answers, errors and edit outcomes,
+  * and long text is truncated head-and-tail.
+  */
+ function summarizeMessagesIntoEntries(messages: Message[]): SummaryEntry[] {
+   const entries: SummaryEntry[] = []
+ 
+   for (const message of messages) {
+     if (message.role === 'user') {
+       let text = getTextContent(message).trim()
+-      if (!text) continue
++      const imageNote = userImageNote(message)
++      if (!text && !imageNote) continue
+       text = truncateLongText(text, USER_MESSAGE_LIMIT * CHARS_PER_TOKEN)
+-      const hasImages =
+-        Array.isArray(message.content) &&
+-        message.content.some(
+-          (part: Record<string, unknown>) =>
+-            part.type === 'image' || part.type === 'media',
+-        )
+-      const imageNote = hasImages ? ' [image(s) were attached]' : ''
+-      entries.push({ role: 'user', parts: [`[USER]${imageNote}\n${text}`] })
++      entries.push({
++        role: 'user',
++        parts: [text ? `[USER]${imageNote}\n${text}` : `[USER]${imageNote}`],
++      })
+     } else if (message.role === 'assistant') {
+       const textParts: string[] = []
+       const toolSummaries: string[] = []
+ 
+       if (Array.isArray(message.content)) {
+         for (const part of message.content) {
+           if (part.type === 'text' && typeof part.text === 'string') {
+             const textWithoutThinkTags = part.text
+               .replace(/<think>[\s\S]*?<\/think>/g, '')
+               .trim()
+             if (textWithoutThinkTags) {
+               textParts.push(textWithoutThinkTags)
+             }
+           } else if (part.type === 'tool-call') {
+             const input = (part.input as Record<string, unknown>) || {}
+             toolSummaries.push(summarizeToolCall(part.toolName, input))
+           }
+         }
+       }
+ 
+       const parts: string[] = []
+       if (textParts.length > 0) {
+         const combinedText = truncateLongText(
+           textParts.join('\n'),
+           ASSISTANT_MESSAGE_LIMIT * CHARS_PER_TOKEN,
+@@ -543,50 +605,53 @@ function summarizeMessagesIntoEntries(messages: Message[]): SummaryEntry[] {
+       if (entryParts.length > 0) {
+         entries.push({
+           role: 'assistant_tool',
+           parts: [
+             truncateLongText(
+               entryParts.join('\n\n'),
+               TOOL_ENTRY_LIMIT * CHARS_PER_TOKEN,
+             ),
+           ],
+         })
+       }
+     }
+   }
+ 
+   return entries
+ }
+ 
+ /**
+  * Tool results are dropped wholesale except for the parts an agent still needs
+  * after the fact: errors, non-zero exit codes, user answers, edit outcomes and
+  * non-blacklisted subagent output.
+  */
+ function summarizeToolResult(toolMessage: ToolMessage): string[] {
+   const entryParts: string[] = []
+ 
++  const imageNote = toolImageNote(toolMessage)
++  if (imageNote) entryParts.push(imageNote)
++
+   if (Array.isArray(toolMessage.content)) {
+     for (const part of toolMessage.content) {
+       if (part.type === 'json' && part.value) {
+         const value = part.value as Record<string, unknown>
+ 
+         if (value.errorMessage || value.error) {
+           let errorText = String(value.errorMessage || value.error)
+           if (errorText.length > 100) {
+             errorText = errorText.slice(0, 100) + '...'
+           }
+           entryParts.push(
+             `Tool error from ${toolMessage.toolName}: ${errorText}`,
+           )
+         }
+ 
+         if (
+           toolMessage.toolName === 'run_terminal_command' &&
+           'exitCode' in value
+         ) {
+           const exitCode = value.exitCode as number
+           if (exitCode !== 0) {
+             entryParts.push(`Command failed with exit code: ${exitCode}`)
+           }
+         }
+ 
+@@ -758,51 +823,51 @@ function selectEntriesWithinBudget(
+ 
+   return { includedEntries: reverseIncluded.reverse(), newestEntryForced }
+ }
+ 
+ /** Renders chronological entries into the historical memory blob. */
+ function renderSummaryText(entries: SummaryEntry[]): string {
+   return entries.flatMap((entry) => entry.parts).join(ENTRY_SEPARATOR)
+ }
+ 
+ /** Wraps the historical memory in the message the model actually sees. */
+ function buildSummaryMessage(
+   summaryText: string,
+   imageParts: Array<ImagePart | FilePart>,
+   sentAt: number,
+ ): Message {
+   const textPart: TextPart = {
+     type: 'text',
+     text: `<conversation_summary>
+ ${SUMMARY_HEADER}
+ 
+ <historical_memory>
+ ${summaryText}
+ </historical_memory>
+ </conversation_summary>
+ 
+-${SUMMARY_DISCLAIMER}`,
++${SUMMARY_DISCLAIMER}${imageParts.length > 0 ? `\n\n${CARRIED_IMAGES_NOTE}` : ''}`,
+   }
+   return {
+     role: 'user',
+     content: [textPart, ...imageParts],
+     sentAt,
+   }
+ }
+ 
+ export type CompactionResult = {
+   messages: Message[]
+   summaryText: string
+   /**
+    * Snake_case on purpose: these go straight into the Axiom event, under the
+    * same field names the context-pruner logs, so both agents' compactions can
+    * be queried as one series.
+    */
+   stats: {
+     mid_turn: boolean
+     user_budget: number
+     assistant_tool_budget: number
+     previous_summary_entry_count: number
+     user_entry_count: number
+     dropped_user_entry_count: number
+     assistant_tool_entry_count: number
+     dropped_assistant_tool_entry_count: number
+@@ -1114,52 +1179,51 @@ function compactRequestHistory(
+   const workingSet = buildWorkingSet({
+     older,
+     fresh,
+     tokenBudget: Math.min(
+       WORKING_SET_TOKEN_LIMIT,
+       Math.floor((optionalTokens - reservedMemory) * WORKING_SET_SHARE),
+     ),
+     noteBudget: hardRemaining - reservedMemory,
+     now,
+   })
+   const workingSetTokens = workingSet
+     ? countTokensMessages(workingSet.messages)
+     : 0
+   const remainingTokens = Math.max(
+     optionalTokens - workingSetTokens,
+     Math.min(MIN_HISTORY_TOKENS, hardRemaining - workingSetTokens),
+   )
+ 
+   // Keep the newest historical entries that fit the actual remainder. The
+   // 50k/20k summary budgets are ceilings, never permission to exceed a BYOK
+   // window. Count the envelope and images too, not just summary text.
+   const selected = new Set<SummaryEntry>(
+     historicalRequest ? [historicalRequest] : [],
+   )
+   let images = result.messages[0].content.filter(
+-    (part): part is ImagePart | FilePart =>
+-      part.type === 'image' || part.type === 'file',
++    (part): part is ImagePart | FilePart => isImagePart(part),
+   )
+   if (
+     countTokensMessages([
+       buildSummaryMessage(renderSummaryText([...selected]), images, now),
+     ]) > remainingTokens
+   )
+     images = []
+   const entryTokens = (entry: SummaryEntry) =>
+     countTokens(entry.parts.join(ENTRY_SEPARATOR) + ENTRY_SEPARATOR)
+   // The user's earlier requests and the newest to-do list first, out of their
+   // own allowance (USER_MEMORY_TOKENS), newest first; a request too large for
+   // what is left is shortened rather than skipped.
+   const reserved = new Set<SummaryEntry>(selected)
+   const shortened = new Map<SummaryEntry, SummaryEntry>()
+   // Only out of room under the pass's own target as well as the window, so a
+   // pass still lands well below its trigger and does not compact again at once.
+   const userAllowance = Math.max(
+     0,
+     Math.min(
+       USER_MEMORY_TOKENS,
+       Math.min(hardRemaining, targetBudget - prefixTokens - fittedTokens) -
+         workingSetTokens -
+         remainingTokens,
+     ),
+   )
+diff --git a/packages/agent-runtime/src/compaction-working-set.ts b/packages/agent-runtime/src/compaction-working-set.ts
+index 2bad18864..b0cf9d7d6 100644
+--- a/packages/agent-runtime/src/compaction-working-set.ts
++++ b/packages/agent-runtime/src/compaction-working-set.ts
+@@ -44,50 +44,51 @@ export const WORKING_SET_TOKEN_LIMIT = 40_000
+ /** Share of the room left after the live request and fresh results. The rest
+  * goes to the summary, whose user messages matter more than any one file. */
+ export const WORKING_SET_SHARE = 0.4
+ 
+ /** Stubs are cheap, but a long session reads hundreds of files. */
+ const STUB_TOKEN_LIMIT = 3_000
+ const OUTLINE_MAX_ENTRIES = 20
+ const OUTLINE_LINE_CHARS = 80
+ 
+ const EDIT_TOOLS = new Set([
+   'str_replace',
+   'write_file',
+   'propose_str_replace',
+   'propose_write_file',
+ ])
+ 
+ /** Runs agents whose edits stay out of this history. A shell command can
+  * change files too, but it is not counted: most commands change nothing. */
+ const DELEGATING_TOOLS = new Set(['spawn_agents'])
+ 
+ /** Status results (missing, blocked, too large, error) are not contents. */
+ const STATUS_PREFIXES = [
+   '[FILE_DOES_NOT_EXIST]',
+   '[BLOCKED]',
+   '[FILE_OUTSIDE_PROJECT]',
++  '[FILE_TOO_LARGE]',
+   '[FILE_READ_ERROR]',
+   '[IMAGE]',
+ ]
+ 
+ export function isWorkingSetMessage(message: Message): boolean {
+   return message.tags?.includes(WORKING_SET_TAG) ?? false
+ }
+ 
+ type Read = {
+   path: string
+   content: string
+   /** Position in the history; later reads and edits compare against it. */
+   order: number
+ }
+ 
+ function pathOf(input: unknown): string | undefined {
+   const path = (input as { path?: unknown } | undefined)?.path
+   return typeof path === 'string' && path ? path : undefined
+ }
+ 
+ /** Every read_files result and every edit, in history order. */
+ function collectReadsAndEdits(messages: Message[]): {
+   reads: Read[]
+   lastEdit: Map<string, number>
+   /** The newest delegation, which may have edited any file; -1 for none. */
+diff --git a/packages/agent-runtime/src/tools/handlers/__tests__/read-files.test.ts b/packages/agent-runtime/src/tools/handlers/__tests__/read-files.test.ts
+index 16774f8f1..6f4fe0e69 100644
+--- a/packages/agent-runtime/src/tools/handlers/__tests__/read-files.test.ts
++++ b/packages/agent-runtime/src/tools/handlers/__tests__/read-files.test.ts
+@@ -1,28 +1,30 @@
+ import { describe, expect, it } from 'bun:test'
+ 
+-import { handleReadFiles } from '../tool/read-files'
++import { FILE_READ_STATUS } from '@codebuff/common/constants/paths'
++
++import { MAX_IMAGES_PER_READ_FILES_CALL, handleReadFiles } from '../tool/read-files'
+ 
+ import type { CodebuffToolCall } from '@codebuff/common/tools/list'
+ import type { AgentTemplate } from '@codebuff/common/types/agent-template'
+ import type { FileReadWindow } from '@codebuff/common/types/contracts/client'
+ 
+ const agentTemplate = (windowedFileReads: boolean): AgentTemplate => ({
+   id: 'test-agent',
+   displayName: 'Test Agent',
+   spawnerPrompt: 'Test agent',
+   model: 'claude-3-5-sonnet-20241022',
+   inputSchema: {},
+   outputMode: 'structured_output',
+   includeMessageHistory: true,
+   inheritParentSystemPrompt: false,
+   mcpServers: {},
+   toolNames: ['read_files'],
+   spawnableAgents: [],
+   systemPrompt: 'Test system prompt',
+   instructionsPrompt: 'Test instructions',
+   stepPrompt: 'Test step prompt',
+   windowedFileReads,
+ })
+ 
+ async function runHandler(params: {
+   paths: CodebuffToolCall<'read_files'>['input']['paths']
+@@ -176,34 +178,123 @@ describe('handleReadFiles with prototype-member paths', () => {
+             }
+           : { path: filePath, error: '[FILE_DOES_NOT_EXIST]' },
+     })
+ 
+     expect(seenFilePaths).toEqual([['a.ts']])
+     expect(output).toEqual([
+       {
+         type: 'json',
+         value: [
+           { path: 'a.ts', content: 'content' },
+           {
+             path: 'shot.PNG',
+             content:
+               '[IMAGE] image/png, 2 KB. The image is attached after this result.',
+           },
+           {
+             path: 'missing.jpg',
+             content: '[FILE_DOES_NOT_EXIST]',
+           },
+         ],
+       },
+       { type: 'media', data: 'iVBORw0KGgo=', mediaType: 'image/png' },
+     ])
+   })
+ 
++  it('attaches at most the capped images, in path order, and leaves other paths alone', async () => {
++    const images = Array.from(
++      { length: MAX_IMAGES_PER_READ_FILES_CALL + 2 },
++      (_, i) => `shot-${i}.png`,
++    )
++    const seenFilePaths: string[][] = []
++    const opened: string[] = []
++    const { output } = await handleReadFiles({
++      previousToolCallFinished: Promise.resolve(),
++      toolCall: {
++        toolName: 'read_files',
++        toolCallId: 'tc-1',
++        input: { paths: ['a.ts', ...images, 'b.ts'] },
++      },
++      agentTemplate: agentTemplate(false),
++      fileContext: { tokenCallers: {} } as any,
++      requestFiles: async ({ filePaths }) => {
++        seenFilePaths.push(filePaths)
++        return Object.fromEntries(filePaths.map((path) => [path, 'content']))
++      },
++      requestImageFile: async ({ filePath }) => {
++        opened.push(filePath)
++        return {
++          path: filePath,
++          data: filePath,
++          mediaType: 'image/png',
++          bytes: 2048,
++        }
++      },
++    })
++
++    expect(MAX_IMAGES_PER_READ_FILES_CALL).toBe(4)
++    const attached = images.slice(0, MAX_IMAGES_PER_READ_FILES_CALL)
++    const deferred = images.slice(MAX_IMAGES_PER_READ_FILES_CALL)
++    // Past the cap the host is never asked: no VM read, no bytes.
++    expect(opened).toEqual(attached)
++    expect(seenFilePaths).toEqual([['a.ts', 'b.ts']])
++    expect(output.slice(1)).toEqual(
++      attached.map((data) => ({
++        type: 'media',
++        data,
++        mediaType: 'image/png',
++      })),
++    )
++    const results = output[0].value as Array<{ path: string; content: string }>
++    expect(results.map((file) => file.path)).toEqual([
++      'a.ts',
++      'b.ts',
++      ...images,
++    ])
++    expect(results.slice(0, 2).map((file) => file.content)).toEqual([
++      'content',
++      'content',
++    ])
++    for (const file of results.slice(-deferred.length)) {
++      expect(file.content).toStartWith(FILE_READ_STATUS.ERROR)
++      expect(file.content).toContain('at most 4 images per call')
++      expect(file.content).toContain('in a later call')
++    }
++  })
++
++  it('counts a repeated image once toward the cap', async () => {
++    const opened: string[] = []
++    const paths = ['a.png', 'a.png', 'b.png', 'c.png', 'd.png']
++    const { output } = await handleReadFiles({
++      previousToolCallFinished: Promise.resolve(),
++      toolCall: {
++        toolName: 'read_files',
++        toolCallId: 'tc-1',
++        input: { paths },
++      },
++      agentTemplate: agentTemplate(false),
++      fileContext: { tokenCallers: {} } as any,
++      requestFiles: async () => ({}),
++      requestImageFile: async ({ filePath }) => {
++        opened.push(filePath)
++        return {
++          path: filePath,
++          data: filePath,
++          mediaType: 'image/png',
++          bytes: 2048,
++        }
++      },
++    })
++
++    expect(opened).toEqual(['a.png', 'b.png', 'c.png', 'd.png'])
++    expect(output).toHaveLength(5)
++  })
++
+   it('reads images as ordinary files when the host cannot read binary', async () => {
+     const { seenFilePaths } = await runHandler({
+       paths: ['shot.png'],
+       windowed: false,
+     })
+ 
+     expect(seenFilePaths).toEqual(['shot.png'])
+   })
+ })
+diff --git a/packages/agent-runtime/src/tools/handlers/tool/read-files.ts b/packages/agent-runtime/src/tools/handlers/tool/read-files.ts
+index c02cb5477..083032ed6 100644
+--- a/packages/agent-runtime/src/tools/handlers/tool/read-files.ts
++++ b/packages/agent-runtime/src/tools/handlers/tool/read-files.ts
+@@ -1,46 +1,56 @@
+ import { isSupportedImageExtension } from '@codebuff/common/constants/images'
++import { FILE_READ_STATUS } from '@codebuff/common/constants/paths'
+ import { jsonToolResult, mediaToolResult } from '@codebuff/common/util/messages'
+ 
+ import { getFileReadingUpdates } from '../../../get-file-reading-updates'
+ import { renderReadFilesResult } from '../../../util/render-read-files-result'
+ 
+ import type { CodebuffToolHandlerFunction } from '../handler-function-type'
+ import type {
+   CodebuffToolCall,
+   CodebuffToolOutput,
+ } from '@codebuff/common/tools/list'
+ import type { AgentTemplate } from '@codebuff/common/types/agent-template'
+ import type {
+   FileReadWindow,
+   RequestImageFileFn,
+ } from '@codebuff/common/types/contracts/client'
+ import type { ParamsExcluding } from '@codebuff/common/types/function-params'
+ import type { ProjectFileContext } from '@codebuff/common/util/file'
+ 
+ type ToolName = 'read_files'
+ 
++/**
++ * The most images one read_files call attaches, in path order. An attached
++ * image is re-sent on every later step until compaction, so one batched read
++ * of large images would otherwise weigh on every request after it. Cloud reads
++ * up to 11 MB each. Only this handler sees a whole call: a host's image hook
++ * sees one file.
++ */
++export const MAX_IMAGES_PER_READ_FILES_CALL = 4
++
+ function isImagePath(path: string): boolean {
+   const dot = path.lastIndexOf('.')
+   const separator = Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'))
+   return dot > separator && isSupportedImageExtension(path.slice(dot))
+ }
+ 
+ export const handleReadFiles = (async (
+   params: {
+     previousToolCallFinished: Promise<void>
+     toolCall: CodebuffToolCall<ToolName>
+     agentTemplate: AgentTemplate
+ 
+     fileContext: ProjectFileContext
+     requestImageFile?: RequestImageFileFn
+   } & ParamsExcluding<
+     typeof getFileReadingUpdates,
+     'requestedFiles' | 'fileWindows'
+   >,
+ ): Promise<{ output: CodebuffToolOutput<ToolName> }> => {
+   const {
+     previousToolCallFinished,
+     toolCall,
+     agentTemplate,
+ 
+     fileContext,
+@@ -76,52 +86,62 @@ export const handleReadFiles = (async (
+       typeof entry === 'string'
+         ? {}
+         : { offset: entry.offset, limit: entry.limit }
+     const key = `${window.offset ?? ''}:${window.limit ?? ''}`
+     const seen = (seenWindows[path] ??= new Set())
+     if (seen.has(key) || seen.has(':')) continue
+     seen.add(key)
+     if (key === ':') {
+       fileWindows[path] = [window]
+       continue
+     }
+     ;(fileWindows[path] ??= []).push(window)
+   }
+ 
+   const addedFiles =
+     requestedFiles.length > 0 || imagePaths.length === 0
+       ? await getFileReadingUpdates({
+           ...params,
+           requestedFiles,
+           fileWindows: windowed ? fileWindows : undefined,
+         })
+       : []
+ 
+   const images = requestImageFile
+     ? await Promise.all(
+-        imagePaths.map((filePath) => requestImageFile({ filePath })),
++        imagePaths
++          .slice(0, MAX_IMAGES_PER_READ_FILES_CALL)
++          .map((filePath) => requestImageFile({ filePath })),
+       )
+     : []
+-  const imageEntries = images.map((image) => ({
+-    path: image.path,
+-    content:
+-      'data' in image
+-        ? `[IMAGE] ${image.mediaType}, ${Math.max(1, Math.round(image.bytes / 1024))} KB. The image is attached after this result.`
+-        : image.error,
+-  }))
++  const imageEntries = [
++    ...images.map((image) => ({
++      path: image.path,
++      content:
++        'data' in image
++          ? `[IMAGE] ${image.mediaType}, ${Math.max(1, Math.round(image.bytes / 1024))} KB. The image is attached after this result.`
++          : image.error,
++    })),
++    // A read status, not [IMAGE]: compaction counts [IMAGE] entries beside an
++    // attachment as images the model saw, and it never saw these.
++    ...imagePaths.slice(MAX_IMAGES_PER_READ_FILES_CALL).map((path) => ({
++      path,
++      content: `${FILE_READ_STATUS.ERROR} [Not read: read_files attaches at most ${MAX_IMAGES_PER_READ_FILES_CALL} images per call. Read this image in a later call.]`,
++    })),
++  ]
+ 
+   return {
+     output: [
+       ...jsonToolResult(
+         renderReadFilesResult(
+           [...addedFiles, ...imageEntries],
+           fileContext.tokenCallers ?? {},
+         ),
+       ),
+       ...images.flatMap((image) =>
+         'data' in image
+           ? mediaToolResult({ data: image.data, mediaType: image.mediaType })
+           : [],
+       ),
+     ],
+   }
+ }) satisfies CodebuffToolHandlerFunction<ToolName>
+diff --git a/sdk/src/run.ts b/sdk/src/run.ts
+index 3bbcc5d2e..334128851 100644
+--- a/sdk/src/run.ts
++++ b/sdk/src/run.ts
+@@ -908,54 +908,54 @@ async function runOnce({
+           fileFilter,
+           cwd,
+           fs,
+           ...(refuseNonText ? { refuseNonText } : {}),
+         })
+       if (!projectFence || overrideTools?.read_files) return read(filePaths)
+       // confineFileToolsToProject: refuse each outside path, read the rest.
+       const refused = Object.create(null) as Record<string, string | null>
+       const inside: string[] = []
+       for (const filePath of filePaths) {
+         if (!filePath) continue
+         if (await projectFence.resolve(filePath)) {
+           inside.push(filePath)
+         } else {
+           const { relativePath } = resolveFilePath(
+             requireCwd(cwd, 'read_files'),
+             filePath,
+           )
+           refused[relativePath] =
+             `${FILE_READ_STATUS.OUTSIDE_PROJECT} ${PROJECT_UNDERSTANDING_OUTSIDE_PROJECT_MESSAGE}`
+         }
+       }
+       const loaded = inside.length > 0 ? await read(inside) : {}
+       return { ...refused, ...loaded }
+     },
+-    // Only a local read can return an image's bytes. An override reads a
+-    // remote workspace through the text-only contract, so it keeps images.
+-    // refuseNonTextFileReads leaves images to the text read, which refuses
+-    // them.
++    // A remote host reads an image through its own read_image hook: its
++    // read_files override is the text-only contract. Without a hook it keeps
++    // images in that text read, and so does refuseNonTextFileReads, which
++    // refuses them.
+     requestImageFile: overrideTools?.read_image ?? (
+       overrideTools?.read_files || refuseNonText
+         ? undefined
+         : async ({ filePath }) => {
+             const imageCwd = requireCwd(cwd, 'read_files')
+             if (projectFence && !(await projectFence.resolve(filePath))) {
+               return {
+                 path: resolveFilePath(imageCwd, filePath).relativePath,
+                 error: `${FILE_READ_STATUS.OUTSIDE_PROJECT} ${PROJECT_UNDERSTANDING_OUTSIDE_PROJECT_MESSAGE}`,
+               }
+             }
+             return getImageFile({
+               filePath,
+               cwd: imageCwd,
+               fs,
+               fileFilter,
+             })
+           }),
+     requestOptionalFile: async ({ filePath }) => {
+       const files = await readFiles({
+         filePaths: [filePath],
+         override: overrideTools?.read_files,
+         fileFilter,
+         cwd,
+         fs,
