@@ -1,0 +1,1254 @@
+diff --git a/cli/src/commands/__tests__/compact-command.test.ts b/cli/src/commands/__tests__/compact-command.test.ts
+new file mode 100644
+index 000000000..cb3b16c17
+--- /dev/null
++++ b/cli/src/commands/__tests__/compact-command.test.ts
+@@ -0,0 +1,62 @@
++import { describe, expect, test } from 'bun:test'
++
++describe('/compact command', () => {
++  test('sends the runtime its exact command, or waits out a running turn', () => {
++    const commandRegistryUrl = new URL(
++      '../command-registry.ts',
++      import.meta.url,
++    ).href
++    const slashCommandsUrl = new URL(
++      '../../data/slash-commands.ts',
++      import.meta.url,
++    ).href
++
++    const result = Bun.spawnSync({
++      cmd: [
++        'bun',
++        '--eval',
++        `
++          import assert from 'node:assert/strict'
++          import { findCommand } from ${JSON.stringify(commandRegistryUrl)}
++          import { SLASH_COMMANDS } from ${JSON.stringify(slashCommandsUrl)}
++
++          assert(SLASH_COMMANDS.some((cmd) => cmd.id === 'compact'))
++          const compact = findCommand('compact')
++          assert(compact)
++
++          const sent = []
++          const queued = []
++          const noop = () => {}
++          const params = (streaming) => ({
++            agentMode: 'DEFAULT',
++            inputValue: '/compact',
++            isStreaming: streaming,
++            streamMessageIdRef: { current: null },
++            isChainInProgressRef: { current: false },
++            inputRef: { current: null },
++            saveToHistory: noop,
++            setInputValue: noop,
++            setInputFocused: noop,
++            scrollToLatest: noop,
++            sendMessage: (message) => sent.push(message),
++            addToQueue: (message) => queued.push(message),
++          })
++
++          await compact.handler(params(false), '')
++          assert.deepEqual(sent, [{ content: '/compact', agentMode: 'DEFAULT' }])
++          assert.deepEqual(queued, [])
++
++          await compact.handler(params(true), '')
++          assert.equal(sent.length, 1)
++          assert.deepEqual(queued, ['/compact'])
++        `,
++      ],
++      env: { ...process.env },
++      stderr: 'pipe',
++      stdout: 'pipe',
++    })
++
++    expect(result.stderr.toString()).not.toContain('error:')
++    expect(result.exitCode).toBe(0)
++  })
++})
+diff --git a/cli/src/commands/command-registry.ts b/cli/src/commands/command-registry.ts
+index 3ca7b2c4a..fad1be37a 100644
+--- a/cli/src/commands/command-registry.ts
++++ b/cli/src/commands/command-registry.ts
+@@ -35,50 +35,52 @@ import {
+   buildSkillPrompt,
+ } from './prompt-builders'
+ import { runBashCommand } from './router'
+ import { handleUsageCommand } from './usage'
+ import { handleByokCommand } from './byok'
+ import { returnToFreebuffLanding } from '../hooks/use-freebuff-session'
+ import { useThemeStore } from '../hooks/use-theme'
+ import { LOGIN_WEBSITE_URL, WEBSITE_URL } from '../login/constants'
+ import { startNewChat } from '../project-files'
+ import { useChatStore } from '../state/chat-store'
+ import { stopActiveRun } from '../utils/active-run'
+ import { useFeedbackStore } from '../state/feedback-store'
+ import { useLoginStore } from '../state/login-store'
+ import {
+   AGENT_MODES,
+   END_SESSION_MESSAGE,
+   IS_FREEBUFF,
+ } from '../utils/constants'
+ import { exitCliCleanly } from '../utils/exit-cleanly'
+ import { getSystemMessage, getUserMessage } from '../utils/message-history'
+ import { capturePendingAttachments } from '../utils/pending-attachments'
+ import { getSkillByName } from '../utils/skill-registry'
+ 
+ import type { MultilineInputHandle } from '../components/multiline-input'
+ import type { InputValue, PendingAttachment } from '../types/store'
++import { CLOUD_COMPACT_PROMPT } from '@codebuff/common/desktop-cloud/compact'
++
+ import type { ChatMessage } from '../types/chat'
+ import type { SendMessageFn } from '../types/contracts/send-message'
+ import type { User } from '../utils/auth'
+ import type { AgentMode } from '../utils/constants'
+ import type { UseMutationResult } from '@tanstack/react-query'
+ 
+ export type RouterParams = {
+   agentMode: AgentMode
+   inputRef: React.MutableRefObject<MultilineInputHandle | null>
+   inputValue: string
+   isChainInProgressRef: React.MutableRefObject<boolean>
+   isStreaming: boolean
+   logoutMutation: UseMutationResult<boolean, Error, void, unknown>
+   streamMessageIdRef: React.MutableRefObject<string | null>
+   addToQueue: (message: string, attachments?: PendingAttachment[]) => void
+   /** Whether the message queue currently holds anything. Steering checks it
+    *  so a mid-turn submit can't overtake earlier queued submissions. */
+   hasQueuedMessages?: () => boolean
+   clearMessages: () => void
+   saveToHistory: (message: string) => void
+   scrollToLatest: () => void
+   sendMessage: SendMessageFn
+   setCanProcessQueue: (value: React.SetStateAction<boolean>) => void
+   setInputFocused: (focused: boolean) => void
+   setInputValue: (
+@@ -480,50 +482,77 @@ const ALL_COMMANDS: CommandDefinition[] = [
+ 
+       // Clear the conversation and rotate to a fresh chat directory, so the
+       // next message doesn't overwrite the previous conversation's history
+       params.setMessages(() => [])
+       params.clearMessages()
+       startNewChat()
+       params.saveToHistory(params.inputValue.trim())
+       clearInput(params)
+       // If user provided a message, send it as the first message in the new chat
+       if (trimmedArgs) {
+         // Re-enable queue processing so the message can be sent
+         params.setCanProcessQueue(true)
+         params.sendMessage({
+           content: trimmedArgs,
+           agentMode: params.agentMode,
+         })
+         setTimeout(() => {
+           params.scrollToLatest()
+         }, 0)
+       } else {
+         // Only disable queue if we're not sending a message
+         params.setCanProcessQueue(false)
+       }
+     },
+   }),
++  // The runtime's manual compaction: a run of its own, with no coding step. The
++  // server bills its summary like any request of this session; a chat too small
++  // to shrink costs nothing. It waits out a running turn.
++  defineCommand({
++    name: 'compact',
++    handler: (params) => {
++      params.saveToHistory(params.inputValue.trim())
++      clearInput(params)
++      if (
++        params.isStreaming ||
++        params.streamMessageIdRef.current ||
++        params.isChainInProgressRef.current
++      ) {
++        params.addToQueue(CLOUD_COMPACT_PROMPT)
++        params.setInputFocused(true)
++        params.inputRef.current?.focus()
++        return
++      }
++      params.sendMessage({
++        content: CLOUD_COMPACT_PROMPT,
++        agentMode: params.agentMode,
++      })
++      setTimeout(() => {
++        params.scrollToLatest()
++      }, 0)
++    },
++  }),
+   defineCommand({
+     name: 'init',
+     handler: async (params) => {
+       const { postUserMessage } = handleInitializationFlowLocally()
+       const trimmed = params.inputValue.trim()
+ 
+       params.saveToHistory(trimmed)
+       clearInput(params)
+ 
+       // Check streaming/queue state
+       if (
+         params.isStreaming ||
+         params.streamMessageIdRef.current ||
+         params.isChainInProgressRef.current
+       ) {
+         const pendingAttachments = capturePendingAttachments()
+         params.addToQueue(trimmed, pendingAttachments)
+         params.setInputFocused(true)
+         params.inputRef.current?.focus()
+         return
+       }
+ 
+       params.sendMessage({
+         content: trimmed,
+         agentMode: params.agentMode,
+diff --git a/cli/src/data/slash-commands.ts b/cli/src/data/slash-commands.ts
+index e9d234de5..0fcc15bdf 100644
+--- a/cli/src/data/slash-commands.ts
++++ b/cli/src/data/slash-commands.ts
+@@ -101,50 +101,55 @@ const ALL_SLASH_COMMANDS: SlashCommand[] = [
+     label: 'usage',
+     description: 'View credits and subscription quota',
+     aliases: ['credits'],
+   },
+   {
+     id: 'subscribe',
+     label: 'subscribe',
+     description: 'Subscribe to get more usage',
+     aliases: ['strong', 'sub', 'buy-credits'],
+   },
+   {
+     id: 'interview',
+     label: 'interview',
+     description: 'AI asks a series of questions to flesh out request into a spec',
+   },
+   {
+     id: 'plan',
+     label: 'plan',
+     description: 'Create a plan for how to implement a request',
+   },
+   {
+     id: 'review',
+     label: 'review',
+     description: 'Review code changes',
+   },
++  {
++    id: 'compact',
++    label: 'compact',
++    description: 'Compact this conversation now: the agent continues from a summary',
++  },
+   {
+     id: 'queue',
+     label: 'queue',
+     description: 'Edit, reorder, or delete the messages waiting to be sent',
+     aliases: ['queued'],
+   },
+   {
+     id: 'todo',
+     label: 'todo',
+     description: 'View the current checklist and progress',
+     aliases: ['todos'],
+   },
+   {
+     id: 'new',
+     label: 'new',
+     description: 'Clear the conversation history and start a new chat',
+     aliases: ['n', 'clear', 'c', 'reset'],
+     implicitCommand: true,
+   },
+   {
+     id: 'history',
+     label: 'history',
+     description: 'Browse and resume past conversations',
+     aliases: ['chats'],
+   },
+diff --git a/cli/src/hooks/use-send-message.ts b/cli/src/hooks/use-send-message.ts
+index 9b30bdabf..c11c16ced 100644
+--- a/cli/src/hooks/use-send-message.ts
++++ b/cli/src/hooks/use-send-message.ts
+@@ -1,30 +1,35 @@
+ import {
+   freebuffChatNeedsAdmission,
+   requestFreebuffChatAdmission,
+ } from '../state/freebuff-chat-store'
++import {
++  compactOutcome,
++  isCloudCompactPrompt,
++} from '@codebuff/common/desktop-cloud/compact'
+ import { capturePendingAttachments } from '../utils/pending-attachments'
++import { getSystemMessage } from '../utils/message-history'
+ import { randomUUID } from 'node:crypto'
+ 
+ import { useCallback, useEffect, useRef } from 'react'
+ 
+ import { setCurrentChatId } from '../project-files'
+ import { createStreamController } from './stream-state'
+ import { useChatStore } from '../state/chat-store'
+ import { getFreebuffInstanceId } from './use-freebuff-session'
+ import {
+   getSelectedFreebuffReasoningEffort,
+   getSelectedFreebuffModel,
+ } from '../state/freebuff-model-store'
+ import { getCodebuffClient } from '../utils/codebuff-client'
+ import {
+   byokLoadFailureMessage,
+   isByokSetupOpen,
+   resolveByokConnection,
+   selectedByokConnection,
+ } from '../utils/byok'
+ import { AGENT_MODE_TO_COST_MODE, IS_FREEBUFF } from '../utils/constants'
+ import { createEventHandlerState } from '../utils/create-event-handler-state'
+ import { captureCliFunnel, cliFunnelKey } from '../utils/cli-product-funnel'
+ import { createCliRunFunnel } from '../utils/cli-run-funnel'
+ import { createRunConfig } from '../utils/create-run-config'
+ import { getAgentIdForMode } from '../utils/freebuff-agent-selection'
+@@ -677,50 +682,51 @@ export const useSendMessage = ({
+       // (closed terminal, crash) can't lose the user's prompt, then keep the
+       // checkpoint fresh from SDK run-state snapshots while the run streams.
+       // The completion save below overwrites this with the final state.
+       saveChatState(
+         latestRunStateSnapshot,
+         useChatStore.getState().messages,
+         runChatDir,
+       )
+ 
+       // Execute SDK run with streaming handlers
+       try {
+         // A sponsored turn loads NO local agent definitions: a `.agents/`
+         // definition is repository-authored content a sponsored run has no
+         // business loading, and its agent is the pinned sponsored one.
+         let agentDefinitions = sponsored ? [] : loadAgentDefinitions()
+         let resolvedAgent = sponsored
+           ? sponsored.plan.agent
+           : resolveAgent(agentMode, agentId, agentDefinitions)
+ 
+         const promptWithBashContext = bashContextForPrompt
+           ? bashContextForPrompt + finalContent
+           : finalContent
+         // The conversation's own agent is told what a sponsored run did to
+         // the files it remembers, once, on its next turn.
+         const sponsoredBrief = sponsored ? null : takePendingSponsoredBrief()
++        const compactRun = { started: false, compacted: false }
+         const effectivePrompt = sponsoredBrief
+           ? `${sponsoredBrief}\n\n${buildPromptWithContext(promptWithBashContext, messageContent)}`
+           : buildPromptWithContext(promptWithBashContext, messageContent)
+ 
+         const eventHandlerState = createEventHandlerState({
+           isActive: () => !abortController.signal.aborted && runChatIsCurrent(),
+           streamRefs,
+           setStreamingAgents,
+           setStreamStatus,
+           aiMessageId,
+           updater,
+           hasReceivedContentRef,
+           addActiveSubagent,
+           removeActiveSubagent,
+           agentMode,
+           setHasReceivedPlanResponse,
+           logger,
+           setIsRetrying,
+           onTotalCost: (cost: number) => {
+             // The sponsor's grant paid for a sponsored turn; it is not the
+             // user's spend and is not shown as theirs.
+             if (sponsored) return
+             actualCredits = cost
+             // Only add to session credits if not covered by subscription
+             // (subscription credits are shown separately in the UI)
+@@ -832,50 +838,56 @@ export const useSendMessage = ({
+                 const pinnedSnapshot = pinByokConnection(snapshot, selectedByok)
+                 latestRunStateSnapshot = pinnedSnapshot
+                 // Don't persist once the run is aborted or the user has switched
+                 // chats: the store's messages then belong to a different
+                 // conversation, and checkpointing them into this run's directory
+                 // would overwrite that chat's transcript with foreign (possibly
+                 // empty) state — the chat would then be hidden from /history.
+                 if (abortController.signal.aborted || !runChatIsCurrent()) {
+                   return
+                 }
+                 previousRunStateRef.current = pinnedSnapshot
+                 // Persist asynchronously and coalescing: the periodic snapshot
+                 // fires ~every 5s at step boundaries, and a synchronous save of the
+                 // (growing) transcript on the render/input thread is what stalls
+                 // long sessions. The authoritative synchronous saves below still
+                 // capture the final state.
+                 scheduleCheckpointSave(
+                   pinnedSnapshot,
+                   useChatStore.getState().messages,
+                   runChatDir,
+                 )
+               },
+               // Usually arrives after the run returned. Only while this run's
+               // state is still the chat's latest: a newer turn has the
+               // summary in memory and saves it itself.
++              onCompactionStart: () => {
++                compactRun.started = true
++              },
++              onCompaction: () => {
++                compactRun.compacted = true
++              },
+               onCompactionSummary: (summary) => {
+                 const saved = adoptedRunState
+                 if (
+                   !saved ||
+                   previousRunStateRef.current !== saved ||
+                   !runChatIsCurrent()
+                 )
+                   return
+                 const patched = withCompactionSummary(saved, summary)
+                 if (!patched) return
+                 adoptedRunState = patched
+                 previousRunStateRef.current = patched
+                 setRunState(patched)
+                 saveChatState(
+                   patched,
+                   useChatStore.getState().messages,
+                   runChatDir,
+                 )
+               },
+               // Mid-turn steering: the agent loop calls this at each step
+               // boundary; texts pushed by the router since the last boundary are
+               // injected into the running turn as user prompts. The transcript
+               // bubble was already echoed at push time (router), so this only
+               // hands over the texts. Returning [] on abort leaves the entries
+               // in the buffer for the leftover handling below.
+@@ -1005,50 +1017,61 @@ export const useSendMessage = ({
+         // conversation: saving here would overwrite it with this run's
+         // context, and previousRunStateRef/setRunState would leak this run's
+         // agent state into the other chat. (A plain Esc interrupt keeps the
+         // same chat, so the interrupted turn is still saved as before.)
+         if (!abortController.signal.aborted && runChatIsCurrent()) {
+           // Finalize: persist state and mark complete. A sponsored turn's run
+           // state is NEVER adopted: the conversation's agent keeps its own
+           // memory, and the sponsored run's history must not become part of it.
+           if (!sponsored) {
+             previousRunStateRef.current = runState
+             setRunState(runState)
+             adoptedRunState = runState
+           }
+           setIsRetrying(false)
+ 
+           // Drop any queued/in-flight async checkpoint first so a stale write
+           // can't land after this authoritative final save.
+           await settleCheckpointSave()
+         } else if (!sponsored && runChatIsCurrent()) {
+           // An interrupted run is not adopted, but the server already created
+           // its root run: move the ad trace pointer past it, or the next
+           // prompt's offer and display requests would name it as the run
+           // carrying that prompt.
+           useChatStore.getState().noteFinishedRunForAdTrace(runState)
+         }
++        // A compact streams nothing, so nothing else says what it did.
++        if (
++          isCloudCompactPrompt(content) &&
++          runState.output?.type !== 'error' &&
++          !abortController.signal.aborted &&
++          runChatIsCurrent()
++        )
++          setMessages((prev) => [
++            ...prev,
++            getSystemMessage(compactOutcome(compactRun)),
++          ])
+         handleRunCompletion({
+           runState,
+           actualCredits,
+           agentMode,
+           timerController,
+           updater,
+           aiMessageId,
+           wasAbortedByUser: abortController.signal.aborted,
+           // A sponsored turn is not billed to the user's Freebuff session, so
+           // none of the session-gate errors that assume it was apply; they are
+           // read exactly as a BYOK turn's are.
+           isByokRun: shouldUseByok || Boolean(sponsored),
+           hasReceivedContent: hasReceivedContentRef.current,
+           setStreamStatus,
+           setCanProcessQueue,
+           updateChainInProgress,
+           setHasReceivedPlanResponse,
+           resumeQueue,
+           isProcessingQueueRef,
+           isQueuePausedRef,
+         })
+         if (!abortController.signal.aborted && runChatIsCurrent()) {
+           // Completion flushes the last batched text and marks the message
+           // finished. Persist that committed state, not the preceding frame --
+           // and for a sponsored turn, the transcript with the CONVERSATION's
+diff --git a/cli/src/utils/create-run-config.ts b/cli/src/utils/create-run-config.ts
+index ebcee2296..88a00cdcb 100644
+--- a/cli/src/utils/create-run-config.ts
++++ b/cli/src/utils/create-run-config.ts
+@@ -16,50 +16,53 @@ import type {
+   AgentDefinition,
+   ConversationSummary,
+   FileFilter,
+   MessageContent,
+   ResolvedByokConnection,
+   RunState,
+ } from '@codebuff/sdk'
+ 
+ export type CreateRunConfigParams = {
+   logger: Logger
+   agent: AgentDefinition | string
+   prompt: string
+   content: MessageContent[] | undefined
+   previousRunState: RunState | null
+   agentDefinitions: AgentDefinition[]
+   eventHandlerState: EventHandlerState
+   signal: AbortSignal
+   costMode?: 'free' | 'lite' | 'normal' | 'max' | 'experimental' | 'ask'
+   /** Runtime-only direct inference credential. Never persist this object. */
+   byok?: ResolvedByokConnection
+   extraCodebuffMetadata?: Record<string, string>
+   /** Periodic in-flight RunState checkpoints (see RunOptions.onStateSnapshot). */
+   onStateSnapshot?: (runState: RunState) => void
+   /** A background summary finished (see RunOptions.onCompactionSummary). */
+   onCompactionSummary?: (summary: ConversationSummary) => void
++  /** See RunOptions.onCompactionStart and onCompaction. */
++  onCompactionStart?: () => void
++  onCompaction?: () => void
+   /** Mid-turn steering: drained by the agent loop at each step boundary;
+    *  returned texts are appended as user prompts and keep the turn going
+    *  (see RunOptions.drainSteeringMessages). */
+   drainSteeringMessages?: () => string[]
+   /** Best-effort native analytics observers, independent of UI projection. */
+   observeEvent?: (event: PrintModeEvent) => void
+   observeChunk?: (event: StreamChunkEvent) => void
+ }
+ 
+ const SENSITIVE_EXTENSIONS = new Set([
+   '.pem',
+   '.key',
+   '.p12',
+   '.pfx',
+   '.jks',
+   '.keystore',
+   '.crt',
+   '.cer',
+ ])
+ const SENSITIVE_BASENAMES = new Set([
+   '.htpasswd',
+   '.netrc',
+   'credentials',
+   '.npmrc',
+   '.yarnrc',
+@@ -92,78 +95,82 @@ export function isSensitiveFile(filePath: string): boolean {
+   const basenameLower = basename.toLowerCase()
+   const ext = path.extname(filePath).toLowerCase()
+ 
+   return (
+     isSensitiveEnvFilePath(filePath) ||
+     SENSITIVE_EXTENSIONS.has(ext) ||
+     SENSITIVE_BASENAMES.has(basenameLower) ||
+     matchesPattern(basenameLower)
+   )
+ }
+ 
+ export const createRunConfig = (params: CreateRunConfigParams) => {
+   const {
+     logger,
+     agent,
+     prompt,
+     content,
+     previousRunState,
+     agentDefinitions,
+     eventHandlerState,
+     costMode,
+     byok,
+     extraCodebuffMetadata,
+     onStateSnapshot,
+     onCompactionSummary,
++    onCompactionStart,
++    onCompaction,
+     drainSteeringMessages,
+   } = params
+ 
+   const handleEvent = createEventHandler(eventHandlerState)
+   const handleStreamChunk = createStreamChunkHandler(eventHandlerState)
+   return {
+     logger,
+     agent,
+     prompt,
+     content,
+     previousRun: previousRunState ?? undefined,
+     agentDefinitions,
+     // A base3 root uses the symbol index only for read_files' referencedBy,
+     // which it does without (bench in #7364), so its new chats skip the parse.
+     // base2, Codebuff and custom roots keep it; a chat that later switches to
+     // one keeps the state it started with.
+     skipSymbolIndex: FREEBUFF_BASE3_AGENT_IDS.has(
+       typeof agent === 'string' ? agent : agent.id,
+     ),
+     maxAgentSteps: MAX_AGENT_STEPS_DEFAULT,
+     handleStreamChunk: (event: StreamChunkEvent) => {
+       handleStreamChunk(event)
+       if (eventHandlerState.isActive?.() !== false) {
+         try {
+           params.observeChunk?.(event)
+         } catch {
+           // Analytics must not fail a run.
+         }
+       }
+     },
+     handleEvent: (event: PrintModeEvent) => {
+       handleEvent(event)
+       if (eventHandlerState.isActive?.() !== false) {
+         try {
+           params.observeEvent?.(event)
+         } catch {
+           // Analytics must not fail a run.
+         }
+       }
+     },
+     signal: params.signal,
+     costMode,
+     byok,
+     extraCodebuffMetadata,
+     onStateSnapshot,
+     onCompactionSummary,
++    onCompactionStart,
++    onCompaction,
+     drainSteeringMessages,
+     fileFilter: ((filePath: string) => {
+       if (isSensitiveFile(filePath)) return { status: 'blocked' }
+       return { status: 'allow' }
+     }) satisfies FileFilter,
+   }
+ }
+diff --git a/common/src/desktop-cloud/compact.test.ts b/common/src/desktop-cloud/compact.test.ts
+new file mode 100644
+index 000000000..823bb52ee
+--- /dev/null
++++ b/common/src/desktop-cloud/compact.test.ts
+@@ -0,0 +1,41 @@
++import { expect, test } from 'bun:test'
++import {
++  CLOUD_COMPACT_FAILED,
++  CLOUD_COMPACTED,
++  CLOUD_NOTHING_TO_COMPACT,
++  compactOutcome,
++  isCloudCompactPrompt,
++  isCloudCompactRequest,
++} from './compact'
++
++test('a pass that began and installed nothing failed; one that never began found nothing', () => {
++  expect(compactOutcome({ started: true, compacted: true })).toBe(CLOUD_COMPACTED)
++  // A ready summary is swapped in with no pass to wait for.
++  expect(compactOutcome({ started: false, compacted: true })).toBe(CLOUD_COMPACTED)
++  expect(compactOutcome({ started: true, compacted: false })).toBe(CLOUD_COMPACT_FAILED)
++  expect(compactOutcome({ started: false, compacted: false })).toBe(CLOUD_NOTHING_TO_COMPACT)
++})
++
++test('only the bare command is one', () => {
++  expect(isCloudCompactPrompt('/compact')).toBe(true)
++  expect(isCloudCompactPrompt('  /compact\n')).toBe(true)
++  expect(isCloudCompactPrompt('/Compact')).toBe(false)
++  expect(isCloudCompactPrompt('compact')).toBe(false)
++  expect(isCloudCompactPrompt('/compact the logs')).toBe(false)
++})
++
++test('a run that has another job stays that job', () => {
++  const prompt = '/compact'
++  expect(isCloudCompactRequest({ prompt })).toBe(true)
++  for (const other of [
++    { agent: 'claude-code' },
++    { localHarness: 'codex' },
++    { opener: true },
++    { runtimeContinuation: true },
++    { mission: { prompt } },
++    { missionPass: 2 },
++    { sponsored: { proposalId: 'p' } },
++    { agenticAdLabOfferId: 'offer' },
++  ])
++    expect(isCloudCompactRequest({ prompt, ...other })).toBe(false)
++})
+diff --git a/common/src/desktop-cloud/compact.ts b/common/src/desktop-cloud/compact.ts
+new file mode 100644
+index 000000000..c0e53c34f
+--- /dev/null
++++ b/common/src/desktop-cloud/compact.ts
+@@ -0,0 +1,49 @@
++/** The prompt that compacts a chat (`isCompactCommandPrompt` in agent-runtime). */
++export const CLOUD_COMPACT_PROMPT = '/compact'
++
++export const CLOUD_NOTHING_TO_COMPACT = 'Nothing to compact yet.'
++export const CLOUD_COMPACTED =
++  'Context compacted. Earlier messages stay here; the agent continues from a summary of them.'
++
++export const CLOUD_COMPACT_FAILED =
++  'Couldn’t compact this chat. Nothing changed, so you can try again.'
++
++/** What a compact did, from its callbacks: a pass that began and installed nothing failed. */
++export function compactOutcome(run: { started: boolean; compacted: boolean }) {
++  if (run.compacted) return CLOUD_COMPACTED
++  return run.started ? CLOUD_COMPACT_FAILED : CLOUD_NOTHING_TO_COMPACT
++}
++
++export function isCloudCompactPrompt(prompt: string): boolean {
++  return prompt.trim() === CLOUD_COMPACT_PROMPT
++}
++
++/**
++ * A compact is maintenance on a chat's saved history, not a turn: nothing runs
++ * on the chat's VM or computer, and it is not a message to anything that counts
++ * messages. Claude Code and Codex keep the word, since it is their own command,
++ * and a mission, an opener or a sponsored procedure is a turn whatever it says.
++ */
++export function isCloudCompactRequest(request: {
++  prompt: string
++  agent?: unknown
++  localHarness?: unknown
++  opener?: unknown
++  runtimeContinuation?: unknown
++  mission?: unknown
++  missionPass?: unknown
++  sponsored?: unknown
++  agenticAdLabOfferId?: unknown
++}): boolean {
++  return (
++    isCloudCompactPrompt(request.prompt) &&
++    !request.agent &&
++    !request.localHarness &&
++    !request.opener &&
++    !request.runtimeContinuation &&
++    !request.mission &&
++    !request.missionPass &&
++    !request.sponsored &&
++    !request.agenticAdLabOfferId
++  )
++}
+diff --git a/common/src/util/axiom-only-log.ts b/common/src/util/axiom-only-log.ts
+index 60001d22e..bc3c7bc38 100644
+--- a/common/src/util/axiom-only-log.ts
++++ b/common/src/util/axiom-only-log.ts
+@@ -441,50 +441,53 @@ const CONTEXT_COMPACTION_COMPLETED_FIELDS = {
+ } as const satisfies AxiomOnlyFieldSchema
+ 
+ const COMPACTION_FOLLOWUP_FIELDS = {
+   compaction_id: 'string',
+   agent_run_id: 'string',
+   model: 'string',
+   trigger_reason: 'string',
+   /** `compaction` (the next one) or `run_end`. */
+   ended_by: 'string',
+   next_trigger_reason: 'string',
+   /** Distinct files read before the compaction whose results it dropped. */
+   elided_read_paths: 'number',
+   read_calls_after: 'number',
+   read_paths_after: 'number',
+   /** Distinct `elided_read_paths` read again inside the window. */
+   reread_paths: 'number',
+   read_tokens_after: 'number',
+   tool_calls_after: 'number',
+   window_ms: 'number',
+ } as const satisfies AxiomOnlyFieldSchema
+ 
+ const COMPACTION_SUMMARY_FIELDS = {
+   ...COMPACTION_CORRELATION_FIELDS,
+   agent_run_id: 'string',
+   model: 'string',
++  /** Why a foreground summary was made, `manual` included; absent on a
++   *  background one, which no compaction asked for yet. */
++  trigger_reason: 'string',
+   /** `completed`, `failed`, or `cancelled`. */
+   outcome: 'string',
+   /** `background` (prepared ahead) or `foreground` (the run waited for it). */
+   mode: 'string',
+   /** Started while the agent's next request may run beside it. */
+   mid_turn: 'boolean',
+   /** `empty`, `unrecognized` (a reply without the summary format),
+    *  `output_limit`, `provider_error`, `timeout` or `no_history`. */
+   error_kind: 'string',
+   finish_reason: 'string',
+   context_token_count: 'number',
+   input_tokens: 'number',
+   cached_input_tokens: 'number',
+   output_tokens: 'number',
+   summary_tokens: 'number',
+   duration_ms: 'number',
+ } as const satisfies AxiomOnlyFieldSchema
+ 
+ const COMPACTION_REQUEST_USAGE_FIELDS = {
+   ...COMPACTION_CORRELATION_FIELDS,
+   compaction_root_model: 'string',
+   compaction_root_start_context_tokens: 'string',
+   compaction_request_id: 'string',
+   compaction_request_group: 'string',
+   compaction_summary_id: 'string',
+diff --git a/packages/agent-runtime/src/__tests__/compact-context-loop.test.ts b/packages/agent-runtime/src/__tests__/compact-context-loop.test.ts
+index f34de7dff..592906f67 100644
+--- a/packages/agent-runtime/src/__tests__/compact-context-loop.test.ts
++++ b/packages/agent-runtime/src/__tests__/compact-context-loop.test.ts
+@@ -758,50 +758,117 @@ describe('compactContext in loopAgentSteps', () => {
+               JSON.stringify(compacted.agentState.pendingCompactionTelemetry),
+             ),
+           },
+         },
+       )
+       expect(next.agentState.compactionSummary?.contextTokens).toBe(9_010)
+       expect(
+         runtimeImpl.promptAiSdkStream.mock.calls[0][0].extraCodebuffMetadata,
+       ).toMatchObject({
+         compaction_request_group: 'first_after_compaction',
+         compaction_id: compacted.agentState.pendingCompactionTelemetry!.id,
+       })
+       expect(next.agentState.pendingCompactionTelemetry).toBeUndefined()
+     })
+ 
+     it('makes a summary now when none exists', async () => {
+       const result = await runLoop(optedIn, idleHistory(0), {
+         prompt: '/compact',
+       })
+       expect(summaryRequests).toHaveLength(1)
+       expect(seenMessages).toHaveLength(0)
+       expect(joined(result.agentState.messageHistory)).toContain(
+         'MODEL SUMMARY',
+       )
+     })
++
++    it('labels the summary it makes as manual, on the receipt and the log', async () => {
++      const logged: Array<Record<string, unknown>> = []
++      await runLoop(optedIn, idleHistory(0), { prompt: '/compact', logged })
++      expect(
++        runtimeImpl.promptAiSdkStream.mock.calls[0][0].extraCodebuffMetadata,
++      ).toMatchObject({
++        compaction_request_group: 'summary',
++        compaction_trigger: 'manual',
++      })
++      expect(
++        logged.find((row) => row.axiomEvent === 'compaction_summary'),
++      ).toMatchObject({ trigger_reason: 'manual', mode: 'foreground' })
++      expect(
++        logged.find((row) => row.axiomEvent === 'context_compaction.attempt'),
++      ).toMatchObject({ trigger_reason: 'manual', outcome: 'applied' })
++    })
++
++    it('leaves a tiny chat alone without a model call', async () => {
++      const history: Message[] = [
++        { ...userMessage('hi'), sentAt: 1_000_000 },
++        { ...assistantMessage('hello'), sentAt: 1_000_000 },
++      ]
++      const logged: Array<Record<string, unknown>> = []
++      const receipts: unknown[] = []
++      const result = await runLoop(optedIn, history, {
++        prompt: '/compact',
++        logged,
++        runtimeOverrides: {
++          onCompaction: (receipt: unknown) => receipts.push(receipt),
++        },
++      })
++      expect(result.output.type).not.toBe('error')
++      expect(runtimeImpl.promptAiSdkStream).not.toHaveBeenCalled()
++      expect(receipts).toHaveLength(0)
++      expect(joined(result.agentState.messageHistory)).not.toContain(
++        'conversation_summary',
++      )
++      expect(
++        logged.find((row) => row.axiomEvent === 'context_compaction.attempt'),
++      ).toMatchObject({ trigger_reason: 'manual', outcome: 'noop' })
++    })
++
++    it('bills one summary for two presses in a row', async () => {
++      const first = await runLoop(optedIn, idleHistory(0), {
++        prompt: '/compact',
++      })
++      expect(summaryRequests).toHaveLength(1)
++      const second = await runLoop(optedIn, first.agentState.messageHistory, {
++        prompt: '/compact',
++        state: { compactionSummary: first.agentState.compactionSummary },
++      })
++      expect(summaryRequests).toHaveLength(1)
++      expect(second.output.type).not.toBe('error')
++    })
++
++    it('still bills an automatic summary for a chat that small', async () => {
++      const history: Message[] = [
++        { ...userMessage('hi'), sentAt: 1_000_000 },
++        { ...assistantMessage('hello'), sentAt: 1_000_000 },
++        { ...userMessage('next'), tags: ['USER_PROMPT'], sentAt: 1_000_000 },
++      ]
++      await runLoop(optedIn, history, {
++        state: measured(10_000_000),
++      })
++      expect(summaryRequests).toHaveLength(1)
++    })
+   })
+ 
+   // Desktop BYOK, 2026-09-24..27 ("compacts every 3-5 turns"): a 32k-default
+   // connection's budget is 25,804 tokens and its threshold 20,643, while the
+   // prompt and tool catalog take ~15k.
+   describe('a small window under a large fixed prompt', () => {
+     const smallWindow = {
+       ...baseTemplate,
+       systemPrompt: 'Follow the project conventions carefully. '.repeat(1_100),
+       compactContext: { maxContextLength: 25_804 },
+     } as AgentTemplate
+     const withReads = (count: number): Message[] => {
+       const history: Message[] = [
+         { ...userMessage('review the files'), tags: ['USER_PROMPT'] },
+       ]
+       for (let i = 0; i < count; i++) {
+         history.push(
+           {
+             role: 'assistant',
+             content: [
+               {
+                 type: 'tool-call',
+                 toolCallId: `read-${i}`,
+                 toolName: 'read_files',
+                 input: { paths: [`file${i}.ts`] },
+diff --git a/packages/agent-runtime/src/conversation-summary.ts b/packages/agent-runtime/src/conversation-summary.ts
+index cca1001ed..0bacc0db7 100644
+--- a/packages/agent-runtime/src/conversation-summary.ts
++++ b/packages/agent-runtime/src/conversation-summary.ts
+@@ -18,51 +18,51 @@
+  *    messages after it, and the new message.
+  *
+  * The summary waits on the agent state (`compactionSummary`), outside the
+  * history. A summary that finishes after its run ended reaches the next run
+  * of the same conversation through an in-process store.
+  */
+ 
+ import {
+   buildCompactionSummaryPrompt,
+   COMPACTION_SUMMARY_METADATA_KEY,
+ } from '@codebuff/common/constants/compaction-summary'
+ import { COMPACTION_SUMMARY_EVENT } from '@codebuff/common/util/axiom-only-log'
+ import {
+   AbortError,
+   getErrorObject,
+   isAbortError,
+ } from '@codebuff/common/util/error'
+ import {
+   dropUnansweredToolCalls,
+   systemMessage,
+   userMessage,
+ } from '@codebuff/common/util/messages'
+ 
+ import { SUMMARY_HEADER } from './compact-history'
+ import { expireMessages, withSystemInstructionTags } from './util/messages'
+-import { countTokens } from './util/token-counter'
++import { countTokens, countTokensMessages } from './util/token-counter'
+ 
+ import type { OpenRouterReasoningOptions } from '@codebuff/common/types/agent-template'
+ import type {
+   ModelUsageData,
+   PromptAiSdkStreamFn,
+ } from '@codebuff/common/types/contracts/llm'
+ import type { Logger } from '@codebuff/common/types/contracts/logger'
+ import type { Message } from '@codebuff/common/types/messages/codebuff-message'
+ import type { ConversationSummary } from '@codebuff/common/types/session-state'
+ 
+ /**
+  * The idle gap after which the summary replaces the history. Five minutes is
+  * the shortest prompt cache measured on our lanes (Anthropic via Respan,
+  * prod 2026-10-26); Pareto keeps it 10-15 minutes, OpenAI about 30.
+  */
+ export const SUMMARY_IDLE_MS = 5 * 60 * 1000
+ export const FIRST_SUMMARY_TOKENS = 40_000
+ export const SUMMARY_GROWTH_TOKENS = 30_000
+ /** Small windows use shares of the window instead of the fixed sizes. */
+ const FIRST_SUMMARY_SHARE = 0.2
+ const SUMMARY_GROWTH_SHARE = 0.15
+ const SUMMARY_TARGET_TOKENS = 2_000
+ const SUMMARY_TARGET_SHARE = 0.1
+ const SUMMARY_MAX_OUTPUT_TOKENS = 16_384
+ const MIN_SUMMARY_CHARS = 200
+@@ -76,50 +76,73 @@ const SUMMARY_NOTE =
+ 
+ export function summaryThresholds(maxContextLength: number): {
+   first: number
+   growth: number
+ } {
+   return {
+     first: Math.min(
+       FIRST_SUMMARY_TOKENS,
+       Math.floor(maxContextLength * FIRST_SUMMARY_SHARE),
+     ),
+     growth: Math.min(
+       SUMMARY_GROWTH_TOKENS,
+       Math.floor(maxContextLength * SUMMARY_GROWTH_SHARE),
+     ),
+   }
+ }
+ 
+ /** How long a summary is asked to be: small windows get a shorter one. */
+ export function summaryTargetTokens(maxContextLength: number): number {
+   return Math.min(
+     SUMMARY_TARGET_TOKENS,
+     Math.floor(maxContextLength * SUMMARY_TARGET_SHARE),
+   )
+ }
+ 
++/**
++ * Whether a manual compact is worth a summary request. A chat under twice the
++ * summary's own target gains little from swapping in a summary of about that
++ * size, and a summary already in the history is not counted: pressing Compact
++ * twice in a row is billed once. The caller's scaffolding is not conversation.
++ */
++export function manualCompactionIsWorthwhile(params: {
++  messages: Message[]
++  maxContextLength: number
++}): boolean {
++  const conversation = params.messages.filter(
++    (message) =>
++      !isEphemeral(message) &&
++      !message.tags?.includes('INSTRUCTIONS_PROMPT') &&
++      !message.tags?.includes(CONVERSATION_SUMMARY_TAG),
++  )
++  return (
++    conversation.length >= 2 &&
++    countTokensMessages(conversation) >=
++      2 * summaryTargetTokens(params.maxContextLength)
++  )
++}
++
+ /** Whether the context grew enough since `latest` to need a new summary. */
+ export function summaryIsDue(params: {
+   contextTokens: number
+   maxContextLength: number
+   /** The newest summary made or in progress, as its context size. */
+   latestContextTokens: number | undefined
+ }): boolean {
+   const { first, growth } = summaryThresholds(params.maxContextLength)
+   if (params.latestContextTokens === undefined)
+     return params.contextTokens >= first
+   return params.contextTokens - params.latestContextTokens >= growth
+ }
+ 
+ /**
+  * Whether the live prompt arrived after the conversation sat idle longer than
+  * the shortest prompt cache. Only true before the assistant answers it.
+  */
+ export function isIdleReturn(messages: Message[], now = Date.now()): boolean {
+   const promptIndex = messages.findLastIndex((m) =>
+     m.tags?.includes('USER_PROMPT'),
+   )
+   if (promptIndex <= 0) return false
+   if (messages.slice(promptIndex + 1).some((m) => m.role === 'assistant'))
+     return false
+   const prompt = messages[promptIndex]
+diff --git a/packages/agent-runtime/src/run-agent-step.ts b/packages/agent-runtime/src/run-agent-step.ts
+index 5863bc99c..938debe85 100644
+--- a/packages/agent-runtime/src/run-agent-step.ts
++++ b/packages/agent-runtime/src/run-agent-step.ts
+@@ -33,50 +33,51 @@ import {
+ } from '@codebuff/common/util/error'
+ import { serializeCacheDebugCorrelation } from '@codebuff/common/util/cache-debug'
+ import {
+   assistantMessage,
+   dropUnansweredToolCalls,
+   systemMessage,
+   userMessage,
+ } from '@codebuff/common/util/messages'
+ import { type ToolSet } from 'ai'
+ import { cloneDeep, mapValues } from 'lodash'
+ import z from 'zod/v4'
+ 
+ import type { CompactionTrigger } from './compact-history'
+ import {
+   closeCompactionWindow,
+   openCompactionWindow,
+ } from './compaction-followup'
+ import type { CompactionWindow } from './compaction-followup'
+ import {
+   automaticCompactionIsWorthwhile,
+   automaticCompactionPostCeiling,
+   compactionOverBudgetMessage,
+ } from './compaction'
+ import {
+   applyConversationSummary,
++  manualCompactionIsWorthwhile,
+   conversationSummaries,
+   isIdleReturn,
+   summarizeAndLog,
+   summaryIsDue,
+   summaryRequestHistory,
+   summaryTargetTokens,
+   summaryReasoningOptions,
+   untilAborted,
+ } from './conversation-summary'
+ import { CACHE_DEBUG_FULL_LOGGING } from './constants'
+ import { getMCPToolData } from './mcp'
+ import {
+   runProjectProfileReport,
+   shouldOfferProjectProfileTool,
+ } from './project-profile'
+ import { getAgentStreamFromTemplate } from './prompt-agent-stream'
+ import { isThinkOnlyResponse } from './util/think-tags'
+ import {
+   decideFollowupTodoNudge,
+   FOLLOWUP_TODO_NUDGE_TAG,
+ } from './util/followup-todo-nudge'
+ import {
+   endsOnSuggestPromptsBeforeAnswer,
+   SUGGEST_PROMPTS_BEFORE_ANSWER_MESSAGE,
+   SUGGEST_PROMPTS_BEFORE_ANSWER_TAG,
+@@ -1464,94 +1465,99 @@ export async function loopAgentSteps(
+     typeof agentTemplate.compactContext === 'object'
+       ? agentTemplate.compactContext
+       : {}
+   const maxContextLength =
+     compactionPolicy.maxContextLength ??
+     contextPrunerBudgetForModel(agentTemplate.model)
+   // Keyed by conversation, so a summary that finishes after this run ended
+   // reaches the next turn of the same thread.
+   const summaries = conversationSummaries(
+     `${params.extraCodebuffMetadata?.trace_session_id ?? runId}:${initialAgentState.agentId}`,
+   )
+   let idleChecked = false
+   /** The context size the provider reported for this run's latest step:
+    *  input plus output tokens. Summary decisions use only this. */
+   let stepUsageTokens: number | undefined
+   // The server accepts a request only while its run is open, so the run
+   // finishes after the summaries it started.
+   const runSummaries: Promise<unknown>[] = []
+ 
+   const summarize = (options: {
+     summaryId?: string
+     history: Message[]
+     contextTokens: number | undefined
+     mode: 'background' | 'foreground'
+     midTurn: boolean
++    /** Only a foreground summary knows why it was made. */
++    trigger?: CompactionTrigger | 'manual'
+   }) =>
+     summarizeAndLog({
+       summaryId: options.summaryId,
+       history: options.history,
+       system,
+       contextTokens: options.contextTokens,
+       targetTokens: summaryTargetTokens(maxContextLength),
+       maxOutputTokens: compactionPolicy.maxOutputTokens,
+       mode: options.mode,
+       midTurn: options.midTurn,
+       // No time limit: a summary the run waits for is its only way under the
+       // budget, and stopping a slow one ended the run (base3 eval, 10-28).
+       // A background summary is not cancelled with its run: the next turn
+       // can still use it. A dead stream ends on the SDK's idle timeout.
+       signal:
+         options.mode === 'foreground' ? signal : new AbortController().signal,
+       cancelSignal: options.mode === 'foreground' ? signal : undefined,
+       logger,
+       runId,
+       model: agentTemplate.model,
+-      telemetry,
++      telemetry: options.trigger
++        ? { ...telemetry, trigger_reason: options.trigger }
++        : telemetry,
+       stream: (request) =>
+         getAgentStreamFromTemplate({
+           ...params,
+           agentId: initialAgentState.parentId
+             ? initialAgentState.agentId
+             : undefined,
+           template: {
+             ...agentTemplate,
+             reasoningOptions: summaryReasoningOptions(
+               agentTemplate.model,
+               agentTemplate.reasoningOptions,
+             ),
+           },
+           runId,
+           messages: request.messages,
+           tools,
+           includeCacheControl: supportsCacheControl(agentTemplate.model),
+           maxOutputTokens: request.maxOutputTokens,
+           signal: request.signal,
+           extraCodebuffMetadata: {
+             ...runMetadata,
+             llm_step_number: String(llmStepNumber + 1),
+             ...request.extraCodebuffMetadata,
++            ...(options.trigger ? { compaction_trigger: options.trigger } : {}),
+           },
+           onFinishReason: request.onFinishReason,
+           onUsageReceived: request.onUsageReceived,
+           onCostCalculated: async () => {},
+         }),
+     })
+ 
+   /** Starts a background summary when the context grew enough since the
+    *  last one. The cache is warm here: a step or a turn just ended. */
+   const startSummaryIfDue = (midTurn: boolean, fixedTokenCount: number) => {
+     if (!agentTemplate.compactContext || summaries.pending()) return
+     const history = currentAgentState.messageHistory
+     // A window too small for a summary to clear room (a large fixed prompt
+     // in a small BYOK window) waits for the hard budget instead.
+     if (
+       !automaticCompactionIsWorthwhile({
+         messages: history,
+         maxContextLength,
+         thresholdTokens: compactionThreshold(maxContextLength),
+         fixedTokenCount,
+         maxOutputTokens: compactionPolicy.maxOutputTokens,
+       })
+     )
+       return
+     const contextTokens = stepUsageTokens
+@@ -1635,60 +1641,67 @@ export async function loopAgentSteps(
+     }
+     try {
+       let summary = summaries.latest(
+         currentAgentState.compactionSummary,
+         before,
+       )
+       let applied = summary
+         ? applyConversationSummary({ messages: before, summary, keep })
+         : null
+       readySummary = usable(applied)
+       // A ready summary is used at once, even when a newer one is in
+       // progress: waiting for it cost ~1 min a swap in the base3 eval
+       // (10-28). The newer one replaces it at the next swap, when it adds
+       // something. Only with nothing ready does the run wait for it.
+       const pending = summaries.pending()
+       if (pending && !usable(applied)) {
+         waitedForPending = true
+         showStatus()
+         const completed = await untilAborted(pending.promise, signal)
+         if (!completed) outcome = 'failed'
+         summary = summaries.latest(currentAgentState.compactionSummary, before)
+         applied = summary
+           ? applyConversationSummary({ messages: before, summary, keep })
+           : null
+       }
+-      if (!usable(applied) && trigger !== 'cache_expiry') {
++      // Never billed for a chat a summary would not shrink, however often the
++      // user asks. The run ends with nothing changed: that is the no-op.
++      const summaryWorthwhile =
++        trigger === 'manual'
++          ? manualCompactionIsWorthwhile({ messages: before, maxContextLength })
++          : trigger !== 'cache_expiry'
++      if (!usable(applied) && summaryWorthwhile) {
+         generatedForeground = true
+         summaryId = crypto.randomUUID()
+         showStatus()
+         const fresh = await summarize({
+           summaryId,
+           history: summaryRequestHistory(before),
+           contextTokens: stepUsageTokens,
+           mode: 'foreground',
+           midTurn: false,
++          trigger,
+         })
+         if (fresh) {
+           summary = fresh
+           applied = applyConversationSummary({
+             messages: before,
+             summary: fresh,
+             keep,
+           })
+         } else outcome = 'failed'
+       }
+       if (!summary || !usable(applied)) return false
+       summaryId = summary.id
+ 
+       if (compactionWindow)
+         closeCompactionWindow({
+           window: compactionWindow,
+           messages: before,
+           endedBy: 'compaction',
+           nextTrigger: trigger,
+           logger,
+           runId,
+           model: agentTemplate.model,
+         })
+       compactionWindow = openCompactionWindow({
+         before,
