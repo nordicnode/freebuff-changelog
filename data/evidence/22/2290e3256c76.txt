@@ -1,0 +1,668 @@
+Date: 2026-11-01T01:20:40Z
+Category: Core
+Areas: Shared/Core
+Commit nature: production
+Stats: +11 / -3
+Analysis notes: Shared/Core changes across 2 file(s) (+11/−3).
+Modified files: common/src/desktop-cloud/handback.ts, common/src/desktop-cloud/history.ts
+Key facts (ground the WHY and DETAIL sentences in these): - Archiving moves a chat's files from its VM to storage; its next turn brings them back. - Cloud has lost its full copy, but the portable export Desktop lands is still there. - No copy of the chat's files survives, so no client can restore them. - Cloud cannot bring this archived chat's files back, but Desktop can land their export. - Continue locally (COD-878): when the chat moved to a computer, or null. Absent from older servers.
+Structured facts (extracted mechanically from the diff; copy names and values verbatim, never round or rename):
+- Exports added: ARCHIVED_CHAT_DESKTOP_ERROR, ARCHIVED_CHAT_LOST_ERROR
+Module & File Purpose (ground-truth documentation from touched files):
+- File `common/src/desktop-cloud/handback.ts`:
+```
+/**
+ * Cloud-to-local handoff ("Continue locally", COD-878). A Cloud chat moves to
+ * one computer keeping its chat id, transcript and place in its project; the
+ * reverse move is the existing Continue in Cloud import.
+ *
+ * 1. `GET /api/v1/cloud/workspaces/:id/export` streams a gzip tar of the chat's
+ *    worktree (the same exclusions as a source import: `.git`, dependencies,
+ *    build output, `.env` secrets, symlinks). It changes nothing.
+ * 2. `POST /api/v1/cloud/workspaces/:id/handback` fences the chat to the
+ *    computer, but only when no run started after the export. From then on
+ *    Cloud refuses new runs for it, so a chat never runs in two places.
+ * 3. Continue in Cloud on a handed-back chat sends `resume: true` and only the
+ *    turns taken locally. Cloud reseeds the chat's worktree from the new files
+ *    and lifts the fence.
+ */
+```
+- File `common/src/desktop-cloud/history.ts`:
+```
+/** Shared history and attachment contract for the Postgres-backed Cloud service. */
+```
+Complete Source of Modified Files (for complete module context):
+- File `common/src/desktop-cloud/handback.ts` (123 lines):
+```
+import { z } from 'zod/v4'
+
+/**
+ * Cloud-to-local handoff ("Continue locally", COD-878). A Cloud chat moves to
+ * one computer keeping its chat id, transcript and place in its project; the
+ * reverse move is the existing Continue in Cloud import.
+ *
+ * 1. `GET /api/v1/cloud/workspaces/:id/export` streams a gzip tar of the chat's
+ *    worktree (the same exclusions as a source import: `.git`, dependencies,
+ *    build output, `.env` secrets, symlinks). It changes nothing.
+ * 2. `POST /api/v1/cloud/workspaces/:id/handback` fences the chat to the
+ *    computer, but only when no run started after the export. From then on
+ *    Cloud refuses new runs for it, so a chat never runs in two places.
+ * 3. Continue in Cloud on a handed-back chat sends `resume: true` and only the
+ *    turns taken locally. Cloud reseeds the chat's worktree from the new files
+ *    and lifts the fence.
+ */
+
+/** Export response headers. The body is `application/gzip`. */
+export const CLOUD_EXPORT_HEADERS = {
+  /** Newest run of the chat when the export was taken, or empty for none. */
+  runId: 'x-freebuff-export-run',
+  /** Lowercase hex SHA-256 of the whole response body. */
+  sha256: 'x-freebuff-export-sha256',
+  /** Byte length of the body. */
+  bytes: 'x-freebuff-export-bytes',
+} as const
+
+export const handbackRequestSchema = z
+  .object({
+    workspaceId: z.string().min(1).max(120),
+    /** The export's run receipt; a newer run means the export is stale. */
+    exportRunId: z.string().max(120),
+    exportSha256: z.string().regex(/^[0-9a-f]{64}$/),
+  })
+  .strict()
+export type HandbackRequest = z.infer<typeof handbackRequestSchema>
+
+/** Sent only after Desktop has committed the local landing. The timestamp identifies this move,
+ * so a delayed acknowledgement cannot reclaim a later Cloud workspace. */
+export const handbackCompleteSchema = handbackRequestSchema.extend({
+  handedBackAt: z.iso.datetime({ offset: true }),
+})
+export type HandbackCompleteRequest = z.infer<typeof handbackCompleteSchema>
+
+export interface HandbackResponse {
+  workspaceId: string
+  /** ISO time the chat left Cloud. Repeating the same handback returns the original time. */
+  handedBackAt: string
+}
+
+/** The 409 a run request gets for a chat that continues on a computer. */
+export const HANDED_BACK_RUN_ERROR =
+  'This chat continues on a computer. Open it there, or choose Continue in Cloud on that computer to bring it back.'
+
+/** The 409 a handback gets when Cloud moved on after the export; export again. */
+export const STALE_EXPORT_ERROR =
+  'This chat changed in Cloud after its files were copied. Retry Continue locally.'
+
+/**
+ * Export v2 (`GET …/export?v=2`). The tar is the same working-tree copy, plus two entries under
+ * this directory, which a worktree never exports itself:
+ *
+ * - `meta.json` (`CloudExportMeta`): the commit the chat's worktree started from, its HEAD, and the
+ *   files tracked at HEAD that the working tree no longer has.
+ * - `commits.bundle`: `git bundle` of HEAD excluding `base` (absent when HEAD is the base; with
+ *   `history=full`, HEAD's whole history, for a Cloud project's first landing on a computer), under
+ *   the ref `CLOUD_EXPORT_BUNDLE_REF`. Its prerequisites are reachable from `base`, which the
+ *   computer that uploaded the chat has. Without a known base it holds HEAD's whole history.
+ *
+ * With them, Continue locally lands Cloud's commits as commits and merges Cloud's work with the
+ * computer's own, instead of flattening it over the current branch tip. An older server ignores
+ * `v` and sends v1 (no `meta.json`); Desktop then lands the files as before.
+ */
+export const CLOUD_EXPORT_V2_DIR = '.freebuff-export'
+/** The ref name inside `commits.bundle`. */
+export const CLOUD_EXPORT_BUNDLE_REF = 'HEAD'
+
+const commitSchema = z.string().regex(/^[0-9a-f]{40}(?:[0-9a-f]{24})?$/)
+
+const cloudExportV2Schema = z
+  .object({
+    version: z.literal(2),
+    /** The commit the worktree started from (its marker), or null for a chat initialized before it was recorded. */
+    base: commitSchema.nullable(),
+    /** The worktree's HEAD, or null for an empty repository. */
+    head: commitSchema.nullable(),
+    /** The worktree's branch. */
+    branch: z.string().max(400).nullable(),
+    /** Whether `commits.bundle` is in the tar. */
+    bundle: z.boolean(),
+    /** Tracked at HEAD, absent from the working tree. */
+    deleted: z.array(z.string().max(4096)).max(200_000),
+  })
+  .strict()
+/** V3 sends Git objects once plus only working files whose bytes differ from HEAD.
+ * `have` is a complete commit graph verified by the receiver; unknown bases send a full pack.
+ * `files` is the complete eligible working-file inventory, for plain-folder reconstruction.
+ * `shallow` preserves any history boundary already present in Cloud (never invents one).
+ */
+export const cloudExportV3Schema = cloudExportV2Schema.extend({
+  version: z.literal(3),
+  bundle: z.literal(false),
+  pack: z.boolean(),
+  have: commitSchema.nullable(),
+  shallow: z.array(commitSchema).max(200_000),
+  files: z.array(z.string().max(4096)).max(200_000),
+}).strict()
+export const cloudExportMetaSchema = z.union([cloudExportV2Schema, cloudExportV3Schema])
+export type CloudExportMeta = z.infer<typeof cloudExportMetaSchema>
+
+/** Archiving moves a chat's files from its VM to storage; its next turn brings them back. */
+export const ARCHIVED_CHAT_RESTORE_ERROR =
+  'This chat’s Cloud files are archived. Send a message to bring them back.'
+
+/** Cloud has lost its full copy, but the portable export Desktop lands is still there. */
+export const ARCHIVED_CHAT_DESKTOP_ERROR =
+  'Cloud can’t bring back this chat’s files. Open it in Freebuff Desktop to restore its saved copy. Its conversation is safe and stays here to read.'
+
+/** No copy of the chat's files survives, so no client can restore them. */
+export const ARCHIVED_CHAT_LOST_ERROR =
+  'Cloud no longer has this chat’s files, so it can’t continue here. Its conversation is safe and stays here to read. Start a new chat in this project to keep working: it starts from the project’s source, without this chat’s changes.'
+```
+- File `common/src/desktop-cloud/history.ts` (214 lines):
+```
+/** Shared history and attachment contract for the Postgres-backed Cloud service. */
+export type CloudHistoryPage<T> = { items: T[]; nextCursor: string | null }
+export type CloudHistoryProject = {
+  /** A durable local target; absence means a hosted project. Never inferred from presence. */
+  deviceExecution?: import('./device-execution').DeviceExecutionTarget | null
+  id: string
+  name: string
+  createdAt: string
+  github?: import('./github').GitHubRepository | null
+  /** The starter selected at project creation; absent from older servers. */
+  template?: import('../templates/selected').SelectedTemplate | null
+  /**
+   * When the user removed it from their project list, or null. A removed project is left out of
+   * `listProjects` until someone prompts in it again. Absent from older servers.
+   */
+  removedAt?: string | null
+}
+export type CloudHistoryRun = {
+  id: string
+  chatId: string
+  status: string
+  model: string | null
+  /** Claude Code or Codex ran this turn (`./agents`); absent for the Freebuff agent and older servers. */
+  agent?: import('./agents').CloudCliAgent | null
+  agentMode: 'plan' | 'build'
+  effort: string | null
+  promptPreview: string
+  createdAt: string
+  finishedAt: string | null
+  error: string | null
+}
+export type CloudHistoryChat = {
+  deviceExecution?: import('./device-execution').DeviceExecutionTarget | null
+  mission?: import('./mission').CloudMission | null
+  id: string
+  projectId: string | null
+  title: string
+  archivedAt: string | null
+  /** Continue locally (COD-878): when the chat moved to a computer, or null. Absent from older servers. */
+  handedBackAt?: string | null
+  /** Cloud cannot bring this archived chat's files back, but Desktop can land their export. */
+  localRestoreRequired?: boolean
+  metadataRevision: number
+  phase: string
+  updatedAt: string
+  lastActiveAt: string
+  latestRun: CloudHistoryRun | null
+}
+/** Attaching observes the existing session; it never admits or purchases one. */
+export type CloudHistoryAttachment = {
+  chat: CloudHistoryChat
+  instanceId: string
+  session: {
+    model: string
+    admittedAt: string
+    expiresAt: string | null
+  } | null
+}
+export type CloudHistoryChatUpdate = {
+  expectedRevision: number
+  title?: string
+  archived?: boolean
+}
+/**
+ * Last write wins: a project name has no revision to compare. Removing keeps its chats and files;
+ * `removed: false` puts it back in the list.
+ */
+export type CloudHistoryProjectUpdate =
+  | { name: string; removed?: boolean }
+  | { name?: string; removed: boolean }
+/**
+ * A server-internal run event marking that the run's SDK traces are stored in
+ * R2 rather than as `trace` events. Never returned by the history API or the
+ * live poll.
+ */
+export const TRACES_IN_R2_KIND = 'traces_r2'
+export type CloudHistoryEvent = {
+  /** Decimal string: Postgres bigint IDs can exceed JavaScript's safe integer. */
+  id: string
+  runId: string
+  kind: string
+  payload: unknown
+  createdAt: string
+}
+export type CloudHistoryEvents = CloudHistoryPage<CloudHistoryEvent> & {
+  /** Resume after the last returned event, even when nextCursor is null. */
+  endCursor: string | null
+}
+export type CloudHistoryOptions = {
+  cursor?: string | null
+  limit?: number
+  signal?: AbortSignal
+}
+
+export class CloudHistoryError extends Error {
+  constructor(
+    readonly status: number,
+    message: string,
+  ) {
+    super(message)
+    this.name = 'CloudHistoryError'
+  }
+}
+
+/**
+ * Sent by every bearer client that can open a chat running on a computer
+ * (`deviceExecution`). Desktop 0.0.192 and older sent no such header and can
+ * only open hosted chats, so the chat list omits device chats for a direct
+ * bearer request without it (`web/src/server/desktop-cloud/history-api.ts`).
+ */
+export const CLOUD_HISTORY_DEVICE_CHATS_HEADER = 'x-freebuff-device-chats'
+
+const bearer = (token: string) => ({
+  Authorization: `Bearer ${token}`,
+  [CLOUD_HISTORY_DEVICE_CHATS_HEADER]: '1',
+})
+
+/** Cookie auth on the same origin, or the existing Desktop session bearer. */
+export function createCloudHistoryClient(
+  options: {
+    baseUrl?: string
+    getToken?: () => string | null | Promise<string | null>
+    fetch?: (url: string, init?: RequestInit) => Promise<Response>
+  } = {},
+) {
+  const base = (options.baseUrl ?? '/api/v1/cloud/history').replace(/\/$/, '')
+  async function get<T>(
+    path: string,
+    page: CloudHistoryOptions = {},
+    projectId?: string,
+    update?: CloudHistoryChatUpdate | CloudHistoryProjectUpdate,
+    search?: string,
+  ): Promise<T> {
+    const query = new URLSearchParams()
+    if (search) query.set('search', search)
+    if (page.cursor != null) query.set('cursor', page.cursor)
+    if (page.limit !== undefined) query.set('limit', String(page.limit))
+    if (projectId !== undefined) query.set('projectId', projectId)
+    const token = await options.getToken?.()
+    const res = await (options.fetch ?? fetch)(
+      `${base}/${path}${query.size ? `?${query}` : ''}`,
+      {
+        credentials: 'same-origin',
+        cache: 'no-store',
+        signal: page.signal,
+        method: update ? 'PATCH' : 'GET',
+        body: update ? JSON.stringify(update) : undefined,
+        headers: update
+          ? {
+              'Content-Type': 'application/json',
+              ...(token ? bearer(token) : {}),
+            }
+          : token
+            ? bearer(token)
+            : undefined,
+      },
+    )
+    if (!res.ok) {
+      const body = await res.json().catch(() => null)
+      throw new CloudHistoryError(
+        res.status,
+        body?.error ?? 'Cloud history unavailable',
+      )
+    }
+    return res.json() as Promise<T>
+  }
+  const id = encodeURIComponent
+  return {
+    listProjects: (page?: CloudHistoryOptions) =>
+      get<CloudHistoryPage<CloudHistoryProject>>('projects', page),
+    getProject: (projectId: string, signal?: AbortSignal) =>
+      get<CloudHistoryProject>(`projects/${id(projectId)}`, { signal }),
+    updateProject: (
+      projectId: string,
+      update: CloudHistoryProjectUpdate,
+      signal?: AbortSignal,
+    ) =>
+      get<CloudHistoryProject>(
+        `projects/${id(projectId)}`,
+        { signal },
+        undefined,
+        update,
+      ),
+    listChats: (page: CloudHistoryOptions & { projectId?: string; search?: string } = {}) =>
+      get<CloudHistoryPage<CloudHistoryChat>>('chats', page, page.projectId, undefined, page.search),
+    getChat: (chatId: string, signal?: AbortSignal) =>
+      get<CloudHistoryChat>(`chats/${id(chatId)}`, { signal }),
+    getAttachment: (chatId: string, signal?: AbortSignal) =>
+      get<CloudHistoryAttachment>(`chats/${id(chatId)}/attachment`, { signal }),
+    updateChat: (
+      chatId: string,
+      update: CloudHistoryChatUpdate,
+      signal?: AbortSignal,
+    ) =>
+      get<CloudHistoryChat>(
+        `chats/${id(chatId)}`,
+        { signal },
+        undefined,
+        update,
+      ),
+    listRuns: (chatId: string, page?: CloudHistoryOptions) =>
+      get<CloudHistoryPage<CloudHistoryRun>>(`chats/${id(chatId)}/runs`, page),
+    getRun: (runId: string, signal?: AbortSignal) =>
+      get<CloudHistoryRun>(`runs/${id(runId)}`, { signal }),
+    listEvents: (runId: string, page?: CloudHistoryOptions) =>
+      get<CloudHistoryEvents>(`runs/${id(runId)}/events`, page),
+    listTraces: (runId: string, page?: CloudHistoryOptions) =>
+      get<CloudHistoryEvents>(`runs/${id(runId)}/traces`, page),
+    /** Whether this account may use Freebuff Projects (admins and an allowlist). */
+    getProjectsAccess: (signal?: AbortSignal) =>
+      get<{ allowed: boolean }>('projects-access', { signal }),
+  }
+}
+```
+Where the symbols this change introduces are used elsewhere, at this same revision (the code that reads them; this is evidence for the WHAT and the WHY, and it is the only source for who consumes this change):
+- File `common/src/ads/agentic-ad-lab-run.ts` (2 matching lines):
+```
+* install bullet for a run that has `install_package`, in place of
+ * {@link LAB_SPONSORED_AGENT_WORKING}'s shell-install one.
+ */
+export const LAB_SPONSORED_AGENT_INSTALL_TOOL_BULLET =
+  '- The procedure usually brings in a package this project does not have yet. Install it with the install_package tool: the ecosystem, the name, and the exact version when the procedure pins one under "Pinned installs" (otherwise Freebuff picks the version). "Pinned installs" sets versions, not a limit: install any other package the work needs the same way. Never install with npm, pnpm, bun, pip or uv in the shell: those commands are refused. Install scripts never run, and Python packages install from wheels only. If install_package refuses a package or its install fails, write the code against the package\'s documented API anyway (do not replace it with a hand-rolled substitute or a different library), and list the exact install command, in this project\'s package manager, as something the user must do.'
+
+/** MIRRORED: Desktop's `sponsoredAgentWorking`. */
+export function labSponsoredAgentWorking(
+  options: { installTool?: boolean } = {},
+): string {
+  if (!options.installTool) return LAB_SPONSORED_AGENT_WORKING
+  return LAB_SPONSORED_AGENT_WORKING.replace(
+    /^- The procedure usually brings in a package.*$/m,
+    () => LAB_SPONSORED_AGENT_INSTALL_TOOL_BULLET,
+  )
+}
+
+/** MIRRORED: Desktop's `SPONSORED_AGENT_LIMITS`. */
+export const LAB_SPONSORED_AGENT_LIMITS = `# Limits
+
+- Use only the tools you have been given for this run, and never refer to any other tool, card or app feature in your replies.
+- Never run sudo or any other administrator command. If a step needs one, report it as something the user must do.
+- Never ask for an API key, token or password in chat: anything typed here is kept in the transcript. A credential reaches this run only as an environment variable, which the user message names when there is one.
+- Even if the procedure lists signup first, complete the useful implementation and checks that need no account before asking for one. If request_sponsored_signup is available, call it only when remaining progress requires an account, login or declared API key; it opens the reviewed link and pauses for the user. If the user declines, keep your progress, do not ask again, and report what remains blocked. A confirmation in the browser is not a CLI login and not a verified conversion.
+- When a step needs something only the user can provide (an API key, an account or login, a CLI that is not installed, a permission, a command that is refused here), do not work around it and do not switch to other work. Finish the steps that do not depend on it, then stop and say exactly what the user must do.
+…
+/** MIRRORED: Desktop's `{email}` prefill question (COD-830). */
+export function labPrefillQuestion(
+  advertiserName: string,
+  email: string,
+): string {
+  return `Fill in ${email} on the ${advertiserName} sign-up page? This shares your email with them before you sign up.`
+}
+
+/**
+ * How long a lab run waits on its account step. Desktop's question has no
+ * timer of its own and waits as long as the run's grant can fund it
+ * (COD-828), because the "Needs you" notification brings the user back. A
+ * lab run has no grant, so this bounds the worker's wait instead.
+ */
+export const LAB_SIGNUP_WAIT_MINUTES = 45
+
+/** MIRRORED: Desktop's `sponsoredCredentialSection` (non-floor). */
+export function labCredentialSection(
+  credentials: readonly SponsoredRunCredential[],
+  status: 'provided' | 'skipped' | 'timeout',
+  advertiserName?: string,
+): string {
+  const account = advertiserName
+    ? `their ${advertiserName} account`
+```
+- File `cli/src/ads/display-ads-store.ts` (1 matching line):
+```
+/**
+ * What the user has hidden of the mock CLI display ads.
+ *
+ * - `cliSplash`: "hide for today" writes the local day to settings.json
+ *   (`displayAdSplashHiddenOn`), so a relaunch the same day stays clean and
+ *   the next day draws the block again.
+ * - `cliStatusline` (and its `/deals` list): × on the row, or `/deals off`,
+ *   hides both for this process only. `/deals on` brings them back.
+ */
+import { create } from 'zustand'
+
+import { loadSettings, saveSettings } from '../utils/settings'
+
+/** The local calendar day as `YYYY-MM-DD`. */
+export function localDay(now: Date = new Date()): string {
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`
+}
+
+interface DisplayAdsState {
+```
+- File `cli/src/utils/sponsored-run.ts` (1 matching line):
+```
+})
+      return null
+    }
+    this.set({ phase: 'running', runningSince: this.deps.now() })
+    // NO `running` REPORT YET (COD-665 V5). Upstream stamps `running_at` on
+    // the first one and its stale sweep fails the row an hour and a half
+    // after it, so it has to mark the start of the compute hour -- not the
+    // wait for the conversation before it, nor a turn whose first model call
+    // is refused. It is sent on the turn's first model event, below.
+    // The grant stops paying at its expiry, and a run that outlives it would
+    // be billed to nobody. Aborted rather than left to fail request by request.
+    // Its HOUR starts now, not at Accept (COD-665): the grant arrives with only
+    // its start deadline, and the server brings it in to an hour from this
+    // turn's first call -- a moment after this, so the local cutoff is never
+    // the later of the two.
+    const runDeadlineMs = sponsoredComputeRunDeadlineMs(
+      grant.expiresAtMs,
+      this.deps.now(),
+    )
+    active.runDeadlineMs = runDeadlineMs
+    active.expiryTimer = setTimeout(
+      () => active.abort.abort('grant-expired'),
+      Math.max(0, runDeadlineMs - this.deps.now()),
+    )
+    active.expiryTimer.unref?.()
+```
+- File `common/src/ads/sponsored-compute-contract.ts` (1 matching line):
+```
+}
+
+/** Whether a grant has spent its active window. */
+export function sponsoredActiveWindowSpent(activeMs: number): boolean {
+  return activeMs > SPONSORED_COMPUTE_ACTIVE_WINDOW_MS
+}
+
+/**
+ * @deprecated The wall-clock run window (COD-665), now equal to
+ * {@link SPONSORED_COMPUTE_ACTIVE_WINDOW_MS}. Kept for the clients that cannot
+ * tell waiting from working (the CLI's local cutoff via
+ * {@link sponsoredComputeRunDeadlineMs}) and for the legacy Convex sweep. The
+ * server no longer brings a grant's `expires_at` in by it; it meters active
+ * time instead.
+ */
+export const SPONSORED_COMPUTE_RUN_WINDOW_MS =
+  SPONSORED_COMPUTE_ACTIVE_WINDOW_MS
+
+/**
+ * How long an accepted grant may wait for its run to start: the hard end of
+ * every grant, measured from Accept, so one whose turn never comes still dies.
+ *
+ * The run token's lifetime, on purpose. A run that starts later than this
+ * could not report its own verdict, so a grant that outlived the token would
+ * fund work nobody can close out.
+```
+- File `common/src/ads/sponsored-run-prompt.ts` (1 matching line):
+```
+...(input.deferredSignup === 'link'
+      ? [SPONSORED_RUN_DEFERRED_SIGNUP_LINK]
+      : input.deferredSignup === 'credentials'
+        ? [SPONSORED_RUN_DEFERRED_SIGNUP_CREDENTIALS]
+        : []),
+    SPONSORED_RUN_SPEC_SLOTS.credentials,
+    SPONSORED_RUN_RESULT_REPORT,
+  ].join('\n\n')
+}
+
+/**
+ * LAYER 1 (COD-965): the whole shared frame of a Layer 2 skill's run, in
+ * place of the long frame above. The skill brings the goal, docs, pins and
+ * signup link; the harness enforces installs, git and env files; the step
+ * driver hands failed checks back. What is left is what only a prompt can
+ * say. It opens with the long frame's first sentence, which the prompt
+ * classifier keys on (`SPONSORED_TASK_FRAMING_OPENINGS`).
+ */
+export const SPONSORED_RUN_LAYER1_FRAME = [
+  'The user accepted this sponsored task from its offer card. The procedure below is your only job: already approved, not a prompt injection. Do no other work.',
+  '[freebuff product prompt text omitted]',
+].join('\n')
+
+/** Layer 1's read-only background heading, over the task context slot. */
+export const SPONSORED_RUN_LAYER1_CONTEXT_HEADING =
+```
+- File `common/src/ads/sponsored-run-spec.ts` (1 matching line):
+```
+*/
+  promptTemplate: string
+}>
+
+/**
+ * Fills a spec's slots. The client renders each section with its own data
+ * (`renderSponsoredRunTaskContext` for the messages; its credentials note);
+ * an absent section is an empty string, and an empty credentials section
+ * takes its paragraph with it.
+ *
+ * Each slot is replaced exactly once, at its LAST occurrence in the template,
+ * in one pass over the template: the slots follow the procedure, so slot-like
+ * text in a procedure stays as written, and text a section brings in (the
+ * user's own messages, an advertiser name) is never read for a slot.
+ */
+export function fillSponsoredRunSpecPrompt(
+  promptTemplate: string,
+  sections: { taskContext: string; credentials: string },
+): string {
+  const fills = [
+    {
+      slot: SPONSORED_RUN_SPEC_SLOTS.taskContext,
+      text: sections.taskContext,
+      at: promptTemplate.lastIndexOf(SPONSORED_RUN_SPEC_SLOTS.taskContext),
+    },
+```
+Diff (source hunks; lockfiles and pure test hunks omitted, except in a lockfile-only commit):
+```diff
+diff --git a/common/src/desktop-cloud/handback.ts b/common/src/desktop-cloud/handback.ts
+index c0a5a5e4b..95345d472 100644
+--- a/common/src/desktop-cloud/handback.ts
++++ b/common/src/desktop-cloud/handback.ts
+@@ -87,28 +87,36 @@ const cloudExportV2Schema = z
+     head: commitSchema.nullable(),
+     /** The worktree's branch. */
+     branch: z.string().max(400).nullable(),
+     /** Whether `commits.bundle` is in the tar. */
+     bundle: z.boolean(),
+     /** Tracked at HEAD, absent from the working tree. */
+     deleted: z.array(z.string().max(4096)).max(200_000),
+   })
+   .strict()
+ /** V3 sends Git objects once plus only working files whose bytes differ from HEAD.
+  * `have` is a complete commit graph verified by the receiver; unknown bases send a full pack.
+  * `files` is the complete eligible working-file inventory, for plain-folder reconstruction.
+  * `shallow` preserves any history boundary already present in Cloud (never invents one).
+  */
+ export const cloudExportV3Schema = cloudExportV2Schema.extend({
+   version: z.literal(3),
+   bundle: z.literal(false),
+   pack: z.boolean(),
+   have: commitSchema.nullable(),
+   shallow: z.array(commitSchema).max(200_000),
+   files: z.array(z.string().max(4096)).max(200_000),
+ }).strict()
+ export const cloudExportMetaSchema = z.union([cloudExportV2Schema, cloudExportV3Schema])
+ export type CloudExportMeta = z.infer<typeof cloudExportMetaSchema>
+ 
+-/** Archived chats resume through Desktop's existing local landing and Cloud upload. */
++/** Archiving moves a chat's files from its VM to storage; its next turn brings them back. */
+ export const ARCHIVED_CHAT_RESTORE_ERROR =
+-  'This chat’s Cloud workspace was archived. Restore it in Freebuff Desktop to continue.'
++  'This chat’s Cloud files are archived. Send a message to bring them back.'
++
++/** Cloud has lost its full copy, but the portable export Desktop lands is still there. */
++export const ARCHIVED_CHAT_DESKTOP_ERROR =
++  'Cloud can’t bring back this chat’s files. Open it in Freebuff Desktop to restore its saved copy. Its conversation is safe and stays here to read.'
++
++/** No copy of the chat's files survives, so no client can restore them. */
++export const ARCHIVED_CHAT_LOST_ERROR =
++  'Cloud no longer has this chat’s files, so it can’t continue here. Its conversation is safe and stays here to read. Start a new chat in this project to keep working: it starts from the project’s source, without this chat’s changes.'
+diff --git a/common/src/desktop-cloud/history.ts b/common/src/desktop-cloud/history.ts
+index e09da4b40..755f88c2b 100644
+--- a/common/src/desktop-cloud/history.ts
++++ b/common/src/desktop-cloud/history.ts
+@@ -16,51 +16,51 @@ export type CloudHistoryProject = {
+   removedAt?: string | null
+ }
+ export type CloudHistoryRun = {
+   id: string
+   chatId: string
+   status: string
+   model: string | null
+   /** Claude Code or Codex ran this turn (`./agents`); absent for the Freebuff agent and older servers. */
+   agent?: import('./agents').CloudCliAgent | null
+   agentMode: 'plan' | 'build'
+   effort: string | null
+   promptPreview: string
+   createdAt: string
+   finishedAt: string | null
+   error: string | null
+ }
+ export type CloudHistoryChat = {
+   deviceExecution?: import('./device-execution').DeviceExecutionTarget | null
+   mission?: import('./mission').CloudMission | null
+   id: string
+   projectId: string | null
+   title: string
+   archivedAt: string | null
+   /** Continue locally (COD-878): when the chat moved to a computer, or null. Absent from older servers. */
+   handedBackAt?: string | null
+-  /** Archived Cloud files must land on this computer before another run. */
++  /** Cloud cannot bring this archived chat's files back, but Desktop can land their export. */
+   localRestoreRequired?: boolean
+   metadataRevision: number
+   phase: string
+   updatedAt: string
+   lastActiveAt: string
+   latestRun: CloudHistoryRun | null
+ }
+ /** Attaching observes the existing session; it never admits or purchases one. */
+ export type CloudHistoryAttachment = {
+   chat: CloudHistoryChat
+   instanceId: string
+   session: {
+     model: string
+     admittedAt: string
+     expiresAt: string | null
+   } | null
+ }
+ export type CloudHistoryChatUpdate = {
+   expectedRevision: number
+   title?: string
+   archived?: boolean
+ }
+ /**
+  * Last write wins: a project name has no revision to compare. Removing keeps its chats and files;
+  * `removed: false` puts it back in the list.
+
+```
