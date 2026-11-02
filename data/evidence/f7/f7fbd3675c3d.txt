@@ -1,0 +1,718 @@
+Date: 2026-11-02T22:51:50Z
+Category: Core
+Areas: Shared/Core
+Commit nature: production
+Stats: +25 / -3
+Analysis notes: Shared/Core changes across 1 file(s) (+25/−3).
+Modified files: common/src/desktop-cloud/history.ts
+Key facts (ground the WHY and DETAIL sentences in these): - The sidebar "finished" dot, shared by every device. Absent from older servers. - Each settled run raises `revision`; opening the chat on any device acknowledges through it. Both only increase, so a stale read or a retried acknowledgement never undoes a newer one. - Attaching observes the existing session; it never admits or purchases one.
+Structured facts (extracted mechanically from the diff; copy names and values verbatim, never round or rename):
+- Exports added: CloudHistoryAttention, CloudHistoryAttentionAck
+Module & File Purpose (ground-truth documentation from touched files):
+- File `common/src/desktop-cloud/history.ts`:
+```
+/** Shared history and attachment contract for the Postgres-backed Cloud service. */
+```
+Complete Source of Modified Files (for complete module context):
+- File `common/src/desktop-cloud/history.ts` (238 lines):
+```
+/** Shared history and attachment contract for the Postgres-backed Cloud service. */
+export type CloudHistoryPage<T> = { items: T[]; nextCursor: string | null }
+export type CloudHistoryProject = {
+  /** A durable local target; absence means a hosted project. Never inferred from presence. */
+  deviceExecution?: import('./device-execution').DeviceExecutionTarget | null
+  id: string
+  name: string
+  createdAt: string
+  github?: import('./github').GitHubRepository | null
+  /** The starter selected at project creation; absent from older servers. */
+  template?: import('../templates/selected').SelectedTemplate | null
+  /**
+   * When the user removed it from their project list, or null. A removed project is left out of
+   * `listProjects` until someone prompts in it again. Absent from older servers.
+   */
+  removedAt?: string | null
+}
+export type CloudHistoryRun = {
+  id: string
+  chatId: string
+  status: string
+  model: string | null
+  /** Claude Code or Codex ran this turn (`./agents`); absent for the Freebuff agent and older servers. */
+  agent?: import('./agents').CloudCliAgent | null
+  agentMode: 'plan' | 'build'
+  effort: string | null
+  promptPreview: string
+  createdAt: string
+  finishedAt: string | null
+  error: string | null
+}
+export type CloudHistoryChat = {
+  deviceExecution?: import('./device-execution').DeviceExecutionTarget | null
+  mission?: import('./mission').CloudMission | null
+  id: string
+  projectId: string | null
+  title: string
+  archivedAt: string | null
+  /** Continue locally (COD-878): when the chat moved to a computer, or null. Absent from older servers. */
+  handedBackAt?: string | null
+  /** Cloud cannot bring this archived chat's files back, but Desktop can land their export. */
+  localRestoreRequired?: boolean
+  metadataRevision: number
+  phase: string
+  updatedAt: string
+  lastActiveAt: string
+  latestRun: CloudHistoryRun | null
+  /** The sidebar "finished" dot, shared by every device. Absent from older servers. */
+  attention?: CloudHistoryAttention
+}
+/**
+ * Each settled run raises `revision`; opening the chat on any device acknowledges through it.
+ * Both only increase, so a stale read or a retried acknowledgement never undoes a newer one.
+ */
+export type CloudHistoryAttention = {
+  revision: number
+  acknowledgedRevision: number
+  reason: 'finished' | 'failed' | 'stopped' | null
+  at: string | null
+}
+export type CloudHistoryAttentionAck = { throughRevision: number }
+/** Attaching observes the existing session; it never admits or purchases one. */
+export type CloudHistoryAttachment = {
+  chat: CloudHistoryChat
+  instanceId: string
+  session: {
+    model: string
+    admittedAt: string
+    expiresAt: string | null
+  } | null
+}
+export type CloudHistoryChatUpdate = {
+  expectedRevision: number
+  title?: string
+  archived?: boolean
+}
+/**
+ * Last write wins: a project name has no revision to compare. Removing keeps its chats and files;
+ * `removed: false` puts it back in the list.
+ */
+export type CloudHistoryProjectUpdate =
+  | { name: string; removed?: boolean }
+  | { name?: string; removed: boolean }
+/**
+ * A server-internal run event marking that the run's SDK traces are stored in
+ * R2 rather than as `trace` events. Never returned by the history API or the
+ * live poll.
+ */
+export const TRACES_IN_R2_KIND = 'traces_r2'
+export type CloudHistoryEvent = {
+  /** Decimal string: Postgres bigint IDs can exceed JavaScript's safe integer. */
+  id: string
+  runId: string
+  kind: string
+  payload: unknown
+  createdAt: string
+}
+export type CloudHistoryEvents = CloudHistoryPage<CloudHistoryEvent> & {
+  /** Resume after the last returned event, even when nextCursor is null. */
+  endCursor: string | null
+}
+export type CloudHistoryOptions = {
+  cursor?: string | null
+  limit?: number
+  signal?: AbortSignal
+}
+
+export class CloudHistoryError extends Error {
+  constructor(
+    readonly status: number,
+    message: string,
+  ) {
+    super(message)
+    this.name = 'CloudHistoryError'
+  }
+}
+
+/**
+ * Sent by every bearer client that can open a chat running on a computer
+ * (`deviceExecution`). Desktop 0.0.192 and older sent no such header and can
+ * only open hosted chats, so the chat list omits device chats for a direct
+ * bearer request without it (`web/src/server/desktop-cloud/history-api.ts`).
+ */
+export const CLOUD_HISTORY_DEVICE_CHATS_HEADER = 'x-freebuff-device-chats'
+
+const bearer = (token: string) => ({
+  Authorization: `Bearer ${token}`,
+  [CLOUD_HISTORY_DEVICE_CHATS_HEADER]: '1',
+})
+
+/** Cookie auth on the same origin, or the existing Desktop session bearer. */
+export function createCloudHistoryClient(
+  options: {
+    baseUrl?: string
+    getToken?: () => string | null | Promise<string | null>
+    fetch?: (url: string, init?: RequestInit) => Promise<Response>
+  } = {},
+) {
+  const base = (options.baseUrl ?? '/api/v1/cloud/history').replace(/\/$/, '')
+  async function get<T>(
+    path: string,
+    page: CloudHistoryOptions = {},
+    projectId?: string,
+    update?: CloudHistoryChatUpdate | CloudHistoryProjectUpdate | CloudHistoryAttentionAck,
+    search?: string,
+  ): Promise<T> {
+    const query = new URLSearchParams()
+    if (search) query.set('search', search)
+    if (page.cursor != null) query.set('cursor', page.cursor)
+    if (page.limit !== undefined) query.set('limit', String(page.limit))
+    if (projectId !== undefined) query.set('projectId', projectId)
+    const token = await options.getToken?.()
+    const res = await (options.fetch ?? fetch)(
+      `${base}/${path}${query.size ? `?${query}` : ''}`,
+      {
+        credentials: 'same-origin',
+        cache: 'no-store',
+        signal: page.signal,
+        method: update ? 'PATCH' : 'GET',
+        body: update ? JSON.stringify(update) : undefined,
+        headers: update
+          ? {
+              'Content-Type': 'application/json',
+              ...(token ? bearer(token) : {}),
+            }
+          : token
+            ? bearer(token)
+            : undefined,
+      },
+    )
+    if (!res.ok) {
+      const body = await res.json().catch(() => null)
+      throw new CloudHistoryError(
+        res.status,
+        body?.error ?? 'Cloud history unavailable',
+      )
+    }
+    return res.json() as Promise<T>
+  }
+  const id = encodeURIComponent
+  return {
+    listProjects: (page?: CloudHistoryOptions) =>
+      get<CloudHistoryPage<CloudHistoryProject>>('projects', page),
+    getProject: (projectId: string, signal?: AbortSignal) =>
+      get<CloudHistoryProject>(`projects/${id(projectId)}`, { signal }),
+    updateProject: (
+      projectId: string,
+      update: CloudHistoryProjectUpdate,
+      signal?: AbortSignal,
+    ) =>
+      get<CloudHistoryProject>(
+        `projects/${id(projectId)}`,
+        { signal },
+        undefined,
+        update,
+      ),
+    listChats: (page: CloudHistoryOptions & { projectId?: string; search?: string } = {}) =>
+      get<CloudHistoryPage<CloudHistoryChat>>('chats', page, page.projectId, undefined, page.search),
+    getChat: (chatId: string, signal?: AbortSignal) =>
+      get<CloudHistoryChat>(`chats/${id(chatId)}`, { signal }),
+    getAttachment: (chatId: string, signal?: AbortSignal) =>
+      get<CloudHistoryAttachment>(`chats/${id(chatId)}/attachment`, { signal }),
+    updateChat: (
+      chatId: string,
+      update: CloudHistoryChatUpdate,
+      signal?: AbortSignal,
+    ) =>
+      get<CloudHistoryChat>(
+        `chats/${id(chatId)}`,
+        { signal },
+        undefined,
+        update,
+      ),
+    acknowledgeAttention: (
+      chatId: string,
+      throughRevision: number,
+      signal?: AbortSignal,
+    ) =>
+      get<CloudHistoryChat>(
+        `chats/${id(chatId)}/attention`,
+        { signal },
+        undefined,
+        { throughRevision },
+      ),
+    listRuns: (chatId: string, page?: CloudHistoryOptions) =>
+      get<CloudHistoryPage<CloudHistoryRun>>(`chats/${id(chatId)}/runs`, page),
+    getRun: (runId: string, signal?: AbortSignal) =>
+      get<CloudHistoryRun>(`runs/${id(runId)}`, { signal }),
+    listEvents: (runId: string, page?: CloudHistoryOptions) =>
+      get<CloudHistoryEvents>(`runs/${id(runId)}/events`, page),
+    listTraces: (runId: string, page?: CloudHistoryOptions) =>
+      get<CloudHistoryEvents>(`runs/${id(runId)}/traces`, page),
+    /** Whether this account may use Freebuff Projects (admins and an allowlist). */
+    getProjectsAccess: (signal?: AbortSignal) =>
+      get<{ allowed: boolean }>('projects-access', { signal }),
+  }
+}
+```
+Where the symbols this change introduces are used elsewhere, at this same revision (the code that reads them; this is evidence for the WHAT and the WHY, and it is the only source for who consumes this change):
+- File `cli/src/utils/chat-history.ts` (8 matching lines):
+```
+): ChatHistoryEntry[] {
+  try {
+    const chatsDir = getChatsDir(dataDir)
+
+    if (!fs.existsSync(chatsDir)) {
+      return []
+    }
+
+    const chatDirs = fs.readdirSync(chatsDir)
+
+    // First pass: get mtime for all chat directories (fast, no file reading)
+    const chatDirInfos: ChatDirInfo[] = []
+    for (const chatId of chatDirs) {
+      const chatPath = path.join(chatsDir, chatId)
+      try {
+        const stat = fs.statSync(chatPath)
+        if (!stat.isDirectory()) continue
+
+        chatDirInfos.push({
+          chatId,
+          chatPath,
+          messagesPath: path.join(chatPath, CHAT_MESSAGES_FILENAME),
+          mtime: stat.mtime,
+        })
+      } catch {
+        // Skip directories we can't stat
+      }
+    }
+
+    // Sort by mtime first (most recent first)
+    chatDirInfos.sort((a, b) => b.mtime.getTime() - a.mtime.getTime())
+```
+- File `cli/src/components/chat-history-screen.tsx` (5 matching lines):
+```
+const [statusMessage, setStatusMessage] = useState<string | null>(null)
+
+  // Load more chats in the background after initial render
+  useEffect(() => {
+    // Use setTimeout to defer the expensive loading to after first paint
+    const timer = setTimeout(() => {
+      setChats(getAllChats(LAYOUT.INITIAL_CHATS + LAYOUT.BACKGROUND_CHATS))
+    }, 0)
+    return () => clearTimeout(timer)
+  }, [])
+
+  const handleDeleteChat = useCallback((chatId: string) => {
+    const deleted = deleteChatSession(chatId)
+    if (deleted) {
+      setChats((prev) => prev.filter((chat) => chat.chatId !== chatId))
+      setStatusMessage('Chat deleted')
+      return
+    }
+
+    setStatusMessage('Could not delete chat')
+  }, [])
+
+  // Calculate available width for the prompt text (last column, variable width)
+  // Format: "[time]   [msgs]   [prompt...] [×]"
+  // reservedWidth accounts for: time col, msgs col, delete button area,
+  // 2 gaps between columns, list border (2), scrollbar (1), and button padding (2)
+  const reservedWidth =
+…
+} = useSearchableList({
+    items: chatItems,
+    filterFn: filterByPrompt,
+  })
+
+  const isCompactMode = terminalHeight < LAYOUT.COMPACT_MODE_THRESHOLD
+  const isNarrowWidth = terminalWidth < LAYOUT.NARROW_WIDTH_THRESHOLD
+
+  // No need to calculate listHeight - let flexbox handle it naturally
+
+  // Unreadable chats (corrupt chat-messages.json) can be deleted but not resumed
+  const unreadableChatIds = useMemo(
+    () => new Set(chats.filter((chat) => chat.unreadable).map((c) => c.chatId)),
+    [chats],
+  )
+
+  // Handle chat selection
+  const selectChat = useCallback(
+    (chatId: string) => {
+      if (unreadableChatIds.has(chatId)) {
+        setStatusMessage("Chat file is corrupted and can't be opened")
+        return
+      }
+      onSelectChat(chatId)
+    },
+```
+- File `cli/src/utils/__tests__/chat-history.test.ts` (5 matching lines):
+```
+info: () => {},
+    warn: () => {},
+    error: () => {},
+    fatal: () => {},
+  },
+}))
+
+import { deleteChatSession, getAllChats } from '../chat-history'
+
+let tempDataDir = ''
+
+function writeChat(chatId: string, prompt: string) {
+  const chatDir = path.join(tempDataDir, 'chats', chatId)
+  fs.mkdirSync(chatDir, { recursive: true })
+  fs.writeFileSync(
+    path.join(chatDir, 'chat-messages.json'),
+    JSON.stringify([
+      {
+        id: `${chatId}-message`,
+        variant: 'user',
+        content: prompt,
+        timestamp: new Date().toISOString(),
+        blocks: [],
+      },
+    ]),
+…
+fs.rmSync(tempDataDir, { recursive: true, force: true })
+  })
+
+  test('deleteChatSession removes a saved chat directory', () => {
+    writeChat('chat-a', 'hello from chat a')
+    writeChat('chat-b', 'hello from chat b')
+
+    expect(deleteChatSession('chat-a', tempDataDir)).toBe(true)
+
+    expect(fs.existsSync(path.join(tempDataDir, 'chats', 'chat-a'))).toBe(false)
+    expect(fs.existsSync(path.join(tempDataDir, 'chats', 'chat-b'))).toBe(true)
+    expect(
+      getAllChats(500, tempDataDir).map((chat) => chat.chatId),
+    ).toEqual(['chat-b'])
+  })
+
+  test('deleteChatSession rejects invalid chat ids', () => {
+    const outsideDir = path.join(tempDataDir, 'outside')
+    fs.mkdirSync(outsideDir, { recursive: true })
+
+    expect(deleteChatSession('../outside', tempDataDir)).toBe(false)
+    expect(deleteChatSession('..', tempDataDir)).toBe(false)
+
+    expect(fs.existsSync(outsideDir)).toBe(true)
+  })
+…
+writeChat('chat-good', 'hello from a healthy chat')
+
+    // Simulate a chat-messages.json truncated by a crash mid-write
+    const corruptDir = path.join(tempDataDir, 'chats', 'chat-corrupt')
+    fs.mkdirSync(corruptDir, { recursive: true })
+    fs.writeFileSync(
+      path.join(corruptDir, 'chat-messages.json'),
+      '[{"id":"msg-1","variant":"user","content":"truncat',
+    )
+
+    const chats = getAllChats(500, tempDataDir)
+
+    const good = chats.find((chat) => chat.chatId === 'chat-good')
+    expect(good).toBeDefined()
+    expect(good?.unreadable).toBeUndefined()
+    expect(good?.lastPrompt).toBe('hello from a healthy chat')
+
+    const corrupt = chats.find((chat) => chat.chatId === 'chat-corrupt')
+    expect(corrupt).toBeDefined()
+    expect(corrupt?.unreadable).toBe(true)
+    expect(corrupt?.lastPrompt).toBe('(unreadable chat)')
+  })
+
+  test('getAllChats lists non-array chat-messages.json as unreadable', () => {
+    const badDir = path.join(tempDataDir, 'chats', 'chat-not-array')
+```
+- File `cli/src/utils/run-state-storage.ts` (5 matching lines):
+```
+}
+  // Kept, not deleted: the user's transcript is in there, and a later fix or a
+  // support request can still get it back.
+  logger.warn(
+    { filePath, part, quarantine, ...detail },
+    'Damaged chat state moved aside; restoring what is left',
+  )
+  return { value: null, outcome: 'damaged' }
+}
+
+/**
+ * Load both RunState and ChatMessage[] from a specific chat directory or the most recent one.
+ * When chatId is provided, it is used to locate the chat directory; otherwise the most
+ * recently modified chat directory is used.
+ * Returns null if no previous chat exists or files can't be parsed.
+ */
+export function loadMostRecentChatState(
+  chatId?: string,
+): SavedChatState | null {
+  try {
+    let chatDir: string | null = chatDirOverride ?? null
+
+    if (!chatDir && chatId && chatId.trim().length > 0) {
+      const baseDir = path.join(getProjectDataDir(), 'chats')
+      const candidateDir = path.join(baseDir, chatId.trim())
+      if (
+        fs.existsSync(candidateDir) &&
+        fs.statSync(candidateDir).isDirectory()
+      ) {
+        chatDir = candidateDir
+      } else {
+        logger.debug(
+          { candidateDir, chatId },
+          'Requested chatId directory not found, falling back to most recent chat directory',
+        )
+      }
+    }
+```
+- File `cli/src/project-files.ts` (3 matching lines):
+```
+export function tryGetProjectRoot() {
+  return projectRoot
+}
+
+export function getCurrentChatId() {
+  if (!currentChatId) {
+    currentChatId = new Date().toISOString().replace(/:/g, '-')
+  }
+  return currentChatId
+}
+
+export function setCurrentChatId(chatId: string) {
+  currentChatId = chatId
+  return currentChatId
+}
+
+export function startNewChat() {
+  currentChatId = new Date().toISOString().replace(/:/g, '-')
+  return currentChatId
+}
+
+// Get the project-specific data directory
+export function getProjectDataDir(): string {
+  const root = getProjectRoot()
+  if (!root) {
+…
+return null
+    }
+
+    // Sort by modification time, most recent first
+    chatDirs.sort((a, b) => b.mtime.getTime() - a.mtime.getTime())
+    return chatDirs[0].fullPath
+  } catch {
+    return null
+  }
+}
+
+export function getCurrentChatDir(): string {
+  const chatId = getCurrentChatId()
+  const dir = path.join(getProjectDataDir(), 'chats', chatId)
+  ensureChatDirectory(dir)
+  return dir
+}
+```
+- File `cli/src/hooks/use-exit-handler.ts` (2 matching lines):
+```
+inputValue: string
+  setInputValue: (value: InputValue) => void
+}
+
+let exitHandlerRegistered = false
+
+function setupExitMessageHandler() {
+  if (exitHandlerRegistered) return
+  exitHandlerRegistered = true
+
+  process.on('exit', () => {
+    try {
+      const chatId = getCurrentChatId()
+      if (chatId) {
+        // This runs synchronously during the exit phase
+        // OpenTUI has already cleaned up by this point
+        const cliName = IS_FREEBUFF ? 'freebuff' : 'codebuff'
+        process.stdout.write(
+          `\nTo continue this session later, run:\n${cliName} --continue ${chatId}\n`,
+        )
+      }
+    } catch {
+      // Silent fail - don't block exit
+    }
+  })
+}
+```
+Diff (source hunks; lockfiles and pure test hunks omitted, except in a lockfile-only commit):
+```diff
+diff --git a/common/src/desktop-cloud/history.ts b/common/src/desktop-cloud/history.ts
+index 755f88c2b..2e2cdd025 100644
+--- a/common/src/desktop-cloud/history.ts
++++ b/common/src/desktop-cloud/history.ts
+@@ -23,51 +23,64 @@ export type CloudHistoryRun = {
+   /** Claude Code or Codex ran this turn (`./agents`); absent for the Freebuff agent and older servers. */
+   agent?: import('./agents').CloudCliAgent | null
+   agentMode: 'plan' | 'build'
+   effort: string | null
+   promptPreview: string
+   createdAt: string
+   finishedAt: string | null
+   error: string | null
+ }
+ export type CloudHistoryChat = {
+   deviceExecution?: import('./device-execution').DeviceExecutionTarget | null
+   mission?: import('./mission').CloudMission | null
+   id: string
+   projectId: string | null
+   title: string
+   archivedAt: string | null
+   /** Continue locally (COD-878): when the chat moved to a computer, or null. Absent from older servers. */
+   handedBackAt?: string | null
+   /** Cloud cannot bring this archived chat's files back, but Desktop can land their export. */
+   localRestoreRequired?: boolean
+   metadataRevision: number
+   phase: string
+   updatedAt: string
+   lastActiveAt: string
+   latestRun: CloudHistoryRun | null
++  /** The sidebar "finished" dot, shared by every device. Absent from older servers. */
++  attention?: CloudHistoryAttention
+ }
++/**
++ * Each settled run raises `revision`; opening the chat on any device acknowledges through it.
++ * Both only increase, so a stale read or a retried acknowledgement never undoes a newer one.
++ */
++export type CloudHistoryAttention = {
++  revision: number
++  acknowledgedRevision: number
++  reason: 'finished' | 'failed' | 'stopped' | null
++  at: string | null
++}
++export type CloudHistoryAttentionAck = { throughRevision: number }
+ /** Attaching observes the existing session; it never admits or purchases one. */
+ export type CloudHistoryAttachment = {
+   chat: CloudHistoryChat
+   instanceId: string
+   session: {
+     model: string
+     admittedAt: string
+     expiresAt: string | null
+   } | null
+ }
+ export type CloudHistoryChatUpdate = {
+   expectedRevision: number
+   title?: string
+   archived?: boolean
+ }
+ /**
+  * Last write wins: a project name has no revision to compare. Removing keeps its chats and files;
+  * `removed: false` puts it back in the list.
+  */
+ export type CloudHistoryProjectUpdate =
+   | { name: string; removed?: boolean }
+   | { name?: string; removed: boolean }
+ /**
+  * A server-internal run event marking that the run's SDK traces are stored in
+  * R2 rather than as `trace` events. Never returned by the history API or the
+@@ -106,51 +119,51 @@ export class CloudHistoryError extends Error {
+  * Sent by every bearer client that can open a chat running on a computer
+  * (`deviceExecution`). Desktop 0.0.192 and older sent no such header and can
+  * only open hosted chats, so the chat list omits device chats for a direct
+  * bearer request without it (`web/src/server/desktop-cloud/history-api.ts`).
+  */
+ export const CLOUD_HISTORY_DEVICE_CHATS_HEADER = 'x-freebuff-device-chats'
+ 
+ const bearer = (token: string) => ({
+   Authorization: `Bearer ${token}`,
+   [CLOUD_HISTORY_DEVICE_CHATS_HEADER]: '1',
+ })
+ 
+ /** Cookie auth on the same origin, or the existing Desktop session bearer. */
+ export function createCloudHistoryClient(
+   options: {
+     baseUrl?: string
+     getToken?: () => string | null | Promise<string | null>
+     fetch?: (url: string, init?: RequestInit) => Promise<Response>
+   } = {},
+ ) {
+   const base = (options.baseUrl ?? '/api/v1/cloud/history').replace(/\/$/, '')
+   async function get<T>(
+     path: string,
+     page: CloudHistoryOptions = {},
+     projectId?: string,
+-    update?: CloudHistoryChatUpdate | CloudHistoryProjectUpdate,
++    update?: CloudHistoryChatUpdate | CloudHistoryProjectUpdate | CloudHistoryAttentionAck,
+     search?: string,
+   ): Promise<T> {
+     const query = new URLSearchParams()
+     if (search) query.set('search', search)
+     if (page.cursor != null) query.set('cursor', page.cursor)
+     if (page.limit !== undefined) query.set('limit', String(page.limit))
+     if (projectId !== undefined) query.set('projectId', projectId)
+     const token = await options.getToken?.()
+     const res = await (options.fetch ?? fetch)(
+       `${base}/${path}${query.size ? `?${query}` : ''}`,
+       {
+         credentials: 'same-origin',
+         cache: 'no-store',
+         signal: page.signal,
+         method: update ? 'PATCH' : 'GET',
+         body: update ? JSON.stringify(update) : undefined,
+         headers: update
+           ? {
+               'Content-Type': 'application/json',
+               ...(token ? bearer(token) : {}),
+             }
+           : token
+             ? bearer(token)
+             : undefined,
+       },
+@@ -176,38 +189,49 @@ export function createCloudHistoryClient(
+       signal?: AbortSignal,
+     ) =>
+       get<CloudHistoryProject>(
+         `projects/${id(projectId)}`,
+         { signal },
+         undefined,
+         update,
+       ),
+     listChats: (page: CloudHistoryOptions & { projectId?: string; search?: string } = {}) =>
+       get<CloudHistoryPage<CloudHistoryChat>>('chats', page, page.projectId, undefined, page.search),
+     getChat: (chatId: string, signal?: AbortSignal) =>
+       get<CloudHistoryChat>(`chats/${id(chatId)}`, { signal }),
+     getAttachment: (chatId: string, signal?: AbortSignal) =>
+       get<CloudHistoryAttachment>(`chats/${id(chatId)}/attachment`, { signal }),
+     updateChat: (
+       chatId: string,
+       update: CloudHistoryChatUpdate,
+       signal?: AbortSignal,
+     ) =>
+       get<CloudHistoryChat>(
+         `chats/${id(chatId)}`,
+         { signal },
+         undefined,
+         update,
+       ),
++    acknowledgeAttention: (
++      chatId: string,
++      throughRevision: number,
++      signal?: AbortSignal,
++    ) =>
++      get<CloudHistoryChat>(
++        `chats/${id(chatId)}/attention`,
++        { signal },
++        undefined,
++        { throughRevision },
++      ),
+     listRuns: (chatId: string, page?: CloudHistoryOptions) =>
+       get<CloudHistoryPage<CloudHistoryRun>>(`chats/${id(chatId)}/runs`, page),
+     getRun: (runId: string, signal?: AbortSignal) =>
+       get<CloudHistoryRun>(`runs/${id(runId)}`, { signal }),
+     listEvents: (runId: string, page?: CloudHistoryOptions) =>
+       get<CloudHistoryEvents>(`runs/${id(runId)}/events`, page),
+     listTraces: (runId: string, page?: CloudHistoryOptions) =>
+       get<CloudHistoryEvents>(`runs/${id(runId)}/traces`, page),
+     /** Whether this account may use Freebuff Projects (admins and an allowlist). */
+     getProjectsAccess: (signal?: AbortSignal) =>
+       get<{ allowed: boolean }>('projects-access', { signal }),
+   }
+ }
+
+```
