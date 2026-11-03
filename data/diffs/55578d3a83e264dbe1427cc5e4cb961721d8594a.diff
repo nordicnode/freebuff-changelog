@@ -1,0 +1,1269 @@
+diff --git a/common/src/desktop-cloud/hosted-workspace.ts b/common/src/desktop-cloud/hosted-workspace.ts
+index 2f36678ed..aa7639285 100644
+--- a/common/src/desktop-cloud/hosted-workspace.ts
++++ b/common/src/desktop-cloud/hosted-workspace.ts
+@@ -177,50 +177,59 @@ export type HostedNativeAgentsRequest = {
+ export type HostedLocalProjectInput = {
+   id: string
+   name: string
+   folderId?: string
+   templateId?: string
+ }
+ 
+ export type HostedWorkspaceHost = {
+   /** Local branch names only; native resolves the enrolled folder and refuses unsafe switches. */
+   projectBranches?(input: { projectId: string; branch?: string }): Promise<{
+     current: string | null
+     branches: string[]
+     /** What a worktree with no starting branch fetches (`origin/main`); older builds omit it. */
+     defaultBranch?: string
+   } | null>
+   nativeAgents?(input: HostedNativeAgentsRequest): Promise<{ agents: HostedNativeAgent[] }>
+   /** Answers only a native-issued quit request; never grants a generic IPC capability. */
+   quit?: {
+     onRequest(listener: (id: number) => void): () => void
+     answer(id: number, accepted: boolean): void
+   }
+   /** Native owns the full approval prompt; commands and directories never enter hosted IPC. */
+   elevations?: {
+     review(): Promise<void>
+   }
++  /**
++   * Settings > General > Diagnose (freebuff-desktop/src/server/services/diagnose). Builds without
++   * it omit the key, and the page hides Diagnose. Repairs take only a handle a scan minted.
++   */
++  diagnostics?: {
++    run(options?: { deep?: boolean; includePaths?: boolean; includeChatTitles?: boolean }): Promise<import('../doctor/types').DoctorReport>
++    repair(input: { kind: import('../doctor/types').DoctorRepairKind; ref?: string }): Promise<import('../doctor/types').DoctorRepairResult>
++    undo(undoRef: string): Promise<import('../doctor/types').DoctorRepairResult>
++  }
+   /** Mirrors cloud-managed local work for the native quit confirmation. */
+   activity?: {
+     report(busy: boolean): Promise<void>
+   }
+   /**
+    * The native updater (freebuff-desktop/electron/updater.cjs). While this
+    * window is the workspace, the local window that used to show update cards is
+    * hidden, so the page renders them. Subscribing tells native the page does;
+    * without a subscriber, native answers a menu check with its own dialogs.
+    */
+   updates?: {
+     pending(): Promise<import('./desktop-update').UpdateCard | null>
+     action(action: import('./desktop-update').UpdateAction): Promise<string>
+     check(): Promise<import('./desktop-update').UpdateCheckResult>
+     onCard(listener: (card: import('./desktop-update').UpdateCard | null) => void): () => void
+   }
+   /** Open a reviewed HTTP(S) authorization link in the system browser. */
+   openExternal?(url: string): Promise<void>
+   /** Text editing is restricted to this window and native's allowlisted commands. */
+   onTextContextMenu?: import('../types/text-menu').TextMenuBridge['onTextContextMenu']
+   textEdit?: import('../types/text-menu').TextMenuBridge['textEdit']
+   shortcuts?: {
+     setBindings(bindings: Record<string, string | null>): Promise<void>
+     setRecording(recording: boolean): Promise<void>
+     onCommand(listener: (command: HostedWorkspaceMenuCommand) => void): () => void
+diff --git a/common/src/doctor/__tests__/doctor.test.ts b/common/src/doctor/__tests__/doctor.test.ts
+new file mode 100644
+index 000000000..cf1963f91
+--- /dev/null
++++ b/common/src/doctor/__tests__/doctor.test.ts
+@@ -0,0 +1,206 @@
++import { describe, expect, test } from 'bun:test'
++import { createRedactor } from '../redact'
++import { runDoctorChecks } from '../run'
++import { doctorAskPrompt, doctorReportMarkdown, doctorReportText, doctorSummary } from '../report'
++import { COMMON_LOG_SIGNATURES, logScanFindings, scanLogText } from '../log-signatures'
++import { finding, type DoctorReport } from '../types'
++import {
++  classifyNetworkError, clockFinding, configuredProxies, dnsFindings, endpointFindings, environmentFindings,
++  hostsFileEntries, hostsFinding, proxyFindings, readClockSkew, tlsFinding,
++} from '../node/network'
++import { architectureFinding, diskFinding, longPathFinding, syncProviderFor, watcherLimitFinding } from '../node/system'
++import { classifyGitFolder, gitFolderFinding, gitInstallFindings } from '../node/git'
++
++const redact = createRedactor({ home: '/Users/alice', username: 'alice' })
++
++describe('redaction', () => {
++  test('paths keep only their last folder, and the home, user and emails go', () => {
++    expect(redact.path('/Users/alice/code/my-repo')).toBe('~/…/my-repo')
++    expect(redact.path('/srv/projects/app')).toBe('/…/app')
++    const text = redact.text('EACCES: open /Users/alice/code/secret-plan/notes.txt for alice (alice@example.com) at https://api.freebuff.com/v1')
++    expect(text).not.toContain('secret-plan')
++    expect(text).not.toContain('alice')
++    expect(text).toContain('<email>')
++    expect(text).toContain('https://api.freebuff.com/v1')
++  })
++
++  test('Windows paths and secrets are redacted', () => {
++    const win = createRedactor({ home: 'C:\\Users\\Bob', username: 'Bob' })
++    expect(win.text('EPERM C:\\Users\\Bob\\AppData\\Roaming\\Freebuff\\state.json')).toBe('EPERM ~/…/state.json')
++    expect(redact.text('Authorization: Bearer abcdefghijklmnop token=xyz123456')).not.toMatch(/abcdefghijklmnop|xyz123456/)
++  })
++
++  test('opting in keeps paths but never secrets', () => {
++    const full = createRedactor({ home: '/Users/alice', username: 'alice', includePaths: true })
++    expect(full.path('/Users/alice/code/my-repo')).toBe('/Users/alice/code/my-repo')
++    expect(full.text('key=sk-abcdefghijklmnopqrstu')).not.toContain('abcdefghijklmnopqrstu')
++  })
++})
++
++describe('runner', () => {
++  test('a slow or throwing check becomes a note, and deep checks wait for the option', async () => {
++    const result = await runDoctorChecks([
++      { id: 'fast', area: 'system', run: () => [finding('fast.ok', 'ok', 'system', 'fine', '')] },
++      { id: 'slow', area: 'network', timeoutMs: 20, run: () => new Promise(() => {}) },
++      { id: 'broken', area: 'disk', run: () => { throw new Error('/Users/alice/private') } },
++      { id: 'deep', area: 'chats', deep: true, run: () => [finding('deep.ran', 'error', 'chats', 'ran', '')] },
++    ], {})
++    expect(result.findings.map(f => f.id).sort()).toEqual(['broken.failed', 'fast.ok', 'slow.timeout'])
++    expect(JSON.stringify(result.findings)).not.toContain('private')
++    expect(result.checks.find(c => c.id === 'deep')?.outcome).toBe('skipped')
++    const deep = await runDoctorChecks([{ id: 'deep', area: 'chats', deep: true, run: () => [finding('deep.ran', 'error', 'chats', 'ran', '')] }], {}, { deep: true })
++    expect(deep.findings[0]!.id).toBe('deep.ran')
++  })
++})
++
++const report: DoctorReport = {
++  version: 1, product: 'desktop', generatedAt: '2026-11-02T00:00:00.000Z', durationMs: 1234, appVersion: '0.0.199',
++  platform: 'darwin', arch: 'arm64', options: { deep: false, includePaths: false }, checks: [{ id: 'slow', ms: 8000, outcome: 'timeout' }],
++  findings: [
++    finding('clock.skew', 'warning', 'clock', "Your computer's clock is 70 s ahead", 'Set your clock.', ['Open settings.']),
++    finding('disk.ok', 'ok', 'disk', 'Enough disk space', '50 GB free.'),
++  ],
++}
++
++describe('report', () => {
++  test('Markdown lists problems with steps, then what passed', () => {
++    const md = doctorReportMarkdown(report)
++    expect(md).toContain('### Warning: Your computer\'s clock is 70 s ahead')
++    expect(md).toContain('1. Open settings.')
++    expect(md).toContain('### Passed')
++    expect(md).toContain('slow (timeout)')
++    expect(doctorSummary(report)).toBe('1 warning found.')
++    expect(doctorReportText(report)).toContain('[WARNING]')
++    expect(doctorAskPrompt(report)).toContain(md)
++  })
++})
++
++describe('log signatures', () => {
++  test('counts known failures without quoting the lines', () => {
++    const log = [
++      'Error: SQLITE_CORRUPT: database disk image is malformed at /Users/alice/x.db',
++      'fatal: detected dubious ownership in repository at /Users/alice/repo',
++      'Error: ENOSPC: no space left on device',
++      'request failed: SELF_SIGNED_CERT_IN_CHAIN',
++      'Bun crashed: SIGILL',
++      'Error: EBUSY: resource busy or locked',
++      'Error: ENOSPC: no space left on device',
++    ].join('\n')
++    const findings = logScanFindings(scanLogText(log, COMMON_LOG_SIGNATURES), 'the engine log')
++    const ids = findings.map(f => f.id)
++    expect(ids).toEqual(expect.arrayContaining(['log.sqlite-corrupt', 'log.git-dubious-ownership', 'log.disk-full', 'log.tls-intercepted', 'log.illegal-instruction', 'log.file-busy']))
++    expect(findings.find(f => f.id === 'log.disk-full')!.detail).toContain('Seen 2 times')
++    expect(JSON.stringify(findings)).not.toContain('alice')
++  })
++})
++
++describe('network', () => {
++  test('clock skew past 20 s warns with sync steps, past 5 min is an error', () => {
++    expect(clockFinding({ skewMs: 5_000, rttMs: 50 }, 'darwin', 'desktop').severity).toBe('ok')
++    const ahead = clockFinding({ skewMs: 70_000, rttMs: 50 }, 'win32', 'desktop')
++    expect(ahead.severity).toBe('warning')
++    expect(ahead.title).toBe("Your computer's clock is 70 s ahead")
++    expect(ahead.detail).toContain('sync automatically')
++    expect(ahead.steps.join(' ')).toContain('Set time automatically')
++    expect(clockFinding({ skewMs: -600_000, rttMs: 50 }, 'linux', 'cli')).toMatchObject({ severity: 'error', title: "Your computer's clock is 10 min behind" })
++  })
++
++  test('skew is read from the Date header against the middle of the round trip', async () => {
++    let t = Date.parse('2026-11-02T00:01:10.000Z')
++    const reading = await readClockSkew('https://example.test', {
++      now: () => (t += 100),
++      fetch: async () => new Response(null, { headers: { date: 'Mon, 02 Nov 2026 00:00:00 GMT' } }),
++    })
++    expect('skewMs' in reading && Math.round(reading.skewMs / 1000)).toBe(70)
++  })
++
++  test('errors are classified, and a certificate failure names interception', () => {
++    expect(classifyNetworkError(Object.assign(new Error('getaddrinfo ENOTFOUND x'), { code: 'ENOTFOUND' }))).toBe('dns')
++    expect(classifyNetworkError({ code: 'ConnectionRefused' })).toBe('refused')
++    expect(classifyNetworkError({ name: 'TimeoutError' })).toBe('timeout')
++    expect(classifyNetworkError({ code: 'SELF_SIGNED_CERT_IN_CHAIN' })).toBe('tls')
++    const [api] = endpointFindings([{ endpoint: { id: 'api', label: 'the Freebuff API', url: 'x' }, ms: 1, ok: false, error: 'tls' }])
++    expect(api!.title).toContain('HTTPS is being intercepted')
++    expect(api!.detail).toContain('antivirus')
++  })
++
++  test('an antivirus issuer or a rejected chain is interception', () => {
++    expect(tlsFinding('api.freebuff.com', { authorized: true, authorizationError: null, issuers: ["Let's Encrypt / R11"] }).id).toBe('tls.ok')
++    const av = tlsFinding('api.freebuff.com', { authorized: true, authorizationError: null, issuers: ['Avast Web/Mail Shield / Avast Web/Mail Shield Root'] })
++    expect(av).toMatchObject({ id: 'tls.intercepted', severity: 'warning' })
++    expect(tlsFinding('x', { authorized: false, authorizationError: 'SELF_SIGNED_CERT_IN_CHAIN', issuers: [] }).severity).toBe('error')
++  })
++
++  test('hosts entries for our domains are found, comments ignored', () => {
++    const entries = hostsFileEntries('127.0.0.1 localhost\n0.0.0.0 api.freebuff.com # blocked\n# 1.2.3.4 codebuff.com\n10.0.0.1 www.codebuff.com other.test')
++    expect(entries).toEqual([{ address: '0.0.0.0', host: 'api.freebuff.com' }, { address: '10.0.0.1', host: 'www.codebuff.com' }])
++    expect(hostsFinding(entries).severity).toBe('error')
++    expect(hostsFinding([]).severity).toBe('ok')
++  })
++
++  test('DNS answers pointing at a local address are flagged', async () => {
++    const found = await dnsFindings(['freebuff.com', 'codebuff.com'], async host => (host === 'freebuff.com' ? ['0.0.0.0'] : ['104.18.1.1']))
++    expect(found.map(f => f.id)).toEqual(['dns.blocked.freebuff.com'])
++  })
++
++  test('proxies are reported by host and port only, and a dead one is an error', async () => {
++    const env = { HTTPS_PROXY: 'http://user:hunter2@proxy.corp:8080', http_proxy: 'http://proxy.corp:8080' }
++    expect(configuredProxies(env)).toEqual([{ variable: 'HTTPS_PROXY', host: 'proxy.corp', port: 8080 }])
++    const down = await proxyFindings(env, async () => false)
++    expect(down[0]!.severity).toBe('error')
++    expect(JSON.stringify(down)).not.toContain('hunter2')
++    expect((await proxyFindings(env, async () => true))[0]!.id).toBe('proxy.ok')
++  })
++
++  test('risky environment variables are named', () => {
++    expect(environmentFindings({ NODE_TLS_REJECT_UNAUTHORIZED: '0', NODE_OPTIONS: '--require ./hook.js' }).map(f => f.id))
++      .toEqual(['env.tls-verification-off', 'env.node-options-preload'])
++  })
++})
++
++describe('system', () => {
++  test('synced folders are recognised by their default names', () => {
++    expect(syncProviderFor('C:\\Users\\Bob\\OneDrive\\Freebuff')).toBe('OneDrive')
++    expect(syncProviderFor('C:\\Users\\Bob\\OneDrive - Contoso\\x')).toBe('OneDrive')
++    expect(syncProviderFor('/Users/a/Dropbox (Personal)/x')).toBe('Dropbox')
++    expect(syncProviderFor('/Users/a/Library/Mobile Documents/com~apple~CloudDocs/x')).toBe('iCloud Drive')
++    expect(syncProviderFor('/Users/a/Library/CloudStorage/GoogleDrive-a@b.com/My Drive/x')).toBe('Google Drive')
++    expect(syncProviderFor('/Users/a/.config/freebuff-desktop')).toBeNull()
++  })
++
++  test('disk thresholds', async () => {
++    const statfs = (free: number) => () => ({ bavail: free / 4096, bsize: 4096 })
++    expect((await diskFinding('your profile', '/x', redact, statfs(100 * 1024 ** 2))).id).toBe('disk.critical')
++    expect((await diskFinding('your profile', '/x', redact, statfs(1024 ** 3))).id).toBe('disk.low')
++    expect((await diskFinding('your profile', '/x', redact, statfs(50 * 1024 ** 3))).id).toBe('disk.ok')
++  })
++
++  test('platform-specific limits', async () => {
++    expect(watcherLimitFinding('linux', () => '8192\n')?.id).toBe('system.inotify-low')
++    expect(watcherLimitFinding('darwin', () => '8192')).toBeNull()
++    expect(architectureFinding('darwin', 'x64', 'Apple M2')?.id).toBe('system.rosetta')
++    expect(architectureFinding('darwin', 'arm64', 'Apple M2')).toBeNull()
++    const deep = 'a'.repeat(120)
++    const list = (dir: string) => (dir.length < 400 ? [{ name: deep, isDirectory: () => true }] : [])
++    expect((await longPathFinding(['C:\\p'], 'win32', 100, list))?.id).toBe('system.long-paths')
++    expect(await longPathFinding(['/p'], 'linux', 100, list)).toBeNull()
++  })
++})
++
++describe('git', () => {
++  test('folder states, and dubious ownership offers a warned repair', () => {
++    expect(classifyGitFolder({ code: 128, stdout: '', stderr: "fatal: detected dubious ownership in repository at '/x'" })).toBe('dubious')
++    expect(classifyGitFolder({ code: 128, stdout: '', stderr: 'fatal: not a git repository' })).toBe('not-repo')
++    expect(classifyGitFolder({ code: null, stdout: '', stderr: '', missing: true })).toBe('no-git')
++    const dubious = gitFolderFinding('dubious', 'my-repo', '/Users/alice/code/my-repo', redact, 'ref-1')!
++    expect(dubious.repair).toMatchObject({ kind: 'trust-git-folder', ref: 'ref-1' })
++    expect(dubious.repair!.warning).toContain('Only trust folders you own')
++    expect(JSON.stringify(dubious)).not.toContain('/Users/alice')
++  })
++
++  test('Windows without long paths is noted', async () => {
++    const run = async (_: string, args: string[]) => (args[0] === '--version' ? { code: 0, stdout: 'git version 2.47.0', stderr: '' } : { code: 1, stdout: '', stderr: '' })
++    expect((await gitInstallFindings('win32', run)).map(f => f.id)).toEqual(['git.ok', 'git.longpaths-off'])
++    expect((await gitInstallFindings('darwin', async () => ({ code: null, stdout: '', stderr: '', missing: true })))[0]!.id).toBe('git.missing')
++  })
++})
+diff --git a/common/src/doctor/help.ts b/common/src/doctor/help.ts
+new file mode 100644
+index 000000000..7baf71897
+--- /dev/null
++++ b/common/src/doctor/help.ts
+@@ -0,0 +1,13 @@
++/**
++ * Where a finding's "More" link goes: the vendor's own documentation for the setting the steps
++ * name. Only stable vendor pages belong here. Freebuff policy (plans, Freebucks, refunds, bans) is
++ * never explained by diagnostics; those questions go to support.
++ */
++export const LEARN_MORE = {
++  gitSafeDirectory: 'https://git-scm.com/docs/git-config#Documentation/git-config.txt-safedirectory',
++  controlledFolderAccess: 'https://learn.microsoft.com/defender-endpoint/customize-controlled-folders',
++  linuxInotify: 'https://man7.org/linux/man-pages/man7/inotify.7.html',
++  windowsLongPaths: 'https://learn.microsoft.com/windows/win32/fileio/maximum-file-path-limitation',
++} as const
++
++export const SUPPORT_EMAIL = 'support@freebuff.com'
+diff --git a/common/src/doctor/log-signatures.ts b/common/src/doctor/log-signatures.ts
+new file mode 100644
+index 000000000..c7d0b2325
+--- /dev/null
++++ b/common/src/doctor/log-signatures.ts
+@@ -0,0 +1,111 @@
++import { finding, type DoctorArea, type DoctorFinding, type DoctorSeverity } from './types'
++import { LEARN_MORE } from './help'
++
++/**
++ * A known failure that leaves a recognisable line in our own logs. The scan reports how many
++ * times each one appears, never the line itself: a log line can hold a path or a file name.
++ */
++export type LogSignature = {
++  id: string
++  pattern: RegExp
++  severity: DoctorSeverity
++  area: DoctorArea
++  title: string
++  detail: string
++  steps: string[]
++  learnMore?: string
++}
++
++export const COMMON_LOG_SIGNATURES: LogSignature[] = [
++  {
++    id: 'log.sqlite-corrupt', pattern: /SQLITE_CORRUPT|database disk image is malformed|file is not a database|SQLITE_NOTADB/i,
++    severity: 'error', area: 'chats', title: 'A local database is damaged',
++    detail: 'The log shows SQLite reporting a damaged database. Chats stored in it may fail to open.',
++    steps: ['Do not delete anything yet: the damaged file still holds your history.', 'Copy this report into a support request so we can help you recover it.'],
++  },
++  {
++    id: 'log.git-dubious-ownership', pattern: /dubious ownership|safe\.directory/i,
++    severity: 'warning', area: 'git', title: 'Git refused a folder owned by another user',
++    detail: 'Git stops working in a folder whose owner is a different user account ("dubious ownership"). This often happens after copying a project from another computer or user, or on an external drive.',
++    steps: ['If you own this folder, trust it in git (Diagnose offers this for each project it finds).', 'Otherwise, take ownership of the folder with your own user account.'],
++    learnMore: LEARN_MORE.gitSafeDirectory,
++  },
++  {
++    id: 'log.disk-full', pattern: /ENOSPC|no space left on device|disk (?:is )?full/i,
++    severity: 'error', area: 'disk', title: 'The disk ran out of space',
++    detail: 'A write failed because the disk was full. Chats, worktrees and updates can fail or be left half written.',
++    steps: ['Free up at least a few gigabytes on the drive that holds your home folder.', 'Restart Freebuff.'],
++  },
++  {
++    id: 'log.permission-denied', pattern: /\bE(?:PERM|ACCES)\b|operation not permitted|permission denied/i,
++    severity: 'warning', area: 'environment', title: 'Access to a file was denied',
++    detail: 'The system refused to let Freebuff read or write a file. On Windows this is usually antivirus or Controlled Folder Access blocking the app; elsewhere it is usually a file owned by another user.',
++    steps: ['If you use Windows Security, allow Freebuff under Ransomware protection > Controlled folder access > Allow an app.', 'If you use another antivirus, add an exclusion for Freebuff and your project folders.', 'Check that your user owns the project folder.'],
++    learnMore: LEARN_MORE.controlledFolderAccess,
++  },
++  {
++    id: 'log.file-busy', pattern: /\bEBUSY\b|resource busy or locked|being used by another process/i,
++    severity: 'warning', area: 'environment', title: 'A file was locked by another program',
++    detail: 'Another program held a file Freebuff needed. Antivirus scanners and OneDrive sync are the usual cause on Windows.',
++    steps: ['Add an antivirus exclusion for Freebuff and your project folders.', 'Keep project folders and the Freebuff profile out of OneDrive or other sync folders.'],
++  },
++  {
++    id: 'log.illegal-instruction', pattern: /\bSIGILL\b|0xC000001D|illegal instruction/i,
++    severity: 'error', area: 'system', title: 'The engine crashed on an unsupported processor instruction',
++    detail: 'The bundled Bun runtime used a processor feature this computer does not have (an older CPU, or a virtual machine that hides AVX).',
++    steps: ['Update Freebuff: current versions fall back to a runtime for older processors.', 'In a virtual machine, enable AVX/AVX2 pass-through for the guest.'],
++  },
++  {
++    id: 'log.tls-intercepted', pattern: /SELF_SIGNED_CERT_IN_CHAIN|UNABLE_TO_GET_ISSUER_CERT(?:_LOCALLY)?|UNABLE_TO_VERIFY_LEAF_SIGNATURE|CERT_UNTRUSTED|certificate (?:verify failed|has expired)|self[- ]signed certificate/i,
++    severity: 'warning', area: 'network', title: 'Secure connections were rejected',
++    detail: 'Freebuff could not verify a server certificate. This is what HTTPS scanning by antivirus, or a corporate proxy that inspects traffic, looks like from inside the app.',
++    steps: ['Turn off HTTPS or SSL scanning in your antivirus (or exclude freebuff.com and codebuff.com).', 'On a work network, ask IT to exempt freebuff.com and codebuff.com from TLS inspection.', 'Check that your computer clock is correct.'],
++  },
++  {
++    id: 'log.network-unreachable', pattern: /\bENOTFOUND\b|\bECONNREFUSED\b|\bETIMEDOUT\b|\bECONNRESET\b|getaddrinfo|ConnectionRefused|FailedToOpenSocket/,
++    severity: 'info', area: 'network', title: 'Network requests failed',
++    detail: 'The log shows connections that could not be made (name lookup, refused or timed out). Occasional failures are normal on a flaky network; many in a row mean something blocks Freebuff.',
++    steps: ['Check the network section of this report.', 'If you use a VPN, firewall or proxy, allow freebuff.com and codebuff.com.'],
++  },
++  {
++    id: 'log.out-of-memory', pattern: /JavaScript heap out of memory|\bout of memory\b|ENOMEM|OOM/,
++    severity: 'warning', area: 'system', title: 'A process ran out of memory',
++    detail: 'Something Freebuff runs ran out of memory and stopped.',
++    steps: ['Close other large apps and restart Freebuff.', 'Very large repositories need more memory; work in a smaller folder if you can.'],
++  },
++  {
++    id: 'log.too-many-files', pattern: /\bEMFILE\b|too many open files|ENOSPC: System limit for number of file watchers/i,
++    severity: 'warning', area: 'system', title: 'The system limit on open files or file watchers was reached',
++    detail: 'The operating system refused to open more files or watch more folders.',
++    steps: ['Raise the limit (see the system section of this report).', 'Restart Freebuff.'],
++  },
++  {
++    id: 'log.port-in-use', pattern: /\bEADDRINUSE\b|address already in use/i,
++    severity: 'info', area: 'processes', title: 'A port was already in use',
++    detail: 'Something tried to listen on a port another program already holds. A leftover Freebuff or dev server process is the usual cause.',
++    steps: ['Quit Freebuff completely and start it again.', 'Stop dev servers you no longer need.'],
++  },
++]
++
++export type LogScan = { signature: LogSignature; count: number }
++
++export function scanLogText(text: string, signatures: ReadonlyArray<LogSignature>): LogScan[] {
++  const counts = new Map<string, LogScan>()
++  for (const line of text.split(/\r?\n/)) {
++    if (!line) continue
++    for (const signature of signatures) {
++      if (!signature.pattern.test(line)) continue
++      const entry = counts.get(signature.id) ?? { signature, count: 0 }
++      entry.count++
++      counts.set(signature.id, entry)
++    }
++  }
++  return [...counts.values()]
++}
++
++export function logScanFindings(scans: LogScan[], source: string): DoctorFinding[] {
++  return scans.map(({ signature, count }) =>
++    finding(signature.id, signature.severity, signature.area, signature.title,
++      `${signature.detail} Seen ${count} time${count === 1 ? '' : 's'} in ${source}.`, signature.steps,
++      signature.learnMore ? { learnMore: signature.learnMore } : {}))
++}
+diff --git a/common/src/doctor/node/git.ts b/common/src/doctor/node/git.ts
+new file mode 100644
+index 000000000..da79c2d83
+--- /dev/null
++++ b/common/src/doctor/node/git.ts
+@@ -0,0 +1,72 @@
++import { execFile } from 'node:child_process'
++import { finding, type DoctorFinding } from '../types'
++import type { DoctorRedactor } from '../redact'
++import { LEARN_MORE } from '../help'
++
++export type CommandResult = { code: number | null; stdout: string; stderr: string; missing?: boolean }
++export type RunCommand = (command: string, args: string[], options?: { cwd?: string; timeoutMs?: number }) => Promise<CommandResult>
++
++/** Runs a read-only command without a shell, bounded in time and output. */
++export const runCommand: RunCommand = (command, args, options = {}) =>
++  new Promise(resolve => {
++    execFile(command, args, {
++      cwd: options.cwd, timeout: options.timeoutMs ?? 5_000, maxBuffer: 256 * 1024, windowsHide: true,
++      env: { ...process.env, GIT_TERMINAL_PROMPT: '0', LC_ALL: 'C' },
++    }, (error, stdout, stderr) => {
++      const code = error ? (typeof (error as { code?: unknown }).code === 'number' ? (error as { code: number }).code : null) : 0
++      resolve({ code, stdout: String(stdout), stderr: String(stderr), missing: (error as { code?: unknown } | null)?.code === 'ENOENT' })
++    })
++  })
++
++export type GitFolderState = 'repo' | 'not-repo' | 'dubious' | 'missing-folder' | 'no-git' | 'unknown'
++
++export function classifyGitFolder(result: CommandResult): GitFolderState {
++  if (result.missing) return 'no-git'
++  if (result.code === 0) return 'repo'
++  if (/dubious ownership|safe\.directory/i.test(result.stderr)) return 'dubious'
++  if (/not a git repository/i.test(result.stderr)) return 'not-repo'
++  if (/cannot change to|No such file or directory|ENOENT/i.test(result.stderr)) return 'missing-folder'
++  return 'unknown'
++}
++
++export async function gitFolderState(dir: string, run: RunCommand = runCommand): Promise<GitFolderState> {
++  return classifyGitFolder(await run('git', ['-C', dir, 'rev-parse', '--show-toplevel'], { timeoutMs: 4_000 }))
++}
++
++export function gitFolderFinding(state: GitFolderState, label: string, dir: string, redact: DoctorRedactor,
++  repairRef?: string): DoctorFinding | null {
++  const where = redact.path(dir)
++  if (state === 'dubious')
++    return finding('git.dubious-ownership', 'warning', 'git', `Git refuses to work in ${label}`,
++      `${where} is owned by another user account, so git stops with "detected dubious ownership". Changes, worktrees and diffs fail for this project.`,
++      ['If this is your folder, trust it in git.', 'Otherwise, take ownership of the folder with your own account.'],
++      {
++        learnMore: LEARN_MORE.gitSafeDirectory,
++        ...(repairRef ? { repair: {
++          kind: 'trust-git-folder' as const, ref: repairRef, label: 'Trust this folder in git',
++          confirm: `Adds ${where} to safe.directory in your global git config. A backup of your git config is saved first, and you can undo this.`,
++          warning: 'Only trust folders you own. Git warns about folders owned by other users because a hostile repository can run commands when you use git in it.',
++        } } : {}),
++      })
++  if (state === 'not-repo')
++    return finding('git.not-a-repo', 'info', 'git', `${label} is not a git repository`,
++      `${where} has no git history, so Freebuff cannot show changes or run chats in their own worktree.`,
++      ['Run `git init` in the folder if you want changes and worktrees.'])
++  return null
++}
++
++export async function gitInstallFindings(platform: string, run: RunCommand = runCommand): Promise<DoctorFinding[]> {
++  const version = await run('git', ['--version'], { timeoutMs: 4_000 })
++  if (version.missing || version.code !== 0)
++    return [finding('git.missing', 'error', 'git', 'Git is not installed', 'Freebuff uses git for changes, worktrees and pull requests.',
++      [platform === 'darwin' ? 'Run `xcode-select --install`, or install git from git-scm.com.' : 'Install git from git-scm.com (or your package manager), then restart Freebuff.'])]
++  const out: DoctorFinding[] = [finding('git.ok', 'ok', 'git', 'Git is installed', version.stdout.trim())]
++  if (platform === 'win32') {
++    const longpaths = await run('git', ['config', '--global', '--get', 'core.longpaths'], { timeoutMs: 4_000 })
++    if (longpaths.stdout.trim() !== 'true')
++      out.push(finding('git.longpaths-off', 'info', 'git', 'Git long paths are off',
++        'On Windows, git cannot check out files whose path is longer than 260 characters unless core.longpaths is on. Deep node_modules trees and worktrees hit this.',
++        ['Run `git config --global core.longpaths true`.'], { learnMore: LEARN_MORE.windowsLongPaths }))
++  }
++  return out
++}
+diff --git a/common/src/doctor/node/network.ts b/common/src/doctor/node/network.ts
+new file mode 100644
+index 000000000..97ee445fc
+--- /dev/null
++++ b/common/src/doctor/node/network.ts
+@@ -0,0 +1,296 @@
++import { connect as netConnect } from 'node:net'
++import { connect as tlsConnect, type PeerCertificate, type TLSSocket } from 'node:tls'
++import { lookup } from 'node:dns/promises'
++import { finding, type DoctorFinding } from '../types'
++
++type Fetch = (url: string, init?: RequestInit) => Promise<Response>
++
++// ------------------------------------------------------------------ clock
++
++/** Past this, Desktop skips turn-start probes whose 25 s deadline already "passed" (PR #9473). */
++export const CLOCK_SKEW_WARN_MS = 20_000
++/** Past this, commands (5 min deadline), sign-in and certificate checks break too. */
++export const CLOCK_SKEW_ERROR_MS = 5 * 60_000
++
++export type ClockReading = { skewMs: number; rttMs: number } | { error: string }
++
++/**
++ * Compares this computer's clock with the server's `Date` header. The header has one-second
++ * precision, so the server time is taken as the middle of that second and the local time as the
++ * middle of the round trip; the error is under a second plus half the round trip.
++ */
++export async function readClockSkew(url: string, options: { fetch?: Fetch; now?: () => number; timeoutMs?: number } = {}): Promise<ClockReading> {
++  const fetcher = options.fetch ?? fetch
++  const now = options.now ?? Date.now
++  const started = now()
++  try {
++    const response = await fetcher(url, { method: 'HEAD', redirect: 'manual', signal: AbortSignal.timeout(options.timeoutMs ?? 6_000) })
++    const ended = now()
++    await response.body?.cancel().catch(() => {})
++    const header = response.headers.get('date')
++    const server = header ? Date.parse(header) : NaN
++    if (!Number.isFinite(server)) return { error: 'no-date' }
++    return { skewMs: Math.round((started + ended) / 2 - (server + 500)), rttMs: ended - started }
++  } catch (error) {
++    return { error: classifyNetworkError(error) }
++  }
++}
++
++export function clockSyncSteps(platform: string): string[] {
++  if (platform === 'win32')
++    return ['Open Settings > Time & language > Date & time.', 'Turn on "Set time automatically", then click "Sync now".', 'Restart Freebuff.']
++  if (platform === 'darwin')
++    return ['Open System Settings > General > Date & Time.', 'Turn on "Set time and date automatically".', 'Restart Freebuff.']
++  return ['Turn on automatic time sync: `timedatectl set-ntp true` on most distributions.', 'Restart Freebuff.']
++}
++
++export function clockFinding(reading: ClockReading, platform: string, product: 'desktop' | 'cli'): DoctorFinding {
++  if ('error' in reading)
++    return finding('clock.unknown', 'info', 'clock', 'Could not compare your clock with Freebuff',
++      'The server did not answer, so the clock check was skipped. See the network findings.', [])
++  const seconds = Math.round(Math.abs(reading.skewMs) / 1000)
++  const direction = reading.skewMs > 0 ? 'ahead' : 'behind'
++  const amount = seconds >= 120 ? `${Math.round(seconds / 60)} min` : `${seconds} s`
++  if (Math.abs(reading.skewMs) <= CLOCK_SKEW_WARN_MS)
++    return finding('clock.ok', 'ok', 'clock', 'Your clock is in sync', `Within ${seconds} s of Freebuff's servers.`)
++  const effect = product === 'desktop'
++    ? 'Freebuff gives each piece of work it sends to this computer a deadline. With a clock this far off, Desktop treats that work as already expired and silently skips it, so turns can start without your files or terminal.'
++    : 'Sign-in tokens and secure connections carry time limits, and a clock this far off can make them fail.'
++  return finding('clock.skew', Math.abs(reading.skewMs) > CLOCK_SKEW_ERROR_MS ? 'error' : 'warning', 'clock',
++    `Your computer's clock is ${amount} ${direction}`,
++    `${effect} Set your clock to sync automatically.`, clockSyncSteps(platform))
++}
++
++// ---------------------------------------------------------------- reachability
++
++export type NetworkErrorKind = 'dns' | 'refused' | 'timeout' | 'reset' | 'tls' | 'offline' | 'other'
++
++const TLS_ERROR = /CERT|certificate|SSL|TLS|self[- ]signed|UNABLE_TO_(?:GET|VERIFY)/i
++
++export function classifyNetworkError(error: unknown): NetworkErrorKind {
++  const e = error as { code?: unknown; name?: unknown; message?: unknown; cause?: { code?: unknown; message?: unknown } } | undefined
++  const text = [e?.code, e?.name, e?.message, e?.cause?.code, e?.cause?.message].filter(v => typeof v === 'string').join(' ')
++  if (TLS_ERROR.test(text)) return 'tls'
++  if (/ENOTFOUND|EAI_AGAIN|getaddrinfo|DNS|resolve host/i.test(text)) return 'dns'
++  if (/ECONNREFUSED|ConnectionRefused/i.test(text)) return 'refused'
++  if (/ETIMEDOUT|Timeout|timed out|AbortError/i.test(text)) return 'timeout'
++  if (/ECONNRESET|socket hang up|ConnectionClosed|EPIPE/i.test(text)) return 'reset'
++  if (/ENETUNREACH|EHOSTUNREACH|FailedToOpenSocket|network is unreachable/i.test(text)) return 'offline'
++  return 'other'
++}
++
++export type Endpoint = { id: string; label: string; url: string }
++export type EndpointResult = { endpoint: Endpoint; ms: number } & ({ ok: true; status: number } | { ok: false; error: NetworkErrorKind })
++
++export async function probeEndpoint(endpoint: Endpoint, options: { fetch?: Fetch; timeoutMs?: number; now?: () => number } = {}): Promise<EndpointResult> {
++  const now = options.now ?? Date.now
++  const started = now()
++  try {
++    const response = await (options.fetch ?? fetch)(endpoint.url, { method: 'GET', redirect: 'manual', signal: AbortSignal.timeout(options.timeoutMs ?? 6_000) })
++    await response.body?.cancel().catch(() => {})
++    // Any HTTP answer, even a 404, means the network path works.
++    return { endpoint, ms: now() - started, ok: true, status: response.status }
++  } catch (error) {
++    return { endpoint, ms: now() - started, ok: false, error: classifyNetworkError(error) }
++  }
++}
++
++const NETWORK_STEPS: Record<NetworkErrorKind, { why: string; steps: string[] }> = {
++  dns: { why: 'its name could not be looked up (DNS)', steps: ['Check that you are online.', 'If you use a DNS filter, ad blocker or Pi-hole, allow freebuff.com and codebuff.com.', 'Check the hosts file finding in this report.'] },
++  refused: { why: 'the connection was refused', steps: ['A firewall, VPN or proxy is blocking it. Allow freebuff.com and codebuff.com.'] },
++  timeout: { why: 'it did not answer in time', steps: ['Check your connection.', 'If you use a VPN or proxy, try without it.'] },
++  reset: { why: 'the connection was cut off', steps: ['A firewall, VPN or antivirus web shield may be interrupting it. Allow freebuff.com and codebuff.com.'] },
++  tls: { why: 'its security certificate was rejected', steps: ['Turn off HTTPS or SSL scanning in your antivirus, or exclude freebuff.com and codebuff.com.', 'On a work network, ask IT to exempt freebuff.com and codebuff.com from TLS inspection.', 'Check that your clock is correct.'] },
++  offline: { why: 'there is no route to it', steps: ['Check that you are online.'] },
++  other: { why: 'the request failed', steps: ['Check your connection, VPN and firewall.'] },
++}
++
++export function endpointFindings(results: EndpointResult[]): DoctorFinding[] {
++  const failed = results.filter((r): r is Extract<EndpointResult, { ok: false }> => !r.ok)
++  if (!failed.length)
++    return [finding('network.reachable', 'ok', 'network', 'Freebuff is reachable',
++      `Reached ${results.map(r => r.endpoint.label).join(', ')}.`)]
++  return failed.map(result => {
++    const { why, steps } = NETWORK_STEPS[result.error]
++    return finding(`network.unreachable.${result.endpoint.id}`, result.endpoint.id === 'api' ? 'error' : 'warning', 'network',
++      result.error === 'tls' ? `Can't reach ${result.endpoint.label}: HTTPS is being intercepted` : `Can't reach ${result.endpoint.label}`,
++      `Freebuff could not reach ${result.endpoint.label} because ${why}.` +
++      (result.error === 'tls' ? ' This is what HTTPS scanning by antivirus or a corporate proxy looks like from inside the app.' : ''), steps)
++  })
++}
++
++// ---------------------------------------------------------------- TLS
++
++// Issuers that only appear when something on this computer or network re-signs HTTPS traffic.
++const INTERCEPTORS = /Avast|AVG|Kaspersky|ESET|Bitdefender|Norton|Symantec|McAfee|Sophos|Trend ?Micro|Webroot|F-Secure|Malwarebytes|Zscaler|Netskope|Fortinet|FortiGate|Palo Alto|Cisco Umbrella|Blue ?Coat|Forcepoint|Barracuda|Check ?Point|Cloudflare Gateway|mitmproxy|Charles Proxy|Fiddler|DO_NOT_TRUST|Proxy/i
++
++export type TlsInspection =
++  | { authorized: boolean; authorizationError: string | null; issuers: string[] }
++  | { error: NetworkErrorKind }
++
++export function inspectTls(host: string, options: { connect?: typeof tlsConnect; timeoutMs?: number } = {}): Promise<TlsInspection> {
++  return new Promise(resolve => {
++    let socket: TLSSocket | undefined
++    const timer = setTimeout(() => { socket?.destroy(); resolve({ error: 'timeout' }) }, options.timeoutMs ?? 6_000)
++    try {
++      // rejectUnauthorized: false so a rejected chain can still be described; nothing is sent.
++      const opened: TLSSocket = (options.connect ?? tlsConnect)({ host, port: 443, servername: host, rejectUnauthorized: false }, () => {
++        clearTimeout(timer)
++        const issuers: string[] = []
++        try {
++          let cert: PeerCertificate | undefined = opened.getPeerCertificate(true)
++          const seen = new Set<string>()
++          while (cert && Object.keys(cert).length && issuers.length < 6) {
++            const name = [cert.issuer?.O, cert.issuer?.CN].flat().filter(Boolean).join(' / ')
++            if (name) issuers.push(name)
++            const next: PeerCertificate | undefined = (cert as PeerCertificate & { issuerCertificate?: PeerCertificate }).issuerCertificate
++            if (!next || seen.has(cert.fingerprint256) || next.fingerprint256 === cert.fingerprint256) break
++            seen.add(cert.fingerprint256)
++            cert = next
++          }
++        } catch { /* a runtime without chain access still reports authorization */ }
++        const authorizationError = opened.authorizationError ? String(opened.authorizationError) : null
++        resolve({ authorized: opened.authorized, authorizationError, issuers })
++        opened.end()
++      })
++      socket = opened
++      opened.on('error', error => { clearTimeout(timer); resolve({ error: classifyNetworkError(error) }) })
++    } catch (error) {
++      clearTimeout(timer)
++      resolve({ error: classifyNetworkError(error) })
++    }
++  })
++}
++
++export function tlsFinding(host: string, inspection: TlsInspection): DoctorFinding {
++  if ('error' in inspection)
++    return finding('tls.unknown', 'info', 'network', `Could not inspect the secure connection to ${host}`,
++      'The connection failed before its certificate could be read. See the network findings.', [])
++  const interceptor = inspection.issuers.find(name => INTERCEPTORS.test(name))
++  if (!inspection.authorized || interceptor) {
++    const by = interceptor ? ` The certificate was issued by "${interceptor}", not by a public authority.` : ''
++    return finding('tls.intercepted', inspection.authorized ? 'warning' : 'error', 'network',
++      'HTTPS to Freebuff is being intercepted',
++      `Something between this computer and ${host} replaces Freebuff's certificate.${by} Antivirus HTTPS scanning and corporate proxies do this, and it makes Freebuff fail with "Can't reach Freebuff".`,
++      NETWORK_STEPS.tls.steps)
++  }
++  return finding('tls.ok', 'ok', 'network', 'Secure connections are not intercepted', `${host} presented a certificate from a public authority.`)
++}
++
++// ---------------------------------------------------------------- DNS and hosts
++
++export const FREEBUFF_DOMAINS = ['freebuff.com', 'codebuff.com']
++
++const LOCAL_ADDRESS = /^(?:0\.0\.0\.0|127\.|10\.|192\.168\.|172\.(?:1[6-9]|2\d|3[01])\.|169\.254\.|::1?$|::ffff:127\.|f[cd][0-9a-f]{2}:|fe80:)/i
++
++export function isLocalAddress(address: string) {
++  return LOCAL_ADDRESS.test(address)
++}
++
++export async function dnsFindings(hosts: string[], resolve: (host: string) => Promise<string[]> = async host =>
++  (await lookup(host, { all: true })).map(entry => entry.address)): Promise<DoctorFinding[]> {
++  const results = await Promise.all(hosts.map(async host => {
++    try { return { host, addresses: await resolve(host) } } catch (error) { return { host, error: classifyNetworkError(error) } }
++  }))
++  const out: DoctorFinding[] = []
++  for (const result of results) {
++    if ('error' in result) continue // reported by reachability, which says why
++    if (result.addresses.some(isLocalAddress))
++      out.push(finding(`dns.blocked.${result.host}`, 'error', 'network', `${result.host} points at this computer or your local network`,
++        `Your system resolves ${result.host} to a local address, so Freebuff's requests never leave your network. A hosts file entry, ad blocker, Pi-hole or DNS filter does this.`,
++        ['Remove the entry from your hosts file, or allow the domain in your DNS filter.', 'Restart Freebuff.']))
++  }
++  return out
++}
++
++export function hostsFilePath(platform: string, env: Record<string, string | undefined>) {
++  return platform === 'win32' ? `${env.SystemRoot ?? env.windir ?? 'C:\\Windows'}\\System32\\drivers\\etc\\hosts` : '/etc/hosts'
++}
++
++/** Hosts-file lines that name one of our domains (or a subdomain), comments ignored. */
++export function hostsFileEntries(text: string, domains = FREEBUFF_DOMAINS): Array<{ address: string; host: string }> {
++  const entries: Array<{ address: string; host: string }> = []
++  for (const raw of text.split(/\r?\n/)) {
++    const line = raw.replace(/#.*/, '').trim()
++    if (!line) continue
++    const [address, ...names] = line.split(/\s+/)
++    for (const name of names) {
++      const host = name.toLowerCase()
++      if (domains.some(domain => host === domain || host.endsWith(`.${domain}`))) entries.push({ address: address!, host })
++    }
++  }
++  return entries
++}
++
++export function hostsFinding(entries: Array<{ address: string; host: string }>): DoctorFinding {
++  if (!entries.length) return finding('hosts.ok', 'ok', 'network', 'Your hosts file does not redirect Freebuff', 'No entries for Freebuff domains.')
++  return finding('hosts.pinned', 'error', 'network', 'Your hosts file redirects Freebuff',
++    `It has ${entries.length} entr${entries.length === 1 ? 'y' : 'ies'} for ${[...new Set(entries.map(e => e.host))].join(', ')}. Freebuff's addresses change, so a pinned or blocked entry breaks it.`,
++    ['Open the hosts file as an administrator and delete those lines.', 'Restart Freebuff.'])
++}
++
++// ---------------------------------------------------------------- proxy and environment
++
++const PROXY_VARS = ['HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy', 'ALL_PROXY', 'all_proxy']
++
++export function configuredProxies(env: Record<string, string | undefined>) {
++  const seen = new Map<string, { variable: string; host: string; port: number }>()
++  for (const variable of PROXY_VARS) {
++    const value = env[variable]
++    if (!value) continue
++    try {
++      const url = new URL(value.includes('://') ? value : `http://${value}`)
++      const port = Number(url.port) || (url.protocol === 'https:' ? 443 : 80)
++      // Only host and port: a proxy URL can carry a user name and password.
++      const key = `${url.hostname}:${port}`
++      if (!seen.has(key)) seen.set(key, { variable, host: url.hostname, port })
++    } catch {
++      seen.set(`invalid:${variable}`, { variable, host: '', port: 0 })
++    }
++  }
++  return [...seen.values()]
++}
++
++export function tcpReachable(host: string, port: number, timeoutMs = 3_000, connect = netConnect): Promise<boolean> {
++  return new Promise(resolve => {
++    const socket = connect({ host, port })
++    const done = (ok: boolean) => { clearTimeout(timer); socket.destroy(); resolve(ok) }
++    const timer = setTimeout(() => done(false), timeoutMs)
++    socket.once('connect', () => done(true))
++    socket.once('error', () => done(false))
++  })
++}
++
++export async function proxyFindings(env: Record<string, string | undefined>, reachable: typeof tcpReachable = tcpReachable): Promise<DoctorFinding[]> {
++  const proxies = configuredProxies(env)
++  const out: DoctorFinding[] = []
++  for (const proxy of proxies) {
++    if (!proxy.host) {
++      out.push(finding(`proxy.invalid.${proxy.variable.toLowerCase()}`, 'warning', 'network', `${proxy.variable} is not a valid proxy address`,
++        'Freebuff sends its requests through this setting, and it cannot be read.', [`Fix or remove the ${proxy.variable} environment variable.`]))
++      continue
++    }
++    if (!(await reachable(proxy.host, proxy.port)))
++      out.push(finding(`proxy.down.${proxy.variable.toLowerCase()}`, 'error', 'network', `The proxy in ${proxy.variable} does not answer`,
++        `${proxy.variable} sends Freebuff's requests through ${proxy.host}:${proxy.port}, which refused or ignored a connection.`,
++        ['Start the proxy, or remove the variable if you no longer use it.', 'Restart Freebuff (and your terminal) after changing it.']))
++  }
++  if (proxies.length && !out.length)
++    out.push(finding('proxy.ok', 'info', 'network', 'A proxy is configured', `Requests go through ${proxies.map(p => `${p.host}:${p.port}`).join(', ')}, which answers. If it inspects HTTPS, see the secure-connection finding.`))
++  return out
++}
++
++export function environmentFindings(env: Record<string, string | undefined>): DoctorFinding[] {
++  const out: DoctorFinding[] = []
++  if (env.NODE_TLS_REJECT_UNAUTHORIZED === '0')
++    out.push(finding('env.tls-verification-off', 'warning', 'environment', 'Certificate checking is turned off',
++      'NODE_TLS_REJECT_UNAUTHORIZED=0 makes JavaScript tools accept any certificate, including an attacker\'s. It is usually left over from working around a proxy.',
++      ['Remove NODE_TLS_REJECT_UNAUTHORIZED from your environment.', 'If a corporate proxy needs it, point NODE_EXTRA_CA_CERTS at the proxy\'s root certificate instead.']))
++  if (env.NODE_EXTRA_CA_CERTS || env.SSL_CERT_FILE)
++    out.push(finding('env.extra-ca', 'info', 'environment', 'Extra trusted certificates are configured',
++      'NODE_EXTRA_CA_CERTS or SSL_CERT_FILE adds certificates JavaScript tools trust. This is normal behind a corporate proxy.', []))
++  if (env.NODE_OPTIONS && /--(?:require|import|loader|experimental-loader)\b|-r\s/.test(env.NODE_OPTIONS))
++    out.push(finding('env.node-options-preload', 'warning', 'environment', 'NODE_OPTIONS loads extra code into every Node process',
++      'A preload in NODE_OPTIONS runs inside Freebuff\'s tools too and can break them.', ['Remove the preload from NODE_OPTIONS, or unset it before starting Freebuff.']))
++  return out
++}
+diff --git a/common/src/doctor/node/system.ts b/common/src/doctor/node/system.ts
+new file mode 100644
+index 000000000..5150d141f
+--- /dev/null
++++ b/common/src/doctor/node/system.ts
+@@ -0,0 +1,128 @@
++import { readFileSync, type StatsFs } from 'node:fs'
++import { mkdtemp, readdir, rm, statfs as statfsAsync } from 'node:fs/promises'
++import { cpus, freemem, tmpdir, totalmem } from 'node:os'
++import { join, sep } from 'node:path'
++import { finding, type DoctorFinding } from '../types'
++import type { DoctorRedactor } from '../redact'
++import { LEARN_MORE } from '../help'
++
++// ---------------------------------------------------------------- disk
++
++export const LOW_DISK_BYTES = 2 * 1024 ** 3
++export const CRITICAL_DISK_BYTES = 512 * 1024 ** 2
++
++const gb = (bytes: number) => `${(bytes / 1024 ** 3).toFixed(bytes < 10 * 1024 ** 3 ? 1 : 0)} GB`
++
++export async function diskFinding(label: string, dir: string, redact: DoctorRedactor,
++  statfs: (path: string) => Promise<Pick<StatsFs, 'bavail' | 'bsize'>> | Pick<StatsFs, 'bavail' | 'bsize'> = statfsAsync): Promise<DoctorFinding> {
++  let free: number
++  try {
++    const stats = await statfs(dir)
++    free = Number(stats.bavail) * Number(stats.bsize)
++  } catch {
++    return finding('disk.unknown', 'info', 'disk', `Could not read free space for ${label}`, `The drive holding ${redact.path(dir)} did not report its free space.`)
++  }
++  if (free < CRITICAL_DISK_BYTES)
++    return finding('disk.critical', 'error', 'disk', `Almost no disk space left (${gb(free)})`,
++      `The drive holding ${label} has ${gb(free)} free. Chats, worktrees and updates fail or are left half written when it fills.`,
++      ['Free up several gigabytes on this drive (empty the trash, remove old downloads or unused node_modules folders).', 'Restart Freebuff.'])
++  if (free < LOW_DISK_BYTES)
++    return finding('disk.low', 'warning', 'disk', `Disk space is low (${gb(free)})`,
++      `The drive holding ${label} has ${gb(free)} free. Worktrees and dependency installs need room.`, ['Free up a few gigabytes on this drive.'])
++  return finding('disk.ok', 'ok', 'disk', 'Enough disk space', `${gb(free)} free on the drive holding ${label}.`)
++}
++
++// ---------------------------------------------------------------- synced folders
++
++const SYNC_PROVIDERS: Array<[RegExp, string]> = [
++  [/(?:^|[\\/])OneDrive(?: - [^\\/]+)?(?:[\\/]|$)/i, 'OneDrive'],
++  [/(?:^|[\\/])Dropbox(?: \([^\\/]+\))?(?:[\\/]|$)/i, 'Dropbox'],
++  [/(?:^|[\\/])(?:Google Drive|GoogleDrive-[^\\/]+|My Drive)(?:[\\/]|$)/i, 'Google Drive'],
++  [/[\\/]Library[\\/]Mobile Documents[\\/]|(?:^|[\\/])iCloud ?Drive(?:[\\/]|$)/i, 'iCloud Drive'],
++  [/(?:^|[\\/])Box(?: Sync)?(?:[\\/]|$)|[\\/]Library[\\/]CloudStorage[\\/]Box-/i, 'Box'],
++  [/[\\/]Library[\\/]CloudStorage[\\/](?:OneDrive|Dropbox|GoogleDrive)/i, 'a cloud storage provider'],
++]
++
++/** The sync client that owns a path, or null. Recognises the default folder names only. */
++export function syncProviderFor(path: string): string | null {
++  for (const [pattern, name] of SYNC_PROVIDERS) if (pattern.test(path)) return name
++  return null
++}
++
++// ---------------------------------------------------------------- temp
++
++export async function tempDirFinding(dir = tmpdir(), redact?: DoctorRedactor): Promise<DoctorFinding> {
++  try {
++    const probe = await mkdtemp(join(dir, 'freebuff-doctor-'))
++    await rm(probe, { recursive: true, force: true })
++    return finding('temp.ok', 'ok', 'system', 'The temporary folder is writable', 'Freebuff can create temporary files.')
++  } catch {
++    return finding('temp.unwritable', 'error', 'system', 'The temporary folder is not writable',
++      `Freebuff could not create a file in ${redact ? redact.path(dir) : 'the temporary folder'}. Installs, downloads and tools that need scratch space fail.`,
++      ['Check that TMPDIR, TEMP or TMP points at a folder that exists and that you can write to.', 'Free up disk space if the drive is full.'])
++  }
++}
++
++// ---------------------------------------------------------------- architecture and memory
++
++/** macOS on Apple silicon running an x64 build under Rosetta: slower, and native modules mismatch. */
++export function architectureFinding(platform = process.platform, arch = process.arch, cpuModel = cpus()[0]?.model ?? '',
++  translated?: boolean): DoctorFinding | null {
++  const rosetta = translated ?? (platform === 'darwin' && arch === 'x64' && /Apple/i.test(cpuModel))
++  if (rosetta)
++    return finding('system.rosetta', 'warning', 'system', 'Running the Intel build on an Apple silicon Mac',
++      'This copy of Freebuff runs under Rosetta translation. It is slower, and tools it starts may not match your Mac.',
++      ['Download Freebuff again from freebuff.com and choose the Apple silicon build.'])
++  if (platform === 'win32' && arch === 'ia32')
++    return finding('system.32-bit', 'error', 'system', 'A 32-bit runtime is in use', 'Freebuff needs a 64-bit system and runtime.', ['Install the 64-bit version.'])
++  return null
++}
++
++export function memoryFinding(free = freemem(), total = totalmem()): DoctorFinding | null {
++  if (total > 0 && free / total < 0.05 && free < 1024 ** 3)
++    return finding('system.memory-low', 'warning', 'system', `Memory is almost full (${gb(free)} free)`,
++      'With this little memory left, Freebuff and the tools it runs can be killed or freeze.', ['Close apps you are not using, then try again.'])
++  return null
++}
++
++// ---------------------------------------------------------------- file watchers
++
++export function watcherLimitFinding(platform = process.platform, read: (path: string) => string = path => readFileSync(path, 'utf8')): DoctorFinding | null {
++  if (platform !== 'linux') return null
++  try {
++    const watches = Number(read('/proc/sys/fs/inotify/max_user_watches').trim())
++    if (Number.isFinite(watches) && watches < 65_536)
++      return finding('system.inotify-low', 'warning', 'system', `The file-watch limit is low (${watches})`,
++        'Linux limits how many folders one user can watch. Large projects exceed a low limit, and file changes then go unnoticed (or tools fail with ENOSPC).',
++        ['Raise it: `echo fs.inotify.max_user_watches=524288 | sudo tee /etc/sysctl.d/60-freebuff.conf && sudo sysctl --system`.'],
++        { learnMore: LEARN_MORE.linuxInotify })
++  } catch { /* not exposed in this container */ }
++  return null
++}
++
++// ---------------------------------------------------------------- Windows path length
++
++/** Counts files under `roots` whose full path passes Windows' 260-character limit. Bounded. */
++export async function longPathFinding(roots: string[], platform = process.platform, maxEntries = 20_000,
++  list: (dir: string) => Promise<Array<{ name: string; isDirectory(): boolean }>> | Array<{ name: string; isDirectory(): boolean }> = dir => readdir(dir, { withFileTypes: true })): Promise<DoctorFinding | null> {
++  if (platform !== 'win32') return null
++  let seen = 0
++  let over = 0
++  const stack = [...roots]
++  while (stack.length && seen < maxEntries) {
++    const dir = stack.pop()!
++    let entries: Array<{ name: string; isDirectory(): boolean }>
++    try { entries = await list(dir) } catch { continue }
++    for (const entry of entries) {
++      seen++
++      const full = `${dir}${sep}${entry.name}`
++      if (full.length >= 260) over++
++      if (entry.isDirectory() && entry.name !== 'node_modules' && entry.name !== '.git') stack.push(full)
++    }
++  }
++  if (!over) return null
++  return finding('system.long-paths', 'warning', 'system', `${over} file path${over === 1 ? ' is' : 's are'} longer than Windows allows by default`,
++    'Paths over 260 characters fail in many Windows tools unless long paths are enabled.',
++    ['Enable long paths: run `git config --global core.longpaths true`, and turn on "Enable Win32 long paths" in Group Policy (or the LongPathsEnabled registry value).', 'Keep projects in a short folder such as C:\\code.'],
++    { learnMore: LEARN_MORE.windowsLongPaths })
++}
+diff --git a/common/src/doctor/redact.ts b/common/src/doctor/redact.ts
+new file mode 100644
+index 000000000..eb0dce404
+--- /dev/null
++++ b/common/src/doctor/redact.ts
+@@ -0,0 +1,68 @@
++/**
++ * Report redaction. By default a report names no full path, no user name and no email: a path
++ * keeps only its last folder (`~/…/my-repo`), which is what support needs to follow along. The
++ * user can opt in to full paths for their own debugging. Secrets are removed either way.
++ */
++
++export type DoctorRedactor = {
++  readonly includePaths: boolean
++  /** One path, shortened unless the user opted in. */
++  path(value: string): string
++  /** Free text (an error message): paths, the user name, emails and secrets taken out. */
++  text(value: string): string
++}
++
++const EMAIL = /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g
++// Bearer tokens, `token=`/`key=` pairs and long opaque keys. Applied whatever the opt-in says.
++const SECRETS: Array<[RegExp, string]> = [
++  [/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/gi, '$1 <secret>'],
++  [/\b((?:api[_-]?key|token|secret|password|authorization|cookie)["']?\s*[:=]\s*["']?)[^\s"'&,;]+/gi, '$1<secret>'],
++  [/\b(?:sk|pk|rk|fb|cb|ghp|gho|ghu|github_pat|xox[abp])[-_][A-Za-z0-9_-]{16,}\b/g, '<secret>'],
++]
++// An absolute path: `C:\…`, `\\server\…` or `/…`, not the `//` of a URL or a relative `a/b`.
++const ABSOLUTE_PATH = /(?<![\w:/.\\-])(?:[A-Za-z]:[\\/]|\\\\|\/)(?:[^\s"'`<>|*?:\\/]+[\\/])*[^\s"'`<>|*?:\\/]*/g
++
++const escape = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
++
++export function createRedactor(options: {
++  home: string
++  username?: string
++  includePaths?: boolean
++}): DoctorRedactor {
++  const includePaths = options.includePaths === true
++  const home = options.home.replace(/[\\/]+$/, '')
++  const homePattern = home
++    ? new RegExp(escape(home).replace(/\\\\|\//g, '[\\\\/]'), 'gi')
++    : null
++  const user = options.username && options.username.length >= 2 ? options.username : undefined
++
++  function shorten(value: string) {
++    const parts = value.split(/[\\/]+/).filter(Boolean)
++    const last = parts.at(-1) ?? ''
++    const underHome = home !== '' && value.toLowerCase().startsWith(home.toLowerCase())
++    const prefix = underHome ? '~' : ''
++    if (!last || (underHome && value.length <= home.length + 1)) return underHome ? '~' : '…'
++    const name = user ? last.replace(new RegExp(escape(user), 'gi'), '<user>') : last
++    return `${prefix}/…/${name}`
++  }
++
++  function secrets(value: string) {
++    return SECRETS.reduce((text, [pattern, replacement]) => text.replace(pattern, replacement), value)
++  }
++
++  return {
++    includePaths,
++    path(value) {
++      return includePaths ? value : shorten(value)
++    },
++    text(value) {
++      let text = secrets(value)
++      if (includePaths) return text
++      text = text.replace(ABSOLUTE_PATH, match => (match.length > 1 ? shorten(match) : match))
++      if (homePattern) text = text.replace(homePattern, '~')
++      text = text.replace(EMAIL, '<email>')
++      if (user) text = text.replace(new RegExp(`\\b${escape(user)}\\b`, 'gi'), '<user>')
++      return text
++    },
++  }
++}
+diff --git a/common/src/doctor/report.ts b/common/src/doctor/report.ts
+new file mode 100644
+index 000000000..d74f586fa
+--- /dev/null
++++ b/common/src/doctor/report.ts
+@@ -0,0 +1,78 @@
++import type { DoctorFinding, DoctorReport, DoctorSeverity } from './types'
++
++const LABEL: Record<DoctorSeverity, string> = { error: 'Problem', warning: 'Warning', info: 'Note', ok: 'OK' }
++
++export function doctorCounts(report: Pick<DoctorReport, 'findings'>) {
++  const counts: Record<DoctorSeverity, number> = { error: 0, warning: 0, info: 0, ok: 0 }
++  for (const item of report.findings) counts[item.severity]++
++  return counts
++}
++
++export function doctorSummary(report: Pick<DoctorReport, 'findings'>) {
++  const { error, warning } = doctorCounts(report)
++  if (!error && !warning) return 'No problems found.'
++  const parts = [
++    error ? `${error} problem${error === 1 ? '' : 's'}` : null,
++    warning ? `${warning} warning${warning === 1 ? '' : 's'}` : null,
++  ].filter(Boolean)
++  return `${parts.join(' and ')} found.`
++}
++
++function header(report: DoctorReport) {
++  const product = report.product === 'desktop' ? 'Freebuff Desktop' : 'Freebuff CLI'
++  return [
++    `${product} ${report.appVersion ?? '(unknown version)'} on ${report.platform} ${report.arch}`,
++    `Scanned ${report.generatedAt} in ${(report.durationMs / 1000).toFixed(1)} s` +
++      `${report.options.deep ? ', deep scan' : ''}${report.options.includePaths ? ', full paths included' : ', paths redacted'}`,
++  ]
++}
++
++function steps(item: DoctorFinding, bullet: string) {
++  return item.steps.map((step, index) => `${bullet}${index + 1}. ${step}`)
++}
++
++/** The "Copy report" text: Markdown for a support ticket or Discord. Already redacted by the scan. */
++export function doctorReportMarkdown(report: DoctorReport): string {
++  const lines = ['## Freebuff diagnostics', '', ...header(report).map(line => `- ${line}`), `- ${doctorSummary(report)}`, '']
++  const shown = report.findings.filter(item => item.severity !== 'ok')
++  for (const item of shown) {
++    lines.push(`### ${LABEL[item.severity]}: ${item.title}`, '', `\`${item.id}\` (${item.area})`, '', item.detail, '')
++    if (item.steps.length) lines.push(...steps(item, ''), '')
++    if (item.learnMore) lines.push(`More: ${item.learnMore}`, '')
++  }
++  const passed = report.findings.filter(item => item.severity === 'ok')
++  if (passed.length) lines.push('### Passed', '', ...passed.map(item => `- ${item.title}`), '')
++  const missing = report.checks.filter(check => check.outcome === 'timeout' || check.outcome === 'failed')
++  if (missing.length) lines.push(`Checks that did not finish: ${missing.map(check => `${check.id} (${check.outcome})`).join(', ')}`, '')
++  return lines.join('\n').trimEnd() + '\n'
++}
++
++/** Plain text for a terminal. */
++export function doctorReportText(report: DoctorReport, options: { verbose?: boolean } = {}): string {
++  const lines = ['Freebuff doctor', ...header(report), '']
++  for (const item of report.findings) {
++    if (item.severity === 'ok' && !options.verbose) continue
++    lines.push(`[${LABEL[item.severity].toUpperCase()}] ${item.title}`, `  ${item.detail}`)
++    lines.push(...steps(item, '  '))
++    if (item.learnMore) lines.push(`  More: ${item.learnMore}`)
++    lines.push('')
++  }
++  const passed = report.findings.filter(item => item.severity === 'ok').length
++  lines.push(doctorSummary(report) + (passed && !options.verbose ? ` ${passed} checks passed.` : ''))
++  return lines.join('\n') + '\n'
++}
++
++/**
++ * The message "Ask Freebuff about this" puts in a new chat, for the user to read and send. It
++ * carries only the redacted report the user can already see.
++ */
++export function doctorAskPrompt(report: DoctorReport): string {
++  const product = report.product === 'desktop' ? 'Freebuff Desktop' : 'the Freebuff CLI'
++  return [
++    `${product}'s built-in diagnostics found the problems below on my computer.`,
++    'Explain what each one means and walk me through fixing them, one at a time. Ask before running',
++    'any command that changes files outside this project or changes system settings.',
++    '',
++    doctorReportMarkdown(report),
++  ].join('\n')
++}
+diff --git a/common/src/doctor/run.ts b/common/src/doctor/run.ts
+new file mode 100644
+index 000000000..4b978bc1f
+--- /dev/null
++++ b/common/src/doctor/run.ts
+@@ -0,0 +1,63 @@
++import { compareFindings, finding, type DoctorArea, type DoctorCheckRun, type DoctorFinding } from './types'
++
++export type DoctorCheck<Context> = {
++  id: string
++  area: DoctorArea
++  /** Runs only when the user asks for a deep scan (a full database integrity check). */
++  deep?: boolean
++  /** Per-check bound; a slow check reports that it timed out and the scan carries on. */
++  timeoutMs?: number
++  run(context: Context, signal: AbortSignal): Promise<DoctorFinding[]> | DoctorFinding[]
++}
++
++const DEFAULT_TIMEOUT_MS = 8_000
++
++/**
++ * Runs every check concurrently, each under its own time limit. A check that throws or times out
++ * becomes one `info` finding naming the check, never the error text (which may hold a path), so
++ * one broken check can neither fail the scan nor leak into the report.
++ */
++export async function runDoctorChecks<Context>(
++  checks: ReadonlyArray<DoctorCheck<Context>>,
++  context: Context,
++  options: { deep?: boolean; signal?: AbortSignal; now?: () => number } = {},
++): Promise<{ findings: DoctorFinding[]; checks: DoctorCheckRun[] }> {
++  const now = options.now ?? (() => performance.now())
++  const runs = await Promise.all(checks.map(async (check): Promise<{ run: DoctorCheckRun; findings: DoctorFinding[] }> => {
++    if (check.deep && !options.deep) return { run: { id: check.id, ms: 0, outcome: 'skipped' }, findings: [] }
++    const started = now()
++    const controller = new AbortController()
++    const abort = () => controller.abort()
++    options.signal?.addEventListener('abort', abort, { once: true })
++    let timer: ReturnType<typeof setTimeout> | undefined
++    try {
++      const timeout = new Promise<'timeout'>(resolve => {
++        timer = setTimeout(() => resolve('timeout'), check.timeoutMs ?? DEFAULT_TIMEOUT_MS)
++      })
++      const result = await Promise.race([Promise.resolve().then(() => check.run(context, controller.signal)), timeout])
++      if (result === 'timeout') {
++        controller.abort()
++        return {
++          run: { id: check.id, ms: Math.round(now() - started), outcome: 'timeout' },
++          findings: [finding(`${check.id}.timeout`, 'info', check.area, `A check took too long (${check.id})`,
++            'This check did not finish in time, so its result is missing from this report. A slow disk or network can cause this.',
++            ['Run the scan again. If it keeps timing out, mention it when you contact support.'])],
++        }
++      }
++      return { run: { id: check.id, ms: Math.round(now() - started), outcome: 'done' }, findings: result }
++    } catch {
++      return {
++        run: { id: check.id, ms: Math.round(now() - started), outcome: 'failed' },
++        findings: [finding(`${check.id}.failed`, 'info', check.area, `A check could not run (${check.id})`,
++          'This check stopped with an error, so its result is missing from this report.', [])],
++      }
++    } finally {
++      clearTimeout(timer)
++      options.signal?.removeEventListener('abort', abort)
++    }
++  }))
++  return {
++    findings: runs.flatMap(run => run.findings).sort(compareFindings),
++    checks: runs.map(run => run.run),
++  }
++}
+diff --git a/common/src/doctor/types.ts b/common/src/doctor/types.ts
+new file mode 100644
+index 000000000..c13cdf977
+--- /dev/null
++++ b/common/src/doctor/types.ts
+@@ -0,0 +1,110 @@
++/**
++ * Freebuff's own diagnostics ("Diagnose" in Desktop Settings, `freebuff doctor` in the CLI).
++ *
++ * Browser-safe: this file and `report.ts` carry no Node imports, so the hosted Settings page can
++ * format a report Desktop produced. The checks themselves live under `node/` (shared) and in each
++ * product (Desktop's profile, folder approvals and chat databases; the CLI's install and PATH).
++ *
++ * A finding never carries file contents, prompts, chat text or credentials. Paths, the user name
++ * and emails are redacted unless the user opts in (`redact.ts`).
++ */
++
++export type DoctorSeverity = 'error' | 'warning' | 'info' | 'ok'
++
++export type DoctorArea =
++  | 'profile'
++  | 'folders'
++  | 'chats'
++  | 'worktrees'
++  | 'git'
++  | 'disk'
++  | 'processes'
++  | 'logs'
++  | 'crashes'
++  | 'interface'
++  | 'network'
++  | 'clock'
++  | 'install'
++  | 'auth'
++  | 'environment'
++  | 'system'
++
++/**
++ * A repair the product can apply, one at a time and only after the user confirms it. `ref` is an
++ * opaque handle minted by the scan that found the problem: the page never sends a path back.
++ */
++export type DoctorRepairKind =
++  | 'clear-display-caches'
++  | 'reset-zoom'
++  | 'relink-worktree'
++  | 'trust-git-folder'
++
++export type DoctorRepair = {
++  kind: DoctorRepairKind
++  ref?: string
++  /** What the button says. */
++  label: string
++  /** What confirming does, shown before it runs. */
++  confirm: string
++  /** Shown beside the confirmation when the repair carries a risk (trusting a folder in git). */
++  warning?: string
++}
++
++export type DoctorFinding = {
++  /** Stable, fixed vocabulary (`profile.state-corrupt`): the report's join key, never user text. */
++  id: string
++  severity: DoctorSeverity
++  area: DoctorArea
++  title: string
++  /** Plain language: what is wrong and why it matters. */
++  detail: string
++  /** What to do, in order. */
++  steps: string[]
++  /** A page that explains more (ours or the vendor's), never a community FAQ. */
++  learnMore?: string
++  repair?: DoctorRepair
++}
++
++export type DoctorCheckRun = {
++  id: string
++  ms: number
++  outcome: 'done' | 'timeout' | 'failed' | 'skipped'
++}
++
++export type DoctorReport = {
++  version: 1
++  product: 'desktop' | 'cli'
++  generatedAt: string
++  durationMs: number
++  appVersion: string | null
++  platform: string
++  arch: string
++  options: { deep: boolean; includePaths: boolean }
++  findings: DoctorFinding[]
++  checks: DoctorCheckRun[]
++}
++
++export type DoctorRepairResult = {
++  ok: boolean
++  message: string
++  /** Present when the repair can be undone: pass it back to undo. */
++  undoRef?: string
++}
++
++const SEVERITY_ORDER: Record<DoctorSeverity, number> = { error: 0, warning: 1, info: 2, ok: 3 }
++
++export function compareFindings(a: DoctorFinding, b: DoctorFinding) {
++  return SEVERITY_ORDER[a.severity] - SEVERITY_ORDER[b.severity] || a.area.localeCompare(b.area) || a.id.localeCompare(b.id)
++}
++
++export function finding(
++  id: string,
++  severity: DoctorSeverity,
++  area: DoctorArea,
++  title: string,
++  detail: string,
++  steps: string[] = [],
++  extra: Pick<DoctorFinding, 'learnMore' | 'repair'> = {},
++): DoctorFinding {
++  return { id, severity, area, title, detail, steps, ...extra }
++}
