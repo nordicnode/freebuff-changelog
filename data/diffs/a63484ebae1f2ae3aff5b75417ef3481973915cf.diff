@@ -1,0 +1,678 @@
+diff --git a/packages/agent-runtime/src/__tests__/compact-history-now.test.ts b/packages/agent-runtime/src/__tests__/compact-history-now.test.ts
+index 409006a9e..fc0b4ec7a 100644
+--- a/packages/agent-runtime/src/__tests__/compact-history-now.test.ts
++++ b/packages/agent-runtime/src/__tests__/compact-history-now.test.ts
+@@ -1,39 +1,35 @@
+-// The mechanical pass on its own. `evaluateCompactionTrigger` answers "is this
+-// worth doing unasked"; `compactHistoryNow` is what runs once that is settled —
+-// a user's /compact or a triggered compaction —
++// The mechanical pass on its own. `compactHistoryNow` is what runs once the
++// decision to compact is settled — a user's /compact or a triggered compaction —
+ // so what it pins is that the decision is the only thing removed — the
+ // protected prefix, the fresh tool exchange and the budget are all still the
+ // shared ones — plus the two answers a caller has to be able to tell apart: a
+ // reduction, and nothing worth doing.
+ 
+ import { describe, expect, it } from 'bun:test'
+ 
+-import {
+-  compactHistoryNow,
+-  evaluateCompactionTrigger,
+-} from '../compact-history'
++import { compactHistoryNow } from '../compact-history'
+ import { countTokensMessages } from '../util/token-counter'
+ 
+ import type { JSONValue } from '@codebuff/common/types/json'
+ import type { Message } from '@codebuff/common/types/messages/codebuff-message'
+ 
+ const user = (text: string): Message => ({
+   role: 'user',
+   tags: ['USER_PROMPT'],
+   content: [{ type: 'text', text }],
+ })
+ const assistant = (text: string): Message => ({
+   role: 'assistant',
+   content: [{ type: 'text', text }],
+   sentAt: Date.now(),
+ })
+ const call = (id: string, paths: unknown[] = ['file.ts']): Message => ({
+   role: 'assistant',
+   content: [
+     {
+       type: 'tool-call',
+       toolCallId: id,
+       toolName: 'read_files',
+       input: { paths },
+     },
+   ],
+@@ -103,63 +99,52 @@ describe('compactHistoryNow', () => {
+         role: 'tool',
+         toolCallId: 'question',
+         toolName: 'ask_questions',
+         content: [
+           {
+             type: 'json',
+             value: { answers: [{ question, answers: [answer] }] },
+           },
+         ],
+       },
+       assistant('I will proceed.'),
+     ]
+ 
+     const compacted = compactHistoryNow({
+       messages,
+       maxContextLength: 400_000,
+     })!
+     expect(compacted).not.toBeNull()
+     expect(compacted.nextTokens).toBeLessThan(compacted.previousTokens)
+     expect(compacted.summaryText).toContain(
+       `Question: ${question}\nAnswer: ${answer}`,
+     )
+     expect(JSON.stringify(compacted.messages)).toContain(answer)
+   })
+ 
+-  it('compacts a history the triggers would have left alone', () => {
++  it('compacts a history well under the context limit', () => {
+     const messages = settledHistory()
+-    const contextTokenCount = countTokensMessages(messages)
+-    // Well under the budget and the cache is warm: nothing to trigger on.
+-    expect(
+-      evaluateCompactionTrigger({
+-        messages,
+-        contextTokenCount,
+-        maxContextLength: 400_000,
+-        cacheExpiryMs: null,
+-      }).trigger,
+-    ).toBeNull()
+-
+     const forced = compactHistoryNow({ messages, maxContextLength: 400_000 })
+     expect(forced).not.toBeNull()
+     expect(forced!.nextTokens).toBeLessThan(forced!.previousTokens)
+     expect(countTokensMessages(forced!.messages)).toBe(forced!.nextTokens)
+     // Edited after it was read, so it comes back as an outline, not a body.
+     expect(JSON.stringify(forced!.messages)).not.toContain(
+       JSON.stringify('export const upload = () => {}\nexport const').slice(
+         1,
+         -1,
+       ),
+     )
+   })
+ 
+   it('keeps the last request live and the files it named in memory', () => {
+     const forced = compactHistoryNow({
+       messages: settledHistory(),
+       maxContextLength: 400_000,
+     })!
+     const live = forced.messages.filter((message) =>
+       message.tags?.includes('USER_PROMPT'),
+     )
+     expect(live).toHaveLength(1)
+     expect(JSON.stringify(live[0])).toContain('Now document it')
+     // The mechanical summary keeps what was read and edited, not its contents.
+     expect(JSON.stringify(forced.messages)).toContain('uploader.ts')
+diff --git a/packages/agent-runtime/src/__tests__/compact-history.test.ts b/packages/agent-runtime/src/__tests__/compact-history.test.ts
+index 466137300..e329a0e39 100644
+--- a/packages/agent-runtime/src/__tests__/compact-history.test.ts
++++ b/packages/agent-runtime/src/__tests__/compact-history.test.ts
+@@ -1,79 +1,60 @@
+ import { describe, expect, it } from 'bun:test'
+ 
+-import {
+-  compactMessages,
+-  DEFAULT_CACHE_EXPIRY_MIN_TOKENS,
+-  DEFAULT_CACHE_EXPIRY_MS,
+-  evaluateCompactionTrigger,
+-  promptCacheGapMs,
+-} from '../compact-history'
+-
+-import { compactionPolicyForModel } from '@codebuff/common/constants/compaction-policy'
++import { compactMessages } from '../compact-history'
+ 
+ import type { Message } from '@codebuff/common/types/messages/codebuff-message'
+ 
+-const MINUTE = 60 * 1000
+-
+ const user = (text: string, tags?: string[]): Message => ({
+   role: 'user',
+   content: [{ type: 'text', text }],
+   ...(tags ? { tags } : {}),
+   sentAt: 1,
+ })
+ 
+ const assistant = (text: string): Message => ({
+   role: 'assistant',
+   content: [{ type: 'text', text }],
+   sentAt: 1,
+ })
+ 
+ const assistantToolCall = (
+   toolName: string,
+   input: Record<string, unknown>,
+ ): Message => ({
+   role: 'assistant',
+   content: [{ type: 'tool-call', toolCallId: 'c1', toolName, input }],
+   sentAt: 1,
+ })
+ 
+ const toolResult = (toolName: string, value: unknown): Message => ({
+   role: 'tool',
+   toolCallId: 'c1',
+   toolName,
+   content: [{ type: 'json', value: value as any }],
+ })
+ 
+-/** A user prompt that landed `gapMinutes` after the assistant's last message. */
+-const idleTurn = (gapMinutes: number): Message[] => [
+-  { ...assistant('previous turn answer'), sentAt: 1_000_000 },
+-  {
+-    ...user('the new question', ['USER_PROMPT']),
+-    sentAt: 1_000_000 + gapMinutes * MINUTE,
+-  },
+-]
+-
+ const textOf = (message: Message): string =>
+   Array.isArray(message.content)
+     ? message.content
+         .map((part) => ('text' in part ? part.text : ''))
+         .join('\n')
+     : String(message.content)
+ 
+ const compact = (messages: Message[]) => compactMessages({ messages }).messages
+ 
+ describe('compactMessages', () => {
+   it('replaces history with a mechanical summary and keeps the live user prompt', () => {
+     const result = compact([
+       user('old question'),
+       assistant('old answer'),
+       user('the live question', ['USER_PROMPT']),
+     ])
+ 
+     expect(result).toHaveLength(2)
+     expect(textOf(result[0])).toContain('<conversation_summary>')
+     expect(textOf(result[0])).toContain('old question')
+     expect(textOf(result[0])).toContain('old answer')
+     expect(result[1].role).toBe('user')
+     expect(textOf(result[1])).toContain('the live question')
+   })
+ 
+@@ -392,226 +373,25 @@ describe('compactMessages', () => {
+           },
+         ]),
+         user('now?', ['USER_PROMPT']),
+       ],
+     })
+     expect(summaryText).toContain('Image(s) not shown: logo.png')
+     expect(summaryText).not.toContain('Image(s) shown by')
+   })
+ 
+   it('produces a summary well under the budget it was called for', () => {
+     const { summaryText } = compactMessages({
+       messages: [
+         user('do the thing', ['USER_PROMPT']),
+         ...Array.from({ length: 400 }, (_, i) =>
+           i % 2 === 0
+             ? assistant(`assistant turn ${i} ${'z'.repeat(2_000)}`)
+             : toolResult('read_files', { content: 'z'.repeat(20_000) }),
+         ),
+       ],
+     })
+ 
+     // Default budgets are 20k assistant/tool + 50k user estimated tokens.
+     expect(Math.ceil(summaryText.length / 3)).toBeLessThan(75_000)
+   })
+ })
+-
+-describe('promptCacheGapMs', () => {
+-  it('measures from the last assistant message to the live prompt', () => {
+-    expect(promptCacheGapMs(idleTurn(42))).toBe(42 * MINUTE)
+-  })
+-
+-  it('skips tool messages, which carry no timestamp', () => {
+-    const [prevAssistant, prompt] = idleTurn(10)
+-    expect(
+-      promptCacheGapMs([
+-        prevAssistant,
+-        { role: 'tool', toolCallId: 'c1', toolName: 'read_files', content: [] },
+-        prompt,
+-      ]),
+-    ).toBe(10 * MINUTE)
+-  })
+-
+-  it('is null when there is nothing to measure between', () => {
+-    expect(promptCacheGapMs([])).toBeNull()
+-    expect(
+-      promptCacheGapMs([user('only a prompt', ['USER_PROMPT'])]),
+-    ).toBeNull()
+-    expect(
+-      promptCacheGapMs([user('untagged'), user('prompt', ['USER_PROMPT'])]),
+-    ).toBeNull()
+-    expect(
+-      promptCacheGapMs([
+-        { ...assistant('no timestamp'), sentAt: undefined },
+-        user('prompt', ['USER_PROMPT']),
+-      ]),
+-    ).toBeNull()
+-  })
+-})
+-
+-describe('evaluateCompactionTrigger', () => {
+-  /** Over the size floor, still well under the context limit. */
+-  const WORTH_COMPACTING = DEFAULT_CACHE_EXPIRY_MIN_TOKENS + 1
+-
+-  const triggerFor = (
+-    messages: Message[],
+-    contextTokenCount: number,
+-    cacheExpiryMs?: number | null,
+-  ) =>
+-    evaluateCompactionTrigger({
+-      messages,
+-      contextTokenCount,
+-      maxContextLength: 400_000,
+-      cacheExpiryMs,
+-    }).trigger
+-
+-  it('does nothing while the context fits and the cache is warm', () => {
+-    expect(triggerFor(idleTurn(5), WORTH_COMPACTING)).toBeNull()
+-  })
+-
+-  it('fires on the context limit even with a warm cache', () => {
+-    expect(triggerFor(idleTurn(5), 500_000)).toBe('context_limit')
+-  })
+-
+-  it('fires on a cold cache even when the context still fits', () => {
+-    expect(triggerFor(idleTurn(90), WORTH_COMPACTING)).toBe('cache_expiry')
+-  })
+-
+-  it('applies the default TTL when none is given', () => {
+-    const ttlMinutes = DEFAULT_CACHE_EXPIRY_MS / MINUTE
+-    expect(triggerFor(idleTurn(ttlMinutes), WORTH_COMPACTING)).toBeNull()
+-    expect(triggerFor(idleTurn(ttlMinutes + 1), WORTH_COMPACTING)).toBe(
+-      'cache_expiry',
+-    )
+-  })
+-
+-  it('leaves a small conversation alone however cold the cache is', () => {
+-    // Compaction always costs detail; below the floor there is too little to
+-    // reclaim to be worth it, and the budget walk would evict nothing anyway.
+-    expect(
+-      triggerFor(idleTurn(600), DEFAULT_CACHE_EXPIRY_MIN_TOKENS - 1),
+-    ).toBeNull()
+-
+-    // One token more and it is worth doing.
+-    expect(triggerFor(idleTurn(600), DEFAULT_CACHE_EXPIRY_MIN_TOKENS)).toBe(
+-      'cache_expiry',
+-    )
+-  })
+-
+-  it('honours a custom floor, and null removes it', () => {
+-    const tiny = 1_000
+-    expect(triggerFor(idleTurn(90), tiny)).toBeNull()
+-    expect(
+-      evaluateCompactionTrigger({
+-        messages: idleTurn(90),
+-        contextTokenCount: tiny,
+-        maxContextLength: 400_000,
+-        cacheExpiryMinTokens: 500,
+-      }).trigger,
+-    ).toBe('cache_expiry')
+-    expect(
+-      evaluateCompactionTrigger({
+-        messages: idleTurn(90),
+-        contextTokenCount: tiny,
+-        maxContextLength: 400_000,
+-        cacheExpiryMinTokens: null,
+-      }).trigger,
+-    ).toBe('cache_expiry')
+-  })
+-
+-  it('the floor never blocks the context-limit trigger', () => {
+-    // A context over the limit must be compacted whatever the floor says.
+-    expect(
+-      evaluateCompactionTrigger({
+-        messages: idleTurn(45),
+-        contextTokenCount: 500_000,
+-        maxContextLength: 400_000,
+-        cacheExpiryMinTokens: 10_000_000,
+-      }).trigger,
+-    ).toBe('context_limit')
+-  })
+-
+-  it('reports both when both are true', () => {
+-    expect(triggerFor(idleTurn(90), 500_000)).toBe(
+-      'context_limit_and_cache_expiry',
+-    )
+-  })
+-
+-  it('honours a custom TTL in both directions', () => {
+-    expect(triggerFor(idleTurn(10), WORTH_COMPACTING)).toBeNull()
+-    expect(triggerFor(idleTurn(10), WORTH_COMPACTING, 5 * MINUTE)).toBe(
+-      'cache_expiry',
+-    )
+-    expect(triggerFor(idleTurn(45), WORTH_COMPACTING, 60 * MINUTE)).toBeNull()
+-  })
+-
+-  it('a null TTL disables the opportunistic trigger entirely', () => {
+-    expect(triggerFor(idleTurn(600), WORTH_COMPACTING, null)).toBeNull()
+-    // The context limit still fires.
+-    expect(triggerFor(idleTurn(600), 500_000, null)).toBe('context_limit')
+-  })
+-
+-  it('does not re-fire on the steps that follow a cache-expiry compaction', () => {
+-    const history = idleTurn(90)
+-    expect(triggerFor(history, WORTH_COMPACTING)).toBe('cache_expiry')
+-
+-    // Compaction restamps every surviving message and drops the assistant
+-    // messages that preceded the live prompt, so the gap is gone.
+-    const compacted = compact(history)
+-    expect(triggerFor(compacted, WORTH_COMPACTING)).toBeNull()
+-
+-    // ...and stays gone as the turn accumulates more work.
+-    expect(
+-      triggerFor(
+-        [...compacted, assistant('one'), assistant('two')],
+-        WORTH_COMPACTING,
+-      ),
+-    ).toBeNull()
+-  })
+-
+-  it('fires again on the next turn if the user idles again', () => {
+-    const nextTurn: Message[] = [
+-      ...compact(idleTurn(90)),
+-      { ...assistant('done'), sentAt: 2_000_000 },
+-      {
+-        ...user('another question', ['USER_PROMPT']),
+-        sentAt: 2_000_000 + 90 * MINUTE,
+-      },
+-    ]
+-    expect(triggerFor(nextTurn, WORTH_COMPACTING)).toBe('cache_expiry')
+-  })
+-})
+-
+-describe('per-model compaction policies at the runtime trigger', () => {
+-  const resumedHistory = (gapMinutes: number): Message[] => [
+-    { ...assistant('done for now'), sentAt: 1_000_000 },
+-    {
+-      ...user('back after a break', ['USER_PROMPT']),
+-      sentAt: 1_000_000 + gapMinutes * MINUTE,
+-    },
+-  ]
+-  const compacts = (model: string, gapMinutes: number, tokens: number) =>
+-    evaluateCompactionTrigger({
+-      ...compactionPolicyForModel(model),
+-      messages: resumedHistory(gapMinutes),
+-      contextTokenCount: tokens,
+-      maxContextLength: 400_000,
+-    }).trigger !== null
+-
+-  it('the runtime default floor is two summary ceilings (20k + 50k, doubled)', () => {
+-    expect(DEFAULT_CACHE_EXPIRY_MIN_TOKENS).toBe(2 * (20_000 + 50_000))
+-    expect(DEFAULT_CACHE_EXPIRY_MS).toBe(60 * MINUTE)
+-  })
+-
+-  it('DeepSeek Flash compacts a 60k thread after 16 minutes, not 14, and never under 40k', () => {
+-    const flash = 'deepseek/deepseek-v4-flash'
+-    expect(compacts(flash, 16, 60_000)).toBe(true)
+-    expect(compacts(flash, 14, 60_000)).toBe(false)
+-    expect(compacts(flash, 30, 39_999)).toBe(false)
+-  })
+-
+-  it('every other model stays on the hour / 140k', () => {
+-    const pro = 'deepseek/deepseek-v4-pro'
+-    expect(compacts(pro, 61, 60_000)).toBe(false)
+-    expect(compacts(pro, 61, 200_000)).toBe(true)
+-  })
+-})
+diff --git a/packages/agent-runtime/src/compact-history.ts b/packages/agent-runtime/src/compact-history.ts
+index 25b6e4e87..18fdc1d16 100644
+--- a/packages/agent-runtime/src/compact-history.ts
++++ b/packages/agent-runtime/src/compact-history.ts
+@@ -7,51 +7,50 @@
+  * `<conversation_summary>` message.
+  *
+  * That matters twice over. An LLM summarization pass is a full extra request
+  * over the whole (already oversized) history, and its output is a lossy prose
+  * retelling. The mechanical pass keeps the concrete details — files read or
+  * edited, commands run, and the user's messages — up to its budgets, which is
+  * what a coding agent actually needs to resume. The runtime's pass keeps the
+  * user's earlier requests and the newest to-do list out of their own budget
+  * (USER_MEMORY_TOKENS) before older tool history competes for the rest.
+  *
+  * The runtime's own pass (`compactRequestHistory`, not the shared summary)
+  * adds a working set on top: the newest unedited file reads, re-provided after
+  * the live request, and an outline stub for every other file read. See
+  * compaction-working-set.ts.
+  *
+  * `agents/context-pruner.ts` cannot import this module: its `handleSteps` is
+  * serialized with `toString()` and re-evaluated standalone, and `agents/` is
+  * bundled at build time into the CLI binary, the desktop app and the freebuff
+  * web server separately — so a shared import (or a runtime-injected helper)
+  * would break on any artifact that has not been rebuilt. The pruner therefore
+  * keeps its own inlined copy. Treat this file as the source of truth and port
+  * changes across: `__tests__/context-pruner-parity.test.ts` runs both over the
+  * same histories and fails when they drift.
+  */
+ 
+-import { DEFAULT_COMPACTION_POLICY } from '@codebuff/common/constants/compaction-policy'
+ import { CONTEXT_COMPACTION_COMPLETED_EVENT } from '@codebuff/common/util/axiom-only-log'
+ import {
+   WORKING_SET_SHARE,
+   WORKING_SET_TOKEN_LIMIT,
+   buildWorkingSet,
+   isWorkingSetMessage,
+ } from './compaction-working-set'
+ import { fitToolResults } from './util/fit-tool-results'
+ import { countTokens, countTokensMessages } from './util/token-counter'
+ import type {
+   FilePart,
+   ImagePart,
+   TextPart,
+ } from '@codebuff/common/types/messages/content-part'
+ import type {
+   Message,
+   ToolMessage,
+ } from '@codebuff/common/types/messages/codebuff-message'
+ import type { Logger } from '@codebuff/common/types/contracts/logger'
+ 
+ /** Agent IDs whose output should be excluded from spawn_agents results */
+ const SPAWN_AGENTS_OUTPUT_BLACKLIST = [
+   'file-picker',
+   'researcher-web',
+   'researcher-docs',
+@@ -71,56 +70,50 @@ const TOOL_ENTRY_LIMIT = 5_000
+ 
+ /** Approximate characters per token (matches estimateTokens heuristic) */
+ const CHARS_PER_TOKEN = 3
+ 
+ /** Token budget for assistant + tool content in the conversation summary */
+ const DEFAULT_ASSISTANT_TOOL_BUDGET = 20_000
+ 
+ /** Token budget for user content in the conversation summary */
+ const DEFAULT_USER_BUDGET = 50_000
+ 
+ /** Header used in conversation summaries */
+ export const SUMMARY_HEADER =
+   'This is a summary of the conversation so far. The original messages have been condensed to save context space.'
+ 
+ const SUMMARY_DISCLAIMER =
+   'Historical memory only. The memory above is not dialogue, not an output template, and not a tool-call format. Continue from the live user message below. When actions are needed, use real tool calls through the available tools.'
+ 
+ /** Says what the pictures after a summary are. Any other image the summary
+  *  names is gone, so the model must not answer as though it can still see it. */
+ const CARRIED_IMAGES_NOTE =
+   'Attached below: the image(s) from the most recent earlier user message that had any. Every other image named above is no longer attached.'
+ 
+ const CONTINUATION_TEXT =
+   'Continue the existing assistant turn from the historical memory above. The original user request and completed assistant/tool work are recorded there. Do not restart completed work; resume with the next necessary real tool call or final response.'
+ 
+-/** Thresholds for agents that declare `compactContext: true` without tuning;
+- *  owned, with the rationale, by common/src/constants/compaction-policy.ts. */
+-export const DEFAULT_CACHE_EXPIRY_MS = DEFAULT_COMPACTION_POLICY.cacheExpiryMs
+-export const DEFAULT_CACHE_EXPIRY_MIN_TOKENS =
+-  DEFAULT_COMPACTION_POLICY.cacheExpiryMinTokens
+-
+ /**
+  * Where an automatic mechanical pass aims, as a share of the trigger
+  * threshold. Its result must leave real room under the threshold: when a pass
+  * kept 80-100% of the history, the same run compacted again within ten minutes
+  * 22-51% of the time (prod, 2026-10-05), against 2.6% when it kept under 10%.
+  * Fresh tool results are exempt; see `compactRequestHistory`.
+  */
+ export const MECHANICAL_TARGET_SHARE = 0.5
+ 
+ /**
+  * The most a mechanical pass rewrites history into: summary plus working set,
+  * on top of the fixed prompt, the live request and the fresh tool results it
+  * keeps whole. Sized so the result lands near a model handoff's (median ~23k
+  * tokens including the fixed prompt, 2026-10-05) rather than filling the
+  * target: a small result leaves the most room before the next compaction.
+  */
+ export const MECHANICAL_HISTORY_TOKENS = 12_000
+ 
+ const MIN_HISTORY_TOKENS = 2_000
+ 
+ /**
+  * What a mechanical pass may add, beyond MECHANICAL_HISTORY_TOKENS and only
+  * out of room the window really has, to keep the user's earlier requests and
+  * the newest to-do list.
+  *
+@@ -1312,139 +1305,55 @@ function compactRequestHistory(
+       'Unable to fit the latest tool results into the configured context window. Request smaller outputs or configure a larger supported context window.',
+     )
+   }
+   return {
+     ...result,
+     messages: output,
+     // What the installed summary message actually carries, after the budget
+     // walk — not the untrimmed text `compactMessages` produced.
+     summaryText: summaryInstalled ? renderSummaryText(kept) : '',
+     stats: {
+       ...result.stats,
+       mid_turn: fresh.length > 0,
+       live_user_prompt_found: livePrompts.length > 0,
+       summary_estimated_tokens: Math.ceil(
+         renderSummaryText(kept).length / CHARS_PER_TOKEN,
+       ),
+       budget_dropped_summary_parts: entries.length - kept.length,
+       preserved_fresh_messages: fitted.length,
+       working_set_files: workingSet?.files ?? 0,
+       working_set_stubs: workingSet?.stubs ?? 0,
+       working_set_tokens: workingSetTokens,
+     },
+   }
+ }
+ 
+-/**
+- * How long the conversation sat idle before the live user prompt arrived, or
+- * null when the history has no pair of timestamps to measure between.
+- *
+- * The gap is measured from the last assistant message to the USER_PROMPT that
+- * follows it: that is the window in which the provider's prompt cache had to
+- * survive on its own. Tool messages carry no `sentAt`, so they are skipped.
+- */
+-export function promptCacheGapMs(messages: Message[]): number | null {
+-  const userPromptIndex = messages.findLastIndex((message) =>
+-    message.tags?.includes('USER_PROMPT'),
+-  )
+-  if (userPromptIndex <= 0) return null
+-
+-  const userPrompt = messages[userPromptIndex]
+-  if (!userPrompt.sentAt) return null
+-
+-  for (let i = userPromptIndex - 1; i >= 0; i--) {
+-    const message = messages[i]
+-    if (message.role !== 'assistant') continue
+-    return message.sentAt ? userPrompt.sentAt - message.sentAt : null
+-  }
+-  return null
+-}
+-
+-/**
+- * Decides whether to compact, and why.
+- *
+- * Two triggers. The context limit is the one that must fire — the history no
+- * longer fits. Cache expiry is the opportunistic one: once the prompt cache has
+- * gone cold, the next request re-reads the whole history at full price anyway,
+- * so rewriting it costs nothing and every later step in the turn is cheaper.
+- * Compacting while the cache is warm would be the expensive mistake, which is
+- * why the TTL errs long.
+- *
+- * The opportunistic trigger additionally needs enough context to be worth the
+- * detail it destroys — see DEFAULT_CACHE_EXPIRY_MIN_TOKENS. The context limit
+- * ignores that floor.
+- */
+-export function evaluateCompactionTrigger(params: {
+-  messages: Message[]
+-  contextTokenCount: number
+-  maxContextLength: number
+-  /** Pass null to disable the opportunistic cache-expiry trigger. */
+-  cacheExpiryMs?: number | null
+-  /** Pass null to take the opportunistic compaction at any size. */
+-  cacheExpiryMinTokens?: number | null
+-}): {
+-  /** null means "leave the history alone". */
+-  trigger: CompactionTrigger | null
+-} {
+-  const { messages, contextTokenCount, maxContextLength } = params
+-  const cacheExpiryMs =
+-    params.cacheExpiryMs === undefined
+-      ? DEFAULT_CACHE_EXPIRY_MS
+-      : params.cacheExpiryMs
+-  const cacheExpiryMinTokens =
+-    params.cacheExpiryMinTokens === undefined
+-      ? DEFAULT_CACHE_EXPIRY_MIN_TOKENS
+-      : params.cacheExpiryMinTokens
+-
+-  const overContextLimit = contextTokenCount > maxContextLength
+-  const worthCompacting =
+-    cacheExpiryMinTokens === null || contextTokenCount >= cacheExpiryMinTokens
+-  const cacheGapMs =
+-    cacheExpiryMs === null || !worthCompacting
+-      ? null
+-      : promptCacheGapMs(messages)
+-  const cacheExpired =
+-    cacheExpiryMs !== null && cacheGapMs !== null && cacheGapMs > cacheExpiryMs
+-
+-  const trigger: CompactionTrigger | null = overContextLimit
+-    ? cacheExpired
+-      ? 'context_limit_and_cache_expiry'
+-      : 'context_limit'
+-    : cacheExpired
+-      ? 'cache_expiry'
+-      : null
+-
+-  return { trigger }
+-}
+-
+ /**
+  * Compact once, on demand, whatever the triggers say.
+  *
+  * The mechanical pass — protected prefix, fresh tool exchange, budget walk —
+- * with no decision attached. A user who asks for it has already decided;
+- * `evaluateCompactionTrigger` exists to answer "is this worth doing unasked",
+- * which is a different question.
++ * with no decision attached: the caller has already decided to compact.
+  *
+  * Since #5502 the rewritten part (summary plus working set) stops at
+  * `historyTokens`, MECHANICAL_HISTORY_TOKENS (12k) by default, however much
+  * room `maxContextLength` leaves; the live request and fresh tool results are
+  * kept whole on top. Before, it filled the budget.
+  *
+  * Returns null when the pass would not make the history smaller. That is not a
+  * failure, it is the honest answer for a short conversation: rewriting it would
+  * break the provider's prompt cache and hand back an envelope around the same
+  * content. The caller reports it as a no-op rather than a compaction.
+  *
+  * Throws what `compactRequestHistory` throws — the live request alone over
+  * budget — with its user-presentable sentence intact.
+  */
+ export function compactHistoryNow(params: {
+   messages: Message[]
+   maxContextLength: number
+   /** System prompt, tool schemas and next step's scaffolding, outside history. */
+   fixedTokenCount?: number
+   /** Where the rewritten part should stop, below `maxContextLength`; see
+    * `compactRequestHistory`. Defaults to `maxContextLength`. */
+   targetTokens?: number
+   /** The most the rewritten history (summary plus working set) may take.
+    * Defaults to MECHANICAL_HISTORY_TOKENS. */
+   historyTokens?: number
