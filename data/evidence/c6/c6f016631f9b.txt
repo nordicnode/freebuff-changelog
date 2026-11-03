@@ -1,0 +1,1013 @@
+Date: 2026-11-03T00:29:56Z
+Category: CLI
+Areas: CLI
+Commit nature: production
+Stats: +21 / -4
+Analysis notes: CLI changes across 1 file(s) (+21/−4).
+Author intent & PR motivation (the WHY lives here; quote it when it explains the change, and say "the reason is not visible" when it does not):
+- PR #1548: perf(cli): scan only the tag seam when appending stream text (matched to this snapshot by its touched files, confidence 100%; treat as likely, not certain)
+  PR Description: ## What
+
+The text streaming path in `cli/src/utils/block-operations.ts` concatenated the whole accumulated block with each incoming delta and then ran two `String.includes` scans over the result:
+
+```ts
+const combinedText = lastBlock.content + text
+if (combinedText.includes(THINK_OPEN_TAG) || combinedText.includes(THINK_CLOSE_TAG)) { ... }
+```
+
+That made one reply cost **O(n²) in its own length** — every delta re-walked everything before it, allocating and flattening the concatenation each time.
+
+## Why it's safe to narrow the scan
+
+A think tag can only be *completed* by the delta that completes it, at the seam between the block's tail and that delta. A tag already sitting inside the block was split out when it arrived. So the check now:
+
+1. looks at the last 7 characters of the block (the widest partial tag, `</think`), plus the delta itself;
+2. falls back to the original full-block scan whenever either contains `<`.
+
+`<` in ordinary prose (`a < b`) still takes the full path, so nothing is lost.
+
+## Measurement (`bun`, same machine, before → after)
+
+| Scenario | Before | After |
+|---|---|---|
+| 8,000 deltas, 470 KB, plain text | 434 ms | **1.1 ms** |
+| 4,000 deltas, 234 KB | 117 ms | **0.9 ms** |
+| 2,000 deltas, 117 KB | 34 ms | **0.7 ms** |
+| 1,000 deltas, 59 KB | 21 ms | **0.4 ms** |
+| 8 subagents × 600 deltas | 38 ms | **5.5 ms** |
+
+Cost is now linear in stream length instead of quadratic (`us/delta` was rising 17 → 54 as the stream grew; it now sits flat below
+Modified files: cli/src/utils/block-operations.ts
+Key facts (ground the WHY and DETAIL sentences in these): - Opened by an earlier delta and closed before any content arrived: the same `<think></think>` in one delta renders nothing. - A delta that ends exactly on `<think>` leaves the parser inside a think tag with no content yet, so no thinking segment carries that state. Open an empty block for it; otherwise the next delta lands as plain text. - (e.g., just "</think>" or "</think>text"). In this case parseThinkTags returns empty or starts with text, but we still need to close the thinking block.
+Subsystem Architecture Documentation (from nearby package guides):
+- From `cli/README.md`:
+```markdown
+# @codebuff/cli
+
+A Terminal User Interface (TUI) package built with OpenTUI and React.
+
+## Installation
+
+```bash
+bun install
+```
+
+## Development
+
+Run the TUI in development mode:
+
+```bash
+bun run dev
+```
+
+## Testing
+
+Run the test suite:
+
+```bash
+bun test
+```
+
+### Interactive E2E Testing
+
+For testing interactive CLI features, install tmux:
+
+```bash
+# macOS
+brew install tmux
+
+# Ubuntu/Debian
+sudo apt-get install tmux
+
+# Windows (via WSL)
+wsl --install
+sudo apt-get install tmux
+```
+
+Then run the proof-of-concept:
+
+```bash
+bun run test:tmux-poc
+```
+
+[freebuff product prompt text omitted]
+
+```bash
+# ❌ Broken: tmux send-keys -t session "hello"
+# ✅ Works:  tmux send-keys -t session $'\e[200~hello\e[201~'
+```
+
+See [tmux.knowledge.md](tmux.knowledge.md) for comprehensive tmux documentation and [src/__tests__/README.md](src/__tests__/README.md) for testing documentation.
+
+## Build
+
+Build the package:
+
+```bash
+bun run build
+```
+
+## Run
+
+Run the built TUI:
+
+```bash
+bun run start
+```
+
+Or use the binary directly:
+
+```bash
+codebuff-tui
+```
+
+## Features
+```
+Complete Source of Modified Files (for complete module context):
+- File `cli/src/utils/block-operations.ts` (497 lines):
+```
+import { updateBlocksRecursively } from './message-block-helpers'
+import {
+  parseThinkTags,
+  getPartialTagLength,
+  THINK_OPEN_TAG,
+  THINK_CLOSE_TAG,
+} from './think-tag-parser'
+
+import type {
+  ContentBlock,
+  ToolContentBlock,
+  TextContentBlock,
+} from '../types/chat'
+
+let thinkingIdCounter = 0
+const generateThinkingId = (): string => {
+  thinkingIdCounter++
+  return `thinking-${thinkingIdCounter}`
+}
+
+type AgentTextUpdate =
+  | { type: 'text'; mode: 'append'; content: string; textType: 'text' | 'reasoning' }
+  | { type: 'text'; mode: 'replace'; content: string }
+
+const updateAgentText = (
+  blocks: ContentBlock[],
+  agentId: string,
+  update: AgentTextUpdate,
+) => {
+  return updateBlocksRecursively(blocks, agentId, (block) => {
+    if (block.type !== 'agent') {
+      return block
+    }
+
+    const agentBlocks = block.blocks ? [...block.blocks] : []
+    const text = update.content ?? ''
+
+    if (update.mode === 'replace') {
+      const updatedBlocks = [...agentBlocks]
+      let replaced = false
+
+      for (let i = updatedBlocks.length - 1; i >= 0; i--) {
+        const entry = updatedBlocks[i]
+        if (entry.type === 'text') {
+          replaced = true
+          if (entry.content === text && block.content === text) {
+            return block
+          }
+          updatedBlocks[i] = { ...entry, content: text }
+          break
+        }
+      }
+
+      if (!replaced) {
+        updatedBlocks.push({ type: 'text', content: text })
+      }
+
+      return {
+        ...block,
+        content: text,
+        blocks: updatedBlocks,
+      }
+    }
+
+    if (!text) {
+      return block
+    }
+
+    // Handle native reasoning chunks for agent blocks
+    if (update.textType === 'reasoning') {
+      const updatedAgentBlocks = appendNativeReasoningToBlocks(agentBlocks, text)
+      const updatedContent = (block.content ?? '') + text
+      return {
+        ...block,
+        content: updatedContent,
+        blocks: updatedAgentBlocks,
+      }
+    }
+
+    // For regular text: first close any open native reasoning block, then use think tag parsing
+    const blocksWithClosedReasoning = closeNativeReasoningBlock(agentBlocks)
+    const updatedAgentBlocks = appendTextWithThinkParsingToBlocks(
+      blocksWithClosedReasoning,
+      text,
+    )
+    const updatedContent = (block.content ?? '') + text
+    return {
+      ...block,
+      content: updatedContent,
+      blocks: updatedAgentBlocks,
+    }
+  })
+}
+
+/**
+ * Check if a text block represents an open (unclosed) thinking block.
+ */
+const isOpenThinkingBlock = (block: ContentBlock | undefined): boolean => {
+  if (!block || block.type !== 'text') {
+    return false
+  }
+  return block.textType === 'reasoning' && block.thinkingOpen === true
+}
+
+/**
+ * Creates a new reasoning (thinking) text block.
+ */
+const createReasoningBlock = (
+  content: string,
+  thinkingOpen: boolean,
+  thinkingId: string,
+): TextContentBlock => ({
+  type: 'text',
+  content,
+  textType: 'reasoning',
+  thinkingCollapseState: 'preview',
+  thinkingOpen,
+  thinkingId,
+})
+
+/**
+ * Creates a new regular text block.
+ */
+const createTextBlock = (content: string): TextContentBlock => ({
+  type: 'text',
+  content,
+  textType: 'text',
+})
+
+/**
+ * Shared logic for appending text with think tag parsing.
+ * Used by both root stream and agent blocks.
+ */
+const appendTextWithThinkParsingToBlocks = (
+  blocks: ContentBlock[],
+  text: string,
+): ContentBlock[] => {
+  if (!text) {
+    return blocks
+  }
+
+  const nextBlocks = [...blocks]
+  const lastBlock = nextBlocks[nextBlocks.length - 1]
+  const wasInsideThinking = isOpenThinkingBlock(lastBlock)
+
+  let textToParse = text
+
+  if (wasInsideThinking && lastBlock?.type === 'text') {
+    const lastBlockContent = lastBlock.content
+
+    const partialLen = getPartialTagLength(lastBlockContent)
+    if (partialLen > 0) {
+      const potentialTag = lastBlockContent.slice(-partialLen) + text
+      if (potentialTag.startsWith(THINK_CLOSE_TAG)) {
+        const newLastContent = lastBlockContent.slice(0, -partialLen)
+        textToParse = lastBlockContent.slice(-partialLen) + text
+
+        if (newLastContent) {
+          nextBlocks[nextBlocks.length - 1] = {
+            ...lastBlock,
+            content: newLastContent,
+          }
+        } else {
+          nextBlocks.pop()
+        }
+      }
+    }
+  } else if (
+    !wasInsideThinking &&
+    lastBlock?.type === 'text' &&
+    lastBlock.textType === 'text'
+  ) {
+    // A plain text block never holds a whole tag (parsing consumed it), so a
+    // tag can only be completed across the seam: the block's last
+    // tag-length-minus-one characters plus this delta. Scanning just that keeps
+    // each delta O(delta) instead of O(block), which was quadratic over a long reply.
+    const seam = lastBlock.content.slice(-(THINK_CLOSE_TAG.length - 1)) + text
+
+    if (seam.includes(THINK_OPEN_TAG) || seam.includes(THINK_CLOSE_TAG)) {
+      textToParse = lastBlock.content + text
+      nextBlocks.pop()
+    }
+  }
+
+  const currentLastBlock = nextBlocks[nextBlocks.length - 1]
+  const insideThinking = isOpenThinkingBlock(currentLastBlock)
+
+  if (insideThinking && !textToParse.includes('<')) {
+    if (currentLastBlock?.type === 'text') {
+      nextBlocks[nextBlocks.length - 1] = {
+        ...currentLastBlock,
+        content: currentLastBlock.content + textToParse,
+      }
+      return nextBlocks
+    }
+  }
+
+  if (!insideThinking && !textToParse.includes('<')) {
+    if (
+      currentLastBlock?.type === 'text' &&
+      currentLastBlock.textType === 'text'
+    ) {
+      nextBlocks[nextBlocks.length - 1] = {
+        ...currentLastBlock,
+        content: currentLastBlock.content + textToParse,
+      }
+      return nextBlocks
+    }
+    return [...nextBlocks, createTextBlock(textToParse)]
+  }
+
+  const fullText = insideThinking ? THINK_OPEN_TAG + textToParse : textToParse
+
+  const segments = parseThinkTags(fullText)
+
+  let segmentStartIdx = 0
+  if (
+    insideThinking &&
+    segments.length > 0 &&
+    segments[0].type === 'thinking'
+  ) {
+    const firstSegment = segments[0]
+    if (currentLastBlock?.type === 'text') {
+      const hasMoreSegments = segments.length > 1
+      const thinkingOpen =
+        !hasMoreSegments && !textToParse.includes(THINK_CLOSE_TAG)
+
+      nextBlocks[nextBlocks.length - 1] = {
+        ...currentLastBlock,
+        content: currentLastBlock.content + firstSegment.content,
+        thinkingOpen,
+      }
+    }
+    segmentStartIdx = 1
+  } else if (insideThinking && textToParse.includes(THINK_CLOSE_TAG)) {
+    // Handle case where we're inside thinking and receive </think> with no content
+    // (e.g., just "</think>" or "</think>text"). In this case parseThinkTags returns
+    // empty or starts with text, but we still need to close the thinking block.
+    if (currentLastBlock?.type === 'text') {
+      if (currentLastBlock.content) {
+        nextBlocks[nextBlocks.length - 1] = {
+          ...currentLastBlock,
+          thinkingOpen: false,
+        }
+      } else {
+        // Opened by an earlier delta and closed before any content arrived:
+        // the same `<think></think>` in one delta renders nothing.
+        nextBlocks.pop()
+      }
+    }
+  }
+
+  for (let i = segmentStartIdx; i < segments.length; i++) {
+    const segment = segments[i]
+    const isLastSegment = i === segments.length - 1
+
+    if (segment.type === 'thinking') {
+      const thinkingOpen =
+        isLastSegment && !textToParse.endsWith(THINK_CLOSE_TAG)
+      nextBlocks.push(
+        createReasoningBlock(
+          segment.content,
+          thinkingOpen,
+          generateThinkingId(),
+        ),
+      )
+    } else {
+      const prevBlock = nextBlocks[nextBlocks.length - 1]
+      if (
+        prevBlock?.type === 'text' &&
+        prevBlock.textType === 'text' &&
+        !prevBlock.thinkingOpen
+      ) {
+        nextBlocks[nextBlocks.length - 1] = {
+          ...prevBlock,
+          content: prevBlock.content + segment.content,
+        }
+      } else {
+        nextBlocks.push(createTextBlock(segment.content))
+      }
+    }
+  }
+
+  // A delta that ends exactly on `<think>` leaves the parser inside a think
+  // tag with no content yet, so no thinking segment carries that state. Open
+  // an empty block for it; otherwise the next delta lands as plain text.
+  const lastSegment = segments[segments.length - 1]
+  if (
+    fullText.lastIndexOf(THINK_OPEN_TAG) > fullText.lastIndexOf(THINK_CLOSE_TAG) &&
+    lastSegment?.type !== 'thinking'
+  ) {
+    nextBlocks.push(createReasoningBlock('', true, generateThinkingId()))
+  }
+
+  return nextBlocks
+}
+
+/** Appends native reasoning content to blocks. */
+const appendNativeReasoningToBlocks = (
+  blocks: ContentBlock[],
+  text: string,
+): ContentBlock[] => {
+  if (!text) {
+    return blocks
+  }
+
+  const nextBlocks = [...blocks]
+  const lastBlock = nextBlocks[nextBlocks.length - 1]
+
+  // If last block is already an open native reasoning block, append to it
+  // Only append if it's a native reasoning block (thinkingOpen === undefined),
+  // not a closed one or a <think> tag block
+  if (isNativeReasoningBlock(lastBlock) && lastBlock.type === 'text') {
+    const updatedBlock: ContentBlock = {
+      ...lastBlock,
+      content: lastBlock.content + text,
+    }
+    nextBlocks[nextBlocks.length - 1] = updatedBlock
+    return nextBlocks
+  }
+
+  // Create a new native reasoning block
+  const newBlock: ContentBlock = {
+    type: 'text',
+    content: text,
+    textType: 'reasoning',
+    thinkingCollapseState: 'preview',
+    thinkingId: generateThinkingId(),
+  }
+
+  return [...nextBlocks, newBlock]
+}
+
+/**
+ * Checks if a block is a native reasoning block (not from <think> tags).
+ * Native reasoning blocks have textType === 'reasoning' but thinkingOpen === undefined.
+ */
+export const isNativeReasoningBlock = (block: ContentBlock | undefined): boolean => {
+  if (!block || block.type !== 'text') {
+    return false
+  }
+  return block.textType === 'reasoning' && block.thinkingOpen === undefined
+}
+
+/**
+ * Closes native reasoning blocks within a specific agent's blocks.
+ * Used when a tool call happens for a subagent.
+ */
+export const closeNativeReasoningInAgent = (
+  blocks: ContentBlock[],
+  agentId: string,
+): ContentBlock[] => {
+  return updateBlocksRecursively(blocks, agentId, (block) => {
+    if (block.type !== 'agent') {
+      return block
+    }
+    const closedBlocks = block.blocks ? closeNativeReasoningBlock(block.blocks) : undefined
+    if (closedBlocks && closedBlocks !== block.blocks) {
+      return { ...block, blocks: closedBlocks }
+    }
+    return block
+  })
+}
+
+/**
+ * Marks the last native reasoning block as complete by setting thinkingOpen: false.
+ * This triggers the UI to collapse the thinking block.
+ * 
+ * Note: We search backwards through all blocks because agent/tool blocks may have
+ * been added after the reasoning block but before text output starts.
+ */
+export const closeNativeReasoningBlock = (
+  blocks: ContentBlock[],
+): ContentBlock[] => {
+  // Find the last native reasoning block (not just the last block)
+  let lastReasoningIndex = -1
+  for (let i = blocks.length - 1; i >= 0; i--) {
+    if (isNativeReasoningBlock(blocks[i])) {
+      lastReasoningIndex = i
+      break
+    }
+  }
+  
+  if (lastReasoningIndex === -1) {
+    return blocks
+  }
+  
+  const reasoningBlock = blocks[lastReasoningIndex]
+  if (reasoningBlock.type !== 'text') {
+    return blocks
+  }
+  
+  const nextBlocks = [...blocks]
+  nextBlocks[lastReasoningIndex] = {
+    ...reasoningBlock,
+    thinkingOpen: false,
+  }
+  return nextBlocks
+}
+
+export const appendTextToRootStream = (
+  blocks: ContentBlock[],
+  delta: { type: 'text' | 'reasoning'; text: string },
+) => {
+  if (!delta.text) {
+    return blocks
+  }
+
+  if (delta.type === 'reasoning') {
+    return appendNativeReasoningToBlocks(blocks, delta.text)
+  }
+
+  // For text type: first close any open native reasoning block, then parse for <think> tags
+  const blocksWithClosedReasoning = closeNativeReasoningBlock(blocks)
+  return appendTextWithThinkParsingToBlocks(blocksWithClosedReasoning, delta.text)
+}
+
+export const appendTextToAgentBlock = (
+  blocks: ContentBlock[],
+  agentId: string,
+  text: string,
+  textType: 'text' | 'reasoning' = 'text',
+) =>
+  updateAgentText(blocks, agentId, {
+    type: 'text',
+    mode: 'append',
+    content: text,
+    textType,
+  })
+
+export const appendToolToAgentBlock = (
+  blocks: ContentBlock[],
+  agentId: string,
+  toolBlock: ToolContentBlock,
+) =>
+  updateBlocksRecursively(blocks, agentId, (block) => {
+    if (block.type !== 'agent') {
+      return block
+    }
+    // Close any open native reasoning blocks before adding the tool
+    const agentBlocks = block.blocks ? closeNativeReasoningBlock([...block.blocks]) : []
+    return { ...block, blocks: [...agentBlocks, toolBlock] }
+  })
+
+export const markAgentComplete = (blocks: ContentBlock[], agentId: string) =>
+  updateBlocksRecursively(blocks, agentId, (block) => {
+    if (block.type !== 'agent') {
+      return block
+    }
+    // Close any open native reasoning blocks when the agent completes
+    const closedBlocks = block.blocks ? closeNativeReasoningBlock(block.blocks) : undefined
+    return { 
+      ...block, 
+      status: 'complete' as const,
+      ...(closedBlocks && { blocks: closedBlocks }),
+    }
+  })
+
+/**
+ * Recursively marks all agent blocks with status 'running' as 'cancelled'.
+ * Used when the user interrupts a response to indicate subagents were stopped.
+ * Also closes any open native reasoning blocks so they don't appear "streaming".
+ */
+export const markRunningAgentsAsCancelled = (
+  blocks: ContentBlock[],
+): ContentBlock[] => {
+  return blocks.map((block) => {
+    if (block.type !== 'agent') {
+      return block
+    }
+
+    // First recursively process nested agents, then close any reasoning blocks
+    let updatedBlocks = block.blocks
+      ? markRunningAgentsAsCancelled(block.blocks)
+      : undefined
+    
+    // Close any open native reasoning blocks in this agent
+    if (updatedBlocks) {
+      updatedBlocks = closeNativeReasoningBlock(updatedBlocks)
+    }
+
+    if (block.status === 'running') {
+      return {
+        ...block,
+        status: 'cancelled' as const,
+        ...(updatedBlocks && { blocks: updatedBlocks }),
+      }
+    }
+
+    if (updatedBlocks && updatedBlocks !== block.blocks) {
+      return { ...block, blocks: updatedBlocks }
+    }
+
+    return block
+  })
+}
+```
+Where the symbols this change introduces are used elsewhere, at this same revision (the code that reads them; this is evidence for the WHAT and the WHY, and it is the only source for who consumes this change):
+- File `cli/src/utils/__tests__/block-processor.test.ts` (13 matching lines):
+```
+},
+  }
+
+  return { handlers, calls }
+}
+
+// ============================================================================
+// Tests: isReasoningTextBlock
+// ============================================================================
+
+describe('isReasoningTextBlock', () => {
+  test('returns true for text block with textType "reasoning"', () => {
+    const block = createReasoningBlock('thinking...')
+    expect(isReasoningTextBlock(block)).toBe(true)
+  })
+
+  test('returns false for text block without textType', () => {
+    const block = createTextBlock('normal text')
+    expect(isReasoningTextBlock(block)).toBe(false)
+  })
+
+  test('returns false for text block with textType "text"', () => {
+    const block = createTextBlock('normal text', 'text')
+    expect(isReasoningTextBlock(block)).toBe(false)
+  })
+…
+const result = processBlocks(blocks, handlers)
+
+      expect(result).toEqual(['reasoning-0'])
+      expect(calls).toHaveLength(1)
+      expect(calls[0].handler).toBe('onReasoningGroup')
+      expect((calls[0].args[0] as TextContentBlock[]).length).toBe(1)
+      expect(calls[0].args[1]).toBe(0)
+    })
+
+    test('groups consecutive reasoning blocks together', () => {
+      const { handlers, calls } = createMockHandlers()
+      const blocks: ContentBlock[] = [
+        createReasoningBlock('thought 1'),
+        createReasoningBlock('thought 2'),
+        createReasoningBlock('thought 3'),
+      ]
+
+      const result = processBlocks(blocks, handlers)
+
+      expect(result).toEqual(['reasoning-0'])
+      expect(calls).toHaveLength(1)
+      expect(calls[0].handler).toBe('onReasoningGroup')
+      const reasoningBlocks = calls[0].args[0] as TextContentBlock[]
+      expect(reasoningBlocks).toHaveLength(3)
+      expect(reasoningBlocks[0].content).toBe('thought 1')
+      expect(reasoningBlocks[1].content).toBe('thought 2')
+```
+- File `cli/src/utils/think-tag-parser.ts` (8 matching lines):
+```
+/**
+ * Parses <think>...</think> tags from text and splits into segments.
+ * Handles streaming scenarios where tags may be incomplete.
+ */
+
+export const THINK_OPEN_TAG = '<think>'
+export const THINK_CLOSE_TAG = '</think>'
+
+export type ThinkSegment = {
+  type: 'text' | 'thinking'
+  content: string
+}
+
+/**
+ * Possible partial tag prefixes that we should buffer.
+ * These are prefixes that could become a complete tag with more input.
+ */
+const PARTIAL_OPEN_PREFIXES = ['<', '<t', '<th', '<thi', '<thin', '<think']
+const PARTIAL_CLOSE_PREFIXES = ['</', '</t', '</th', '</thi', '</thin', '</think']
+…
+export function parseThinkTags(text: string): ThinkSegment[] {
+  if (!text) {
+    return []
+  }
+
+  const segments: ThinkSegment[] = []
+  let remaining = text
+  let insideThink = false
+
+  while (remaining.length > 0) {
+    if (insideThink) {
+      // Look for closing tag
+      const closeIdx = remaining.indexOf(THINK_CLOSE_TAG)
+      if (closeIdx === -1) {
+        // No closing tag found - all remaining is thinking content
+        if (remaining.length > 0) {
+          segments.push({ type: 'thinking', content: remaining })
+        }
+        break
+      }
+      // Content before closing tag is thinking
+      if (closeIdx > 0) {
+        segments.push({ type: 'thinking', content: remaining.slice(0, closeIdx) })
+      }
+      remaining = remaining.slice(closeIdx + THINK_CLOSE_TAG.length)
+```
+- File `cli/src/utils/__tests__/think-tag-parser.test.ts` (6 matching lines):
+```
+import { describe, test, expect } from 'bun:test'
+
+import {
+  parseThinkTags,
+  getPartialTagLength,
+  THINK_OPEN_TAG,
+  THINK_CLOSE_TAG,
+} from '../think-tag-parser'
+
+describe('parseThinkTags', () => {
+  test('returns empty array for empty string', () => {
+    expect(parseThinkTags('')).toEqual([])
+  })
+
+  test('returns single text segment for text without tags', () => {
+    expect(parseThinkTags('Hello world')).toEqual([
+      { type: 'text', content: 'Hello world' },
+    ])
+  })
+…
+expect(getPartialTagLength('text<a')).toBe(0)
+    expect(getPartialTagLength('text</x')).toBe(0)
+  })
+
+  test('handles just the partial tag character', () => {
+    expect(getPartialTagLength('<')).toBe(1)
+    expect(getPartialTagLength('<t')).toBe(2)
+    expect(getPartialTagLength('</')).toBe(2)
+  })
+})
+
+describe('tag constants', () => {
+  test('THINK_OPEN_TAG is correct', () => {
+    expect(THINK_OPEN_TAG).toBe('<think>')
+  })
+
+  test('THINK_CLOSE_TAG is correct', () => {
+    expect(THINK_CLOSE_TAG).toBe('</think>')
+  })
+})
+```
+- File `packages/agent-runtime/src/util/__tests__/stream-xml-parser.test.ts` (6 matching lines):
+```
+expect(result.filteredText).toBe('')
+      expect(result.toolCalls).toHaveLength(1)
+      expect(result.toolCalls[0].toolName).toBe('test_tool')
+    })
+
+    it('should handle realistic streaming scenario with small chunks', () => {
+      const state = createStreamParserState()
+      const allChunks: string[] = []
+      const allToolCalls: any[] = []
+
+      // Simulate streaming in small chunks like a real LLM would
+      const fullText = `<think>
+Thinking about the task...
+</think>
+
+<codebuff_tool_call>
+{"cb_tool_name": "propose_str_replace", "path": "test.ts"}
+</codebuff_tool_call>`
+
+      // Stream in ~10 char chunks
+      for (let i = 0; i < fullText.length; i += 10) {
+        const chunk = fullText.slice(i, i + 10)
+        const result = parseStreamChunk(chunk, state)
+        allChunks.push(result.filteredText)
+        allToolCalls.push(...result.toolCalls)
+      }
+
+      const combinedText = allChunks.join('')
+      expect(combinedText).toBe('<think>\nThinking about the task...\n</think>\n\n')
+      expect(allToolCalls).toHaveLength(1)
+      expect(allToolCalls[0].toolName).toBe('propose_str_replace')
+      expect(allToolCalls[0].input.path).toBe('test.ts')
+    })
+```
+- File `common/src/util/desktop-installer-archive.test.ts` (5 matching lines):
+```
+// Arbitrary opaque compressed application data: the personalizer must never inspect or alter it.
+  const suffix = arEntry('data.tar.xz', Buffer.from([0, 128, 42, 255, 1, 2, 3]))
+  return {
+    prefix,
+    suffix,
+    archive: Buffer.concat([prefix, suffix]),
+    controlEntry,
+  }
+}
+
+async function* chunks(
+  buffer: Buffer,
+  chunkSize = 17,
+): AsyncGenerator<Uint8Array> {
+  yield new Uint8Array(0)
+  for (let i = 0; i < buffer.length; i += chunkSize)
+    yield buffer.subarray(i, i + chunkSize)
+}
+
+async function collect(source: AsyncIterable<Uint8Array>): Promise<Buffer> {
+  const chunks: Uint8Array[] = []
+  for await (const chunk of source) chunks.push(chunk)
+  return Buffer.concat(chunks)
+}
+
+function rewrittenControl(archive: Buffer): {
+  header: Buffer
+  control: Buffer
+  tail: Buffer
+```
+- File `sdk/e2e/integration/stream-chunks.integration.test.ts` (4 matching lines):
+```
+handleEvent: collector.handleEvent,
+        handleStreamChunk: collector.handleStreamChunk,
+      })
+
+      // Should receive string chunks
+      const stringChunks = collector.streamChunks.filter(
+        (c): c is string => typeof c === 'string',
+      )
+
+      expect(stringChunks.length).toBeGreaterThan(0)
+
+      // Combined chunks should form meaningful text
+      const fullText = collector.getFullStreamText()
+      expect(fullText.length).toBeGreaterThan(0)
+    },
+    DEFAULT_TIMEOUT,
+  )
+
+  test(
+    'stream chunks arrive incrementally (not all at once)',
+    async () => {
+      if (skipIfNoApiKey()) return
+
+      const chunkTimestamps: number[] = []
+      const collector = new EventCollector()
+…
+if (skipIfNoApiKey()) return
+
+      const collector = new EventCollector()
+
+      await client.run({
+        agent: DEFAULT_AGENT,
+        prompt:
+          'Output these special characters: émojis 🎉, quotes "test", newlines, and tabs',
+        handleEvent: collector.handleEvent,
+        handleStreamChunk: collector.handleStreamChunk,
+      })
+
+      const fullText = collector.getFullStreamText()
+
+      // Should handle the response without errors
+      expect(collector.errors.length).toBe(0)
+      expect(fullText.length).toBeGreaterThan(0)
+      expect(collector.hasEventType('finish')).toBe(true)
+    },
+    DEFAULT_TIMEOUT,
+  )
+})
+```
+Tests this commit changed (added lines only; the assertions are what the change is expected to do, not a description of the feature):
+- File `cli/src/utils/__tests__/block-operations-streaming.test.ts`
+```
+      for (const chunkSize of [1, 2, 3, 4, 5, 6, 7, 8, 9, 64]) {
+```
+Diff (source hunks; lockfiles and pure test hunks omitted, except in a lockfile-only commit):
+```diff
+diff --git a/cli/src/utils/block-operations.ts b/cli/src/utils/block-operations.ts
+index 688f2d8af..de8e30b5d 100644
+--- a/cli/src/utils/block-operations.ts
++++ b/cli/src/utils/block-operations.ts
+@@ -215,88 +215,105 @@ const appendTextWithThinkParsingToBlocks = (
+ 
+   let segmentStartIdx = 0
+   if (
+     insideThinking &&
+     segments.length > 0 &&
+     segments[0].type === 'thinking'
+   ) {
+     const firstSegment = segments[0]
+     if (currentLastBlock?.type === 'text') {
+       const hasMoreSegments = segments.length > 1
+       const thinkingOpen =
+         !hasMoreSegments && !textToParse.includes(THINK_CLOSE_TAG)
+ 
+       nextBlocks[nextBlocks.length - 1] = {
+         ...currentLastBlock,
+         content: currentLastBlock.content + firstSegment.content,
+         thinkingOpen,
+       }
+     }
+     segmentStartIdx = 1
+   } else if (insideThinking && textToParse.includes(THINK_CLOSE_TAG)) {
+     // Handle case where we're inside thinking and receive </think> with no content
+     // (e.g., just "</think>" or "</think>text"). In this case parseThinkTags returns
+     // empty or starts with text, but we still need to close the thinking block.
+     if (currentLastBlock?.type === 'text') {
+-      nextBlocks[nextBlocks.length - 1] = {
+-        ...currentLastBlock,
+-        thinkingOpen: false,
++      if (currentLastBlock.content) {
++        nextBlocks[nextBlocks.length - 1] = {
++          ...currentLastBlock,
++          thinkingOpen: false,
++        }
++      } else {
++        // Opened by an earlier delta and closed before any content arrived:
++        // the same `<think></think>` in one delta renders nothing.
++        nextBlocks.pop()
+       }
+     }
+   }
+ 
+   for (let i = segmentStartIdx; i < segments.length; i++) {
+     const segment = segments[i]
+     const isLastSegment = i === segments.length - 1
+ 
+     if (segment.type === 'thinking') {
+       const thinkingOpen =
+         isLastSegment && !textToParse.endsWith(THINK_CLOSE_TAG)
+       nextBlocks.push(
+         createReasoningBlock(
+           segment.content,
+           thinkingOpen,
+           generateThinkingId(),
+         ),
+       )
+     } else {
+       const prevBlock = nextBlocks[nextBlocks.length - 1]
+       if (
+         prevBlock?.type === 'text' &&
+         prevBlock.textType === 'text' &&
+         !prevBlock.thinkingOpen
+       ) {
+         nextBlocks[nextBlocks.length - 1] = {
+           ...prevBlock,
+           content: prevBlock.content + segment.content,
+         }
+       } else {
+         nextBlocks.push(createTextBlock(segment.content))
+       }
+     }
+   }
+ 
++  // A delta that ends exactly on `<think>` leaves the parser inside a think
++  // tag with no content yet, so no thinking segment carries that state. Open
++  // an empty block for it; otherwise the next delta lands as plain text.
++  const lastSegment = segments[segments.length - 1]
++  if (
++    fullText.lastIndexOf(THINK_OPEN_TAG) > fullText.lastIndexOf(THINK_CLOSE_TAG) &&
++    lastSegment?.type !== 'thinking'
++  ) {
++    nextBlocks.push(createReasoningBlock('', true, generateThinkingId()))
++  }
++
+   return nextBlocks
+ }
+ 
+ /** Appends native reasoning content to blocks. */
+ const appendNativeReasoningToBlocks = (
+   blocks: ContentBlock[],
+   text: string,
+ ): ContentBlock[] => {
+   if (!text) {
+     return blocks
+   }
+ 
+   const nextBlocks = [...blocks]
+   const lastBlock = nextBlocks[nextBlocks.length - 1]
+ 
+   // If last block is already an open native reasoning block, append to it
+   // Only append if it's a native reasoning block (thinkingOpen === undefined),
+   // not a closed one or a <think> tag block
+   if (isNativeReasoningBlock(lastBlock) && lastBlock.type === 'text') {
+     const updatedBlock: ContentBlock = {
+       ...lastBlock,
+       content: lastBlock.content + text,
+     }
+     nextBlocks[nextBlocks.length - 1] = updatedBlock
+     return nextBlocks
+
+```
