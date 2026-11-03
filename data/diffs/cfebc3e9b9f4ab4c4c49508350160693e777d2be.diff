@@ -1,0 +1,168 @@
+diff --git a/common/src/desktop-cloud/local-conversations.ts b/common/src/desktop-cloud/local-conversations.ts
+index 0f0c6e5c1..56676aed4 100644
+--- a/common/src/desktop-cloud/local-conversations.ts
++++ b/common/src/desktop-cloud/local-conversations.ts
+@@ -93,36 +93,37 @@ export type LocalConversationSnapshot = {
+     hasNewer: boolean
+   }
+   questions: LocalConversationQuestion[]
+   elevations: Array<{ id: string; command: string; reason: string }>
+   queued: Array<{ id: string; text: string }>
+ }
+ export type LocalConversationRequest =
+   | { operation: 'projects'; offset?: number }
+   | { operation: 'workspace' }
+   | { operation: 'save-workspace'; tabs: string[]; activeId: string | null }
+   | { operation: 'threads'; projectId: string; offset?: number }
+   | { operation: 'search'; projectId: string; query: string }
+   | (LocalConversationScope &
+       (
+         | { operation: 'read'; before?: number; after?: number }
+         | { operation: 'migrate'; priority?: boolean; retry?: boolean }
+         | { operation: 'attachment'; attachmentId: string }
+       ))
+ export type LocalConversationResponses = {
+   workspace: LocalConversationWorkspace | null
+   'save-workspace': { ok: true }
+   projects: { projects: LocalConversationProject[]; nextOffset: number | null }
+   threads: { threads: LocalConversationThread[]; nextOffset: number | null }
+   search: { threadIds: string[]; indexing: boolean }
+   /** `reason`: a fixed failure token from Desktop 0.0.197+ (`needs-reconnect`: pick the folder again). */
+-  migrate: { cloud?: { threadId: string; projectId: string | null }; error?: string; retryable?: false; reason?: string }
++  /** `deferred`: a background request (no `priority`/`retry`) for a chat not yet in Cloud; nothing was imported. Older Desktops never send it. */
++  migrate: { cloud?: { threadId: string; projectId: string | null }; deferred?: true; error?: string; retryable?: false; reason?: string }
+   read: LocalConversationSnapshot
+   attachment: { dataUrl: string }
+ }
+ export type LocalConversationsHost = {
+   /** Authenticate the native account/profile before automatically exposing its local history. */
+   authorize(): Promise<boolean>
+   request<T extends LocalConversationRequest>(
+     input: T,
+   ): Promise<LocalConversationResponses[T['operation']]>
+ }
+diff --git a/packages/agent-runtime/src/__tests__/tool-stream-parser-dup-text.test.ts b/packages/agent-runtime/src/__tests__/tool-stream-parser-dup-text.test.ts
+new file mode 100644
+index 000000000..1d2cfa87c
+--- /dev/null
++++ b/packages/agent-runtime/src/__tests__/tool-stream-parser-dup-text.test.ts
+@@ -0,0 +1,59 @@
++import { TEST_AGENT_RUNTIME_IMPL } from '@codebuff/common/testing/impl/agent-runtime'
++import { promptSuccess } from '@codebuff/common/util/error'
++import { describe, expect, it } from 'bun:test'
++
++import { processStreamWithTools } from '../tool-stream-parser'
++import { createToolCallChunk } from './test-utils'
++
++import type { StreamChunk } from '@codebuff/common/types/contracts/llm'
++
++// The cloud agent drops the consolidated `text` event once its text was
++// persisted as chunk rows. That is safe only while the event carries exactly
++// the text already yielded as chunks, after them, and nothing else.
++describe('the consolidated text event duplicates the yielded text chunks', () => {
++  async function run(chunks: StreamChunk[]) {
++    async function* stream() {
++      for (const chunk of chunks) yield chunk
++      return promptSuccess('id')
++    }
++    const order: Array<['chunk' | 'event', string]> = []
++    const noop = { onTagStart: () => {}, onTagEnd: () => {} }
++    for await (const chunk of processStreamWithTools({
++      ...TEST_AGENT_RUNTIME_IMPL,
++      stream: stream(),
++      processors: { test_tool: noop },
++      defaultProcessor: () => noop,
++      onResponseChunk: (chunk) => {
++        if (chunk.type === 'text') order.push(['event', chunk.text])
++      },
++      executeXmlToolCall: async () => {},
++    })) {
++      if (chunk.type === 'text') order.push(['chunk', chunk.text])
++      if (chunk.type === 'tool-call') order.push(['chunk', `<${chunk.toolName}>`])
++    }
++    return order
++  }
++
++  it('repeats each text segment after its chunks, split at tool calls', async () => {
++    const order = await run([
++      { type: 'text', text: 'Hel' },
++      { type: 'text', text: 'lo' },
++      createToolCallChunk('test_tool', {}),
++      { type: 'text', text: 'Bye' },
++    ])
++    expect(order).toEqual([
++      ['chunk', 'Hel'],
++      ['chunk', 'lo'],
++      ['event', 'Hello'],
++      ['chunk', '<test_tool>'],
++      ['chunk', 'Bye'],
++      ['event', 'Bye'],
++    ])
++  })
++
++  it('emits no text event when no text streamed', async () => {
++    expect(await run([createToolCallChunk('test_tool', {})])).toEqual([
++      ['chunk', '<test_tool>'],
++    ])
++  })
++})
+diff --git a/packages/agent-runtime/src/tool-stream-parser.ts b/packages/agent-runtime/src/tool-stream-parser.ts
+index 3e12ac807..106df1ae4 100644
+--- a/packages/agent-runtime/src/tool-stream-parser.ts
++++ b/packages/agent-runtime/src/tool-stream-parser.ts
+@@ -60,50 +60,55 @@ export async function* processStreamWithTools(params: {
+   const xmlParserState: StreamParserState = createStreamParserState()
+ 
+   async function processToolCallObject(params: {
+     toolName: string
+     input: any
+     providerOptions?: ProviderMetadata
+   }): Promise<void> {
+     const { toolName, providerOptions } = params
+     let { input } = params
+ 
+     // AI SDK sometimes emits tool-call chunks with a raw JSON string as `input`
+     // when its repair pass can't produce a parsed object. Try to parse; if it
+     // fails, leave as string — the executor surfaces a clear error.
+     if (typeof input === 'string') {
+       try {
+         input = JSON.parse(input)
+       } catch {}
+     }
+ 
+     const processor = processors[toolName] ?? defaultProcessor(toolName)
+ 
+     await processor.onTagStart(toolName, {})
+     await processor.onTagEnd(toolName, input, providerOptions)
+   }
+ 
++  // The `text` event is the consolidated copy of the text chunks yielded since
++  // the last flush, never new text: message history is built from it, and the
++  // cloud agent skips persisting it once those chunks were written
++  // (web/src/server/desktop-cloud/agent.ts; pinned by
++  // __tests__/tool-stream-parser-dup-text.test.ts).
+   async function flush() {
+     if (buffer) {
+       await onResponseChunk({
+         type: 'text',
+         text: buffer,
+       })
+     }
+     buffer = ''
+   }
+ 
+   async function* processChunk(
+     chunk: StreamChunk | undefined,
+   ): AsyncGenerator<StreamChunk> {
+     if (chunk === undefined) {
+       await flush()
+       streamCompleted = true
+       return
+     }
+ 
+     if (chunk.type === 'text') {
+       // Parse XML tool calls from the text stream
+       const { filteredText, toolCalls } = parseStreamChunk(
+         chunk.text,
+         xmlParserState,
+       )
