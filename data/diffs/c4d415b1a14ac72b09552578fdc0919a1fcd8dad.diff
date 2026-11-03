@@ -1,0 +1,380 @@
+diff --git a/agents/__tests__/base3.test.ts b/agents/__tests__/base3.test.ts
+index c46a4dc22..77aed3a7b 100644
+--- a/agents/__tests__/base3.test.ts
++++ b/agents/__tests__/base3.test.ts
+@@ -390,32 +390,47 @@ describe('working in batches', () => {
+     }
+     // a catalog handle is matched by the model it stands for
+     const handle = createBase3('fbm1.handle', {
+       batching: true,
+       compiledModelId: FLASH,
+     })
+     expect(handle.systemPrompt).toContain(SECTION)
+     expect(handle.stepPrompt).toStartWith('Work in batches:')
+     // fast mode is the same model on another lane
+     const fast = createBase3('deepseek/deepseek-v4-flash-fast', {
+       batching: true,
+     })
+     expect(fast.systemPrompt).toContain(SECTION)
+     expect(fast.stepPrompt).toStartWith('Work in batches:')
+   })
+ 
+   test('a lean row never gets it: its context budget says to read narrowly', () => {
+     const lean = createBase3(FLASH, {
+       compaction: LEAN_COMPACTION_POLICY,
+       batching: true,
+     })
+     expect(lean.systemPrompt).not.toContain(SECTION)
+     expect(lean.stepPrompt).toBeUndefined()
+   })
+ 
++  test('batching never reads as economising', () => {
++    // "costs less" led Flash to think "my budget is limited" and stop short
++    const batched = createBase3(FLASH, { batching: true })
++    const section = batched.systemPrompt!.slice(
++      batched.systemPrompt!.indexOf(SECTION),
++    )
++    for (const text of [section, batched.stepPrompt!]) {
++      expect(text).not.toMatch(/\bcosts?\b|\bcheap|\bbudget|\bsav(e|ing)\b/i)
++    }
++    expect(section).toContain(
++      'Batching is about fewer round trips, never about doing less: do every part of the request and verify it.',
++    )
++    expect(batched.stepPrompt).toContain('every part of the request')
++  })
++
+   test('it comes after the dynamic context, outside the core the server compares', () => {
+     const prompt = createBase3(FLASH, { batching: true }).systemPrompt!
+     expect(prompt.indexOf(SECTION)).toBeGreaterThan(
+       prompt.indexOf(PLACEHOLDER.GIT_CHANGES_PROMPT),
+     )
+   })
+ })
+diff --git a/agents/base3.ts b/agents/base3.ts
+index b9abceb53..d48ddf6eb 100644
+--- a/agents/base3.ts
++++ b/agents/base3.ts
+@@ -19,65 +19,71 @@ import {
+   AGENT_PROGRESS_GUIDANCE,
+   AGENT_VERIFICATION_GUIDANCE,
+   WORKSPACE_QUESTION_GUIDANCE,
+ } from '@codebuff/common/constants/agent-work-style'
+ 
+ import { leanContextGuidance } from './lean-context'
+ import {
+   FOLLOWUP_STYLE_GUIDANCE,
+   gravityIndexGuidance,
+   OPUS_MODEL,
+   publisher,
+   SKILL_DISCOVERY_GUIDANCE,
+ } from './constants'
+ import {
+   PLACEHOLDER,
+   type SecretAgentDefinition,
+ } from './types/secret-agent-definition'
+ 
+ /**
+  * Working in batches, appended to base3's prompt for the roots that ask for it
+  * (`batching`) on the models in BATCHING_MODELS. Every response re-sends the
+  * conversation, so the same work in fewer responses is faster and cheaper
+  * (docs/benchmarks/base3-batched/README.md).
+  * It comes after the dynamic context, outside the core the server compares
+  * (web/src/llm-api/root-instruction-contract.ts), so older clients still match.
+- * Deliberately NOT repeated as a per-step `stepPrompt`: a step prompt is
+- * deleted each step, so no request is a prefix of the next and the prompt
+- * cache collapses (#1158; measured in the benchmark doc above).
++ * Its one-line reminder is the `stepPrompt` below.
++ *
++ * No cost or budget wording. Users quoted Flash thinking "my budget is
++ * limited" before a cheap partial fix (2026-10-31, 11-02); this section's
++ * "costs less" was one of the two places our prompts suggested it (the other
++ * was the server's DEEPSEEK_BREVITY_NUDGE). The "never about doing less" line
++ * is what fixed the same failure for a lean row (lean-context.ts).
+  */
+ const BATCHING_GUIDANCE = `## Work in batches
+ 
+-Every response is a round trip: the whole conversation is sent again before the next reply begins, so a task done in fewer responses finishes sooner and costs less. Get as much done in each response as you can.
++Every response is a round trip: the whole conversation is sent again before the next reply begins, so a task done in fewer responses finishes sooner. Get as much done in each response as you can.
++
++Batching is about fewer round trips, never about doing less: do every part of the request and verify it.
+ 
+ - **Make every call you already can.** Tool calls that do not depend on each other's results belong in one response, not in a sequence of responses.
+ - **Search in one batch.** When you need to find something, send every code_search and glob you can think of together (the names, strings and paths it could be under), rather than one search per response.
+ - **Read in one batch.** Read every file that looks relevant in one read_files call, often 5 to 15 of them, including the ones you expect to need next, rather than one file at a time. Go back for more only when what you read points to something specific.
+ - **Explore with the dedicated tools.** code_search, glob, list_directory and read_files take many patterns or paths per call; ls, cat, grep and find in the terminal do not.
+ - **Edit in one batch.** Make all the edits you already know in one response.
+ - **Check in one batch.** Run the checks in the same response as your last edits, as one terminal command that runs every check the change needs (for example each touched package's typecheck and the tests that cover the change), each with its exit status echoed and not piped into head or tail.
+-- **Stop when it is done.** Once the request is met and its checks pass, or the question is answered, give the final message.`
++- **Stop when it is done.** Once every part of the request is done and its checks pass, or the question is answered, give the final message.`
+ 
+ /**
+  * The models the section and its reminder are measured to help: on DeepSeek
+  * V4.1 Flash they finished sooner at the same score. On GPT-6 Luna the section
+  * bought no time, and on MiMo v2.5 it cost score, so both keep base3's prompt
+  * as it was (docs/benchmarks/base3-batched/README.md). Add a model only with a
+  * paired buffbench run on it that also checks its cache hit: the reminder
+  * comes with the section.
+  */
+ const BATCHING_MODELS = [
+   FREEBUFF_DEEPSEEK_V4_FLASH_MODEL_ID,
+   // The same model in fast mode, on a lane in front of DeepSeek's own API,
+   // which caches partial prefixes as Flash's lanes do.
+   FREEBUFF_DEEPSEEK_V4_FLASH_FAST_MODEL_ID,
+ ]
+ 
+ /**
+  * The models that end a turn on a status line or a plan instead of calling the
+  * tool that does the work, and so get TURN_ENDING_NOTE as `instructionsPrompt`
+  * — the rule again, right after every user message. The system prompt's
+  * TURN_ENDING_RULE alone does not stop them (docs/freebuff-muse-spark.md).
+  * Every copy stays in history, so the cached prefix only grows.
+  *
+  * Muse Spark 1.3 has been here since 2026-10-11, and the note measurably
+  * worked: across the Desktop 0.0.171 -> 0.0.172 boundary its short
+@@ -185,51 +191,51 @@ export function createBase3(
+     // rate. The server skips it where it reads the user's own words
+     // (`isRootStepReminderMessage`).
+     ...(batching ? { stepPrompt: BASE3_BATCHING_STEP_PROMPT } : {}),
+     toolNames: [
+       'read_files',
+       'str_replace',
+       'write_file',
+       'run_terminal_command',
+       'code_search',
+       'glob',
+       'list_directory',
+       ...(options.workspace ? [] : ['write_todos'] as const),
+     ],
+ 
+     // No deadline, time-budget or "minimal result early" wording: no product
+     // host gives the model a deadline, and that wording made models invent
+     // one and stop short. A host with a real deadline passes `deadlineAt`; the
+     // runtime then states it.
+     systemPrompt: `You are Buffy, the coding agent behind Codebuff. You help users with software engineering tasks: fixing bugs, adding functionality, refactoring, and explaining code.
+ 
+ Current date: ${PLACEHOLDER.CURRENT_DATE}.
+ 
+ - Size the work to the request. Do everything the user asked for, completely, and nothing they did not: no unrequested features, refactors, new files, dependencies or polish. A question gets an answer, not a change. A small or specific request gets a direct fix, without a plan, a to-do list or a survey of the codebase.
+ - ${options.workspace ? WORKSPACE_QUESTION_GUIDANCE : 'When a request is open-ended or high-level ("build me an app", "improve the onboarding", "make this faster") and reasonable readings differ in size or direction, settle the scope yourself, build the smallest version that meets the goal, then name the main choices you made and what could come next. Do not build the largest version you can imagine.'}
+ - Match the project's existing conventions. Verify a library is already used in the project before employing it.
+-- Prefer editing existing files over creating new ones. Make the fewest changes that address the request.
++- Prefer editing existing files over creating new ones. Make the fewest changes that fully address the request.
+ - Note the request's explicit requirements (exact output paths, file names, interfaces, schemas, formats, performance or resource constraints) and check the result against them before finishing.
+ - For performance work, do not claim a speedup without a measurement.
+ - Verify the final edited files: after a repair, rerun the affected checks; earlier passing results do not cover later changes. When filtering test or build output through a pipeline, preserve the tested command's exit status (for example, Bash pipefail or explicit status capture), and inspect the failure output.
+ - Take screenshots or drive a browser for visual inspection only when the user explicitly asks for a screenshot or a visual check.
+ - Fix the cause of a failing check. Do not skip tests, weaken assertions, swallow errors, or add type/lint suppressions just to make verification pass. If such a change is required by the requested behavior, explain why and verify that behavior. Report checks that failed or could not run as limitations, never as passes.
+ - ${options.supportsBackgroundCommands === false ? 'Terminal commands support only SYNC on this host. Use the host-managed preview controls for persistent services; do not request BACKGROUND or use shell backgrounding. Split other long jobs into bounded commands.' : 'Use BACKGROUND for persistent services or long jobs, inspect their logs and readiness, and verify they are still running when required. Do not assume shell backgrounding inside a SYNC command survives tool cleanup.'}
+ ${options.workspace ? '' : '- Use write_todos only for work with several distinct steps, and list only the steps the request needs, never extras you might add. The user watches the list as your live progress: each time you finish an item, call write_todos again with it marked completed before you start the next one, rather than marking everything done at the end.\n'}- When the work is done, finish every tool call first${options.workspace ? '' : ' (including marking your last to-do completed)'}, then end with a self-contained final message. Do not point back to earlier messages ("as above"); the user may see only this one.
+ - ${TURN_ENDING_RULE}
+ - Don't run destructive or hard-to-undo commands (git push, resets, deploys) unless the user asks for them.
+ - Stay inside the project folder. Do not read, list or search files outside it (the home directory, other projects, app or system folders) unless the user gave you that exact path or asked you to look there, and then only that path, not its parent or sibling folders. If the task seems to need anything else outside the project, ask the user first.
+ 
+ ${AGENT_PROGRESS_GUIDANCE}
+ 
+ When a progress update is warranted and more work remains, put it before the next tool call in the same response so the update does not end the turn.
+ 
+ ${AGENT_VERIFICATION_GUIDANCE}
+ 
+ ${PLACEHOLDER.KNOWLEDGE_FILES_CONTENTS}
+ 
+ ${PLACEHOLDER.GIT_CHANGES_PROMPT}
+ ${leanGuidance}${batching ? `\n${BATCHING_GUIDANCE}` : ''}`,
+   }
+ }
+ 
+ /**
+diff --git a/common/src/constants/base3-step-prompt.ts b/common/src/constants/base3-step-prompt.ts
+index a5ff463fd..eb40fdac5 100644
+--- a/common/src/constants/base3-step-prompt.ts
++++ b/common/src/constants/base3-step-prompt.ts
+@@ -1,7 +1,16 @@
+ /**
+  * base3's per-step batching reminder on DeepSeek V4.1 Flash (`stepPrompt`,
+  * agents/base3.ts). Here so the server can recognise it by its exact text
+  * (`isRootStepReminderMessage`, common/src/util/system-reminder.ts): it is the
+  * last user message of every such request, never the user's own words.
+  */
+-export const BASE3_BATCHING_STEP_PROMPT = `Work in batches: put every tool call you can already make into this response (all the searches you can think of, every file worth reading, all the edits you know with their checks in one command). Once the request is met, give the final message instead.`
++export const BASE3_BATCHING_STEP_PROMPT = `Work in batches: put every tool call you can already make into this response (all the searches you can think of, every file worth reading, all the edits you know with their checks in one command). Once every part of the request is done and checked, give the final message instead.`
++
++/**
++ * Earlier texts of the reminder, which released clients still send until they
++ * update. "Once the request is met" read as permission to stop with part of a
++ * larger change undone (docs/benchmarks/base3-batched/README.md, round 1).
++ */
++export const BASE3_BATCHING_STEP_PROMPT_PREVIOUS: readonly string[] = [
++  `Work in batches: put every tool call you can already make into this response (all the searches you can think of, every file worth reading, all the edits you know with their checks in one command). Once the request is met, give the final message instead.`,
++]
+diff --git a/common/src/util/__tests__/system-reminder.test.ts b/common/src/util/__tests__/system-reminder.test.ts
+index 19de57572..1755f981d 100644
+--- a/common/src/util/__tests__/system-reminder.test.ts
++++ b/common/src/util/__tests__/system-reminder.test.ts
+@@ -1,42 +1,57 @@
+ import { describe, expect, test } from 'bun:test'
+ 
+-import { BASE3_BATCHING_STEP_PROMPT } from '../../constants/base3-step-prompt'
++import {
++  BASE3_BATCHING_STEP_PROMPT,
++  BASE3_BATCHING_STEP_PROMPT_PREVIOUS,
++} from '../../constants/base3-step-prompt'
+ import {
+   isRootStepReminderMessage,
+   withSystemReminderTags,
+ } from '../system-reminder'
+ 
+ describe('root step reminders', () => {
+   const reminder = withSystemReminderTags(BASE3_BATCHING_STEP_PROMPT)
+ 
+   test('a root step reminder is recognised as it arrives', () => {
+     expect(isRootStepReminderMessage({ role: 'user', content: reminder })).toBe(true)
+     expect(
+       isRootStepReminderMessage({
+         role: 'user',
+         content: [{ type: 'text', text: reminder }],
+       }),
+     ).toBe(true)
+   })
+ 
++  test("released clients' earlier reminder texts are recognised too", () => {
++    expect(BASE3_BATCHING_STEP_PROMPT_PREVIOUS.length).toBeGreaterThan(0)
++    for (const text of BASE3_BATCHING_STEP_PROMPT_PREVIOUS) {
++      expect(
++        isRootStepReminderMessage({
++          role: 'user',
++          content: withSystemReminderTags(text),
++        }),
++      ).toBe(true)
++    }
++  })
++
+   test('nothing else passes for one, not even a prompt wrapped in its tags', () => {
+     expect(
+       isRootStepReminderMessage({
+         role: 'user',
+         content: withSystemReminderTags('a script shared by many accounts'),
+       }),
+     ).toBe(false)
+     expect(isRootStepReminderMessage({ role: 'user', content: 'fix the bug' })).toBe(false)
+     expect(
+       isRootStepReminderMessage({
+         role: 'user',
+         content: [
+           { type: 'text', text: reminder },
+           { type: 'image_url', image_url: { url: 'data:image/png;base64,' } },
+         ],
+       }),
+     ).toBe(false)
+     expect(isRootStepReminderMessage({ role: 'assistant', content: reminder })).toBe(false)
+     expect(isRootStepReminderMessage(null)).toBe(false)
+   })
+ })
+diff --git a/common/src/util/system-reminder.ts b/common/src/util/system-reminder.ts
+index 6ddadf61f..2b0ee85db 100644
+--- a/common/src/util/system-reminder.ts
++++ b/common/src/util/system-reminder.ts
+@@ -1,40 +1,45 @@
+-import { BASE3_BATCHING_STEP_PROMPT } from '../constants/base3-step-prompt'
++import {
++  BASE3_BATCHING_STEP_PROMPT,
++  BASE3_BATCHING_STEP_PROMPT_PREVIOUS,
++} from '../constants/base3-step-prompt'
+ 
+ /**
+  * How the agent runtime frames an agent's step prompt: a user message of its
+  * own, wrapped so the model does not read it as the user speaking again
+  * (packages/agent-runtime/src/templates/strings.ts).
+  */
+ export function withSystemReminderTags(text: string): string {
+   return `<system_reminder>${text}</system_reminder>`
+ }
+ 
+-/** Our roots' step reminders, as they arrive. */
+-const ROOT_STEP_REMINDERS: ReadonlySet<string> = new Set([
+-  withSystemReminderTags(BASE3_BATCHING_STEP_PROMPT),
+-])
++/** Our roots' step reminders, as they arrive, older clients' texts included. */
++const ROOT_STEP_REMINDERS: ReadonlySet<string> = new Set(
++  [BASE3_BATCHING_STEP_PROMPT, ...BASE3_BATCHING_STEP_PROMPT_PREVIOUS].map(
++    withSystemReminderTags,
++  ),
++)
+ 
+ /**
+  * A user message that is exactly one of our roots' step reminders: the last
+  * message of every request on base3 batching (agents/base3.ts), and never the
+  * user's own words. Matched by its whole text, never by its tags alone, so a
+  * prompt cannot pass for one by wrapping itself in them.
+  */
+ export function isRootStepReminderMessage(message: unknown): boolean {
+   const { role, content } = (message ?? {}) as {
+     role?: unknown
+     content?: unknown
+   }
+   if (role !== 'user') return false
+   let text: string
+   if (typeof content === 'string') {
+     text = content
+   } else if (Array.isArray(content)) {
+     const parts = content as { type?: unknown; text?: unknown }[]
+     if (!parts.every((part) => part?.type === 'text')) return false
+     text = parts.map((part) => String(part.text ?? '')).join('')
+   } else {
+     return false
+   }
+   return ROOT_STEP_REMINDERS.has(text.trim())
+ }
+diff --git a/packages/agent-runtime/src/util/turn-progress.ts b/packages/agent-runtime/src/util/turn-progress.ts
+index 66117ff76..6600d4b87 100644
+--- a/packages/agent-runtime/src/util/turn-progress.ts
++++ b/packages/agent-runtime/src/util/turn-progress.ts
+@@ -1,42 +1,48 @@
+ import { TOOLS_WHICH_WONT_FORCE_NEXT_STEP } from '@codebuff/common/tools/constants'
+ import { createHash } from 'crypto'
+ 
+ import { isRejectedEdit } from './file-edit-loop'
+ import { FILE_MUTATING_TOOL_NAMES } from './truncated-write-guard'
+ 
+ import type { ToolMessage } from '@codebuff/common/types/messages/codebuff-message'
+ 
+ /**
+  * Consecutive model steps with no progress that end a root turn. Far above the
+  * identical-call guards' thresholds because it matches a broader shape, so a
+  * false stop has to be much less likely, and a model polling a slow build with
+  * unchanged output has to survive it.
+  */
+ export const NO_PROGRESS_STOP_THRESHOLD = 40
+ 
+-export const NO_PROGRESS_STOP_MESSAGE = `I stopped here because my last ${NO_PROGRESS_STOP_THRESHOLD} steps changed no files and returned nothing new, so carrying on would only spend your session. This task is not finished. Tell me what to try differently, or switch model, and I'll pick it up from here.`
++/**
++ * Shown to the user and kept in history as the model's own words, so it gives
++ * the model no cost reason to stop: "carrying on would only spend your
++ * session" taught it, in its own voice, that a task can be left unfinished to
++ * save the session.
++ */
++export const NO_PROGRESS_STOP_MESSAGE = `I stopped here because my last ${NO_PROGRESS_STOP_THRESHOLD} steps changed no files and returned nothing new. This task is not finished. Tell me what to try differently, or switch model, and I'll pick it up from here.`
+ 
+ /** Bookkeeping, not work: a new to-do list is not a new fact about the task. */
+ const BOOKKEEPING_TOOLS: ReadonlySet<string> = new Set([
+   ...TOOLS_WHICH_WONT_FORCE_NEXT_STEP,
+   'write_todos',
+ ])
+ 
+ export type StepToolCall = {
+   toolCallId: string
+   toolName: string
+   input: unknown
+ }
+ 
+ /**
+  * Counts the consecutive steps of one turn that made no progress. A step makes
+  * progress when it changes a file, or when a tool returns something this turn
+  * has not seen: the same tool, input and output is not news, and anything else
+  * is. So a long reading stretch never counts, and neither does output that
+  * moves while a command is polled.
+  *
+  * Deliberately generous, because what it misses still ends at the step ceiling:
+  *  - An accepted edit is progress even if the next one undoes it.
+  *  - A rejected edit is never progress, however it varies: nothing changed.
+  *  - Results from before this turn are unknown, so re-reading them is news.
+  */
