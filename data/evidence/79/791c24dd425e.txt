@@ -1,0 +1,662 @@
+Date: 2026-11-04T05:08:58Z
+Category: Core
+Areas: Shared/Core
+Commit nature: production
+Stats: +140 / -5
+Analysis notes: New files: `common/src/mcp/server-url.ts`.
+Added files: common/src/mcp/server-url.ts
+Modified files: common/src/desktop-cloud/custom-mcp.ts, common/src/mcp/client.ts
+Key facts (ground the WHY and DETAIL sentences in these): - Supply the scheme people leave off (`example.com/mcp`) before every check below. - Checked first so it is the message shown. Wording only: the public-address check that actually keeps Cloud off private networks is the transport's, and runs regardless. - Zod still runs this after `.url()` fails; a throw here would escape `safeParse`. - The address a remote entry connects to. `mcp.json` often carries a bare `example.com/mcp`. - Users paste MCP server addresses the way they type them into a browser: `mcp.example.com/sse`, `example.com/mcp`, `localhost:3000/mcp`. `new URL` rejects the first two and misreads the last as a URL with the scheme `localhost:`, so every surface failed with "not a valid URL". - This only supplies a missing scheme. It never removes or changes one the user typed, so each surface's own scheme, host and SSRF checks run unchanged on the result: `javascript:`, `file:` and `ftp:` URLs come back as given and are rejected there, as before.
+Structured facts (extracted mechanically from the diff; copy names and values verbatim, never round or rename):
+- Constants newly defined: LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]']) ; HOST_WITH_PORT = /^[^\s/:?#]+:\d+(?:[/?#]|$)/ (a definition alone changes nothing at runtime; if the diff shows no reader, say it is in place and does nothing yet)
+- Exports added: remoteMcpUrl, normalizeMcpServerUrl
+- Behavior asserted by new tests (test titles, verbatim; the hunks themselves are omitted): "normalizeMcpServerUrl" ; "leaves empty and unparseable input for the caller to reject" ; "remoteMcpUrl" ; "connects a bare host over https and keeps params" ; "refuses a scheme that is not http(s)"
+Module & File Purpose (ground-truth documentation from touched files):
+- File `common/src/mcp/client.ts`:
+```
+// Cap on how much of a failed stdio server's stderr we retain for the error
+// message — enough to show the real failure without unbounded growth.
+```
+- File `common/src/mcp/server-url.ts`:
+```
+// Users paste MCP server addresses the way they type them into a browser: `mcp.example.com/sse`,
+// `example.com/mcp`, `localhost:3000/mcp`. `new URL` rejects the first two and misreads the last
+// as a URL with the scheme `localhost:`, so every surface failed with "not a valid URL".
+//
+// This only supplies a missing scheme. It never removes or changes one the user typed, so each
+// surface's own scheme, host and SSRF checks run unchanged on the result: `javascript:`, `file:`
+// and `ftp:` URLs come back as given and are rejected there, as before.
+```
+Complete Source of Modified Files (for complete module context):
+- File `common/src/desktop-cloud/custom-mcp.ts` (77 lines):
+```
+import { z } from 'zod/v4'
+
+import { normalizeMcpServerUrl } from '../mcp/server-url'
+
+export const CUSTOM_MCP_LIMIT = 20
+export const customMcpInputSchema = z
+  .object({
+    name: z
+      .string()
+      .trim()
+      .min(1)
+      .max(80)
+      .regex(/^[\p{L}\p{N} _.-]+$/u),
+    url: z
+      .string()
+      // Supply the scheme people leave off (`example.com/mcp`) before every check below.
+      .overwrite(normalizeMcpServerUrl)
+      .url()
+      .max(2048)
+      // Checked first so it is the message shown. Wording only: the public-address check that
+      // actually keeps Cloud off private networks is the transport's, and runs regardless.
+      .refine((value) => {
+        if (!URL.canParse(value)) return true
+        const host = new URL(value).hostname
+        return !(
+          host === 'localhost' ||
+          host.endsWith('.localhost') ||
+          host === '[::1]' ||
+          host === '0.0.0.0' ||
+          /^127\./.test(host)
+        )
+      }, 'Cloud can’t reach a server on your own computer. Use a public HTTPS URL, or add local servers in the CLI.')
+      .refine((value) => {
+        // Zod still runs this after `.url()` fails; a throw here would escape `safeParse`.
+        if (!URL.canParse(value)) return false
+        const url = new URL(value)
+        return (
+          url.protocol === 'https:' &&
+          !url.username &&
+          !url.password &&
+          !url.hash &&
+          !url.search &&
+          (!url.port || url.port === '443')
+        )
+      }, 'Use a public HTTPS URL without credentials or query parameters'),
+    token: z
+      .string()
+      .trim()
+      .max(8192)
+      .regex(/^[^\r\n]*$/)
+      .optional(),
+  })
+  .strict()
+export const customMcpApprovalSchema = z
+  .object({
+    manifestHash: z.string().regex(/^sha256:[a-f0-9]{64}$/),
+    tools: z.array(z.string().min(1).max(200)).max(200),
+  })
+  .strict()
+
+export type CustomMcpTool = {
+  name: string
+  description: string
+  inputSchema: Record<string, unknown>
+  annotations?: { readOnlyHint?: boolean; destructiveHint?: boolean }
+}
+export type CustomMcpServer = {
+  id: string
+  name: string
+  url: string
+  enabled: boolean
+  manifestHash: string
+  tools: CustomMcpTool[]
+  approvedTools: string[]
+}
+export type CustomMcpInput = z.infer<typeof customMcpInputSchema>
+```
+- File `common/src/mcp/client.ts` (202 lines):
+```
+import { Client } from '@modelcontextprotocol/sdk/client/index.js'
+import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js'
+import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
+import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
+
+import { getErrorObject } from '../util/error'
+import { mcpContentToToolResultOutputs } from './content-mapping'
+import { normalizeMcpServerUrl } from './server-url'
+
+import type { MCPConfig } from '../types/mcp'
+import type { ToolResultOutput } from '../types/messages/content-part'
+import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js'
+import type {
+  CallToolResult,
+} from '@modelcontextprotocol/sdk/types.js'
+
+// Cap on how much of a failed stdio server's stderr we retain for the error
+// message — enough to show the real failure without unbounded growth.
+const STDERR_BUFFER_CAP = 8192
+
+const runningClients: Record<string, Client> = {}
+const listToolsCache: Record<
+  string,
+  ReturnType<typeof Client.prototype.listTools>
+> = {}
+
+/**
+ * Substitutes environment variable references ($VAR_NAME) in a string with their values.
+ * Supports both simple replacement ("$VAR_NAME") and interpolation ("Bearer $VAR_NAME").
+ */
+function substituteEnvInValue(value: string): string {
+  return value.replace(/\$([A-Z_][A-Z0-9_]*)/g, (match, varName) => {
+    const envValue = process.env[varName]
+    if (envValue === undefined) {
+      // Return original if env var not found
+      return match
+    }
+    return envValue
+  })
+}
+
+/**
+ * Substitutes environment variable references in all values of a record.
+ */
+function substituteEnvInRecord(
+  record: Record<string, string>,
+): Record<string, string> {
+  const result: Record<string, string> = {}
+  for (const [key, value] of Object.entries(record)) {
+    result[key] = substituteEnvInValue(value)
+  }
+  return result
+}
+
+function hashConfig(config: MCPConfig): string {
+  if (config.type === 'stdio') {
+    return JSON.stringify({
+      command: config.command,
+      args: config.args,
+      env: config.env,
+    })
+  }
+  if (config.type === 'http') {
+    return JSON.stringify({
+      type: 'http',
+      url: config.url,
+      params: config.params,
+    })
+  }
+  if (config.type === 'sse') {
+    return JSON.stringify({
+      type: 'sse',
+      url: config.url,
+      params: config.params,
+    })
+  }
+  config.type satisfies never
+  throw new Error(
+    `Internal error in hashConfig: invalid MCP config type ${config.type}`,
+  )
+}
+
+/** The address a remote entry connects to. `mcp.json` often carries a bare `example.com/mcp`. */
+export function remoteMcpUrl(
+  config: Extract<MCPConfig, { url: string }>,
+): URL {
+  const url = new URL(normalizeMcpServerUrl(config.url))
+  if (url.protocol !== 'https:' && url.protocol !== 'http:')
+    throw new Error(
+      `MCP server url must use https (or http), got ${url.protocol} in ${config.url}`,
+    )
+  for (const [key, value] of Object.entries(config.params)) {
+    url.searchParams.set(key, value)
+  }
+  return url
+}
+
+export async function getMCPClient(config: MCPConfig): Promise<string> {
+  let key = hashConfig(config)
+  if (key in runningClients) {
+    return key
+  }
+
+  let transport: Transport
+  // Buffer the child process's stderr so that a server which crashes during
+  // startup produces an actionable error instead of the opaque MCP SDK message
+  // "MCP error -32000: Connection closed".
+  let stderrBuffer = ''
+  if (config.type === 'stdio') {
+    const stdioTransport = new StdioClientTransport({
+      command: config.command,
+      args: config.args,
+      env: substituteEnvInRecord(config.env),
+      stderr: 'pipe',
+    })
+    // When stderr is 'pipe' the SDK exposes a PassThrough immediately (before
+    // the process is spawned), so attaching here captures even early output
+    // from a child that dies during the connection handshake.
+    stdioTransport.stderr?.on('data', (chunk: Buffer) => {
+      if (stderrBuffer.length < STDERR_BUFFER_CAP) {
+        stderrBuffer += chunk.toString('utf8')
+      }
+    })
+    transport = stdioTransport
+  } else {
+    const url = remoteMcpUrl(config)
+    const headers = substituteEnvInRecord(config.headers)
+    if (config.type === 'http') {
+      transport = new StreamableHTTPClientTransport(url, {
+        requestInit: {
+          headers,
+        },
+      })
+    } else if (config.type === 'sse') {
+      transport = new SSEClientTransport(url, {
+        requestInit: {
+          headers,
+        },
+      })
+    } else {
+      config.type satisfies never
+      throw new Error(`Internal error: invalid MCP config type ${config.type}`)
+    }
+  }
+
+  const client = new Client({
+    name: 'codebuff',
+    version: '1.0.0',
+  })
+
+  try {
+    await client.connect(transport)
+  } catch (error) {
+    const baseMessage = getErrorObject(error).message
+    if (config.type === 'stdio') {
+      const commandStr = [config.command, ...(config.args ?? [])].join(' ')
+      const detail = stderrBuffer.trim()
+      throw new Error(
+        `${baseMessage}. Failed to start MCP server via \`${commandStr}\`. ` +
+          `Ensure the command is installed and runnable (e.g. an up-to-date ` +
+          `node/npm/npx, or python/uvx) and that any required env vars are set.` +
+          (detail ? `\nServer stderr:\n${detail}` : ''),
+      )
+    }
+    throw new Error(
+      `${baseMessage}. Failed to connect to MCP server at ${config.url}.`,
+    )
+  }
+  runningClients[key] = client
+
+  return key
+}
+
+export function listMCPTools(
+  clientId: string,
+  ...args: Parameters<typeof Client.prototype.listTools>
+): ReturnType<typeof Client.prototype.listTools> {
+  const client = runningClients[clientId]
+  if (!client) {
+    throw new Error(`listTools: client not found with id: ${clientId}`)
+  }
+  if (!listToolsCache[clientId]) {
+    listToolsCache[clientId] = client.listTools(...args)
+  }
+  return listToolsCache[clientId]
+}
+
+export async function callMCPTool(
+  clientId: string,
+  ...args: Parameters<typeof Client.prototype.callTool>
+): Promise<ToolResultOutput[]> {
+  const client = runningClients[clientId]
+  if (!client) {
+    throw new Error(`callTool: client not found with id: ${clientId}`)
+  }
+  const callResult = await client.callTool(...args)
+  const result = callResult as CallToolResult
+  const content = result.content
+
+  return mcpContentToToolResultOutputs(content)
+}
+```
+- File `common/src/mcp/server-url.ts` (35 lines):
+```
+// Users paste MCP server addresses the way they type them into a browser: `mcp.example.com/sse`,
+// `example.com/mcp`, `localhost:3000/mcp`. `new URL` rejects the first two and misreads the last
+// as a URL with the scheme `localhost:`, so every surface failed with "not a valid URL".
+//
+// This only supplies a missing scheme. It never removes or changes one the user typed, so each
+// surface's own scheme, host and SSRF checks run unchanged on the result: `javascript:`, `file:`
+// and `ftp:` URLs come back as given and are rejected there, as before.
+
+const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]'])
+
+/** `name:` followed by digits and then the end, a path, a query or a fragment is a port, not a scheme. */
+const HOST_WITH_PORT = /^[^\s/:?#]+:\d+(?:[/?#]|$)/
+const SCHEME = /^[a-z][a-z0-9+.-]*:/i
+
+/**
+ * Trims `raw` and, when it has no scheme, prefixes `https://` — or `http://` for a loopback host,
+ * the only place plain HTTP is allowed and where local MCP servers almost always listen.
+ * A value that already has a scheme is returned trimmed and otherwise untouched.
+ */
+export function normalizeMcpServerUrl(raw: string): string {
+  const value = raw.trim()
+  if (!value) return value
+  if (value.startsWith('//')) return `https:${value}`
+  if (SCHEME.test(value) && !HOST_WITH_PORT.test(value)) return value
+
+  let hostname: string
+  try {
+    hostname = new URL(`https://${value}`).hostname
+  } catch {
+    // Not a URL with any scheme; leave it for the caller's validation to report.
+    return value
+  }
+  return `${LOOPBACK_HOSTS.has(hostname) ? 'http' : 'https'}://${value}`
+}
+```
+Where the symbols this change introduces are used elsewhere, at this same revision (the code that reads them; this is evidence for the WHAT and the WHY, and it is the only source for who consumes this change):
+- File `common/src/mcp/__tests__/server-url.test.ts` (10 matching lines):
+```
+import { describe, expect, test } from 'bun:test'
+
+import { remoteMcpUrl } from '../client'
+import { normalizeMcpServerUrl } from '../server-url'
+
+describe('normalizeMcpServerUrl', () => {
+  test.each([
+    ['bare host', 'mcp.example.com', 'https://mcp.example.com'],
+    ['host and path', 'example.com/mcp', 'https://example.com/mcp'],
+    ['host and sse path', 'mcp.example.com/sse', 'https://mcp.example.com/sse'],
+    ['host and port', 'mcp.example.com:8443/mcp', 'https://mcp.example.com:8443/mcp'],
+    ['host and port only', 'mcp.example.com:8443', 'https://mcp.example.com:8443'],
+    ['query kept', 'example.com/mcp?tenant=acme', 'https://example.com/mcp?tenant=acme'],
+    ['protocol-relative', '//example.com/mcp', 'https://example.com/mcp'],
+    ['localhost', 'localhost:3000/mcp', 'http://localhost:3000/mcp'],
+    ['bare localhost', 'localhost', 'http://localhost'],
+    ['IPv4 loopback', '127.0.0.1:8080/mcp', 'http://127.0.0.1:8080/mcp'],
+    ['IPv6 loopback', '[::1]:8080/mcp', 'http://[::1]:8080/mcp'],
+```
+Tests this commit changed (added lines only; the assertions are what the change is expected to do, not a description of the feature):
+- File `common/src/mcp/__tests__/server-url.test.ts`: "normalizeMcpServerUrl"; "leaves empty and unparseable input for the caller to reject"; "remoteMcpUrl"; "connects a bare host over https and keeps params"; "refuses a scheme that is not http(s)"
+```
+import { describe, expect, test } from 'bun:test'
+import { remoteMcpUrl } from '../client'
+import { normalizeMcpServerUrl } from '../server-url'
+describe('normalizeMcpServerUrl', () => {
+  test.each([
+    ['bare host', 'mcp.example.com', 'https://mcp.example.com'],
+    ['host and path', 'example.com/mcp', 'https://example.com/mcp'],
+    ['host and sse path', 'mcp.example.com/sse', 'https://mcp.example.com/sse'],
+    ['host and port', 'mcp.example.com:8443/mcp', 'https://mcp.example.com:8443/mcp'],
+    ['host and port only', 'mcp.example.com:8443', 'https://mcp.example.com:8443'],
+    ['query kept', 'example.com/mcp?tenant=acme', 'https://example.com/mcp?tenant=acme'],
+    ['protocol-relative', '//example.com/mcp', 'https://example.com/mcp'],
+    ['localhost', 'localhost:3000/mcp', 'http://localhost:3000/mcp'],
+    ['bare localhost', 'localhost', 'http://localhost'],
+    ['IPv4 loopback', '127.0.0.1:8080/mcp', 'http://127.0.0.1:8080/mcp'],
+    ['IPv6 loopback', '[::1]:8080/mcp', 'http://[::1]:8080/mcp'],
+    ['non-loopback IP', '10.0.0.5:8080/mcp', 'https://10.0.0.5:8080/mcp'],
+    ['surrounding whitespace', '  \texample.com/mcp \n', 'https://example.com/mcp'],
+  ])('adds a scheme: %s', (_name, input, expected) => {
+    expect(normalizeMcpServerUrl(input)).toBe(expected)
+  })
+  test.each([
+    ['https', 'https://example.com/mcp'],
+    ['uppercase https', 'HTTPS://example.com/mcp'],
+    ['http on a public host', 'http://example.com/mcp'],
+    ['http on localhost', 'http://localhost:3000/mcp'],
+    ['https on localhost', 'https://localhost:3000/mcp'],
+  ])('keeps a typed scheme: %s', (_name, input) => {
+    expect(normalizeMcpServerUrl(` ${input} `)).toBe(input)
+  })
+  // Returned as given, so each surface's scheme check rejects them exactly as it did before.
+  test.each([
+    'javascript:alert(1)',
+    'file:///etc/passwd',
+    'ftp://example.com/mcp',
+    'data:text/html,hi',
+    'ws://example.com/mcp',
+  ])('never rewrites another scheme: %s', (input) => {
+    expec
+```
+Diff (source hunks; lockfiles and pure test hunks omitted, except in a lockfile-only commit):
+```diff
+diff --git a/common/src/desktop-cloud/custom-mcp.ts b/common/src/desktop-cloud/custom-mcp.ts
+index 56b28b2f4..4757597a3 100644
+--- a/common/src/desktop-cloud/custom-mcp.ts
++++ b/common/src/desktop-cloud/custom-mcp.ts
+@@ -1,42 +1,60 @@
+ import { z } from 'zod/v4'
+ 
++import { normalizeMcpServerUrl } from '../mcp/server-url'
++
+ export const CUSTOM_MCP_LIMIT = 20
+ export const customMcpInputSchema = z
+   .object({
+     name: z
+       .string()
+       .trim()
+       .min(1)
+       .max(80)
+       .regex(/^[\p{L}\p{N} _.-]+$/u),
+     url: z
+       .string()
+-      .trim()
++      // Supply the scheme people leave off (`example.com/mcp`) before every check below.
++      .overwrite(normalizeMcpServerUrl)
+       .url()
+       .max(2048)
++      // Checked first so it is the message shown. Wording only: the public-address check that
++      // actually keeps Cloud off private networks is the transport's, and runs regardless.
++      .refine((value) => {
++        if (!URL.canParse(value)) return true
++        const host = new URL(value).hostname
++        return !(
++          host === 'localhost' ||
++          host.endsWith('.localhost') ||
++          host === '[::1]' ||
++          host === '0.0.0.0' ||
++          /^127\./.test(host)
++        )
++      }, 'Cloud can’t reach a server on your own computer. Use a public HTTPS URL, or add local servers in the CLI.')
+       .refine((value) => {
++        // Zod still runs this after `.url()` fails; a throw here would escape `safeParse`.
++        if (!URL.canParse(value)) return false
+         const url = new URL(value)
+         return (
+           url.protocol === 'https:' &&
+           !url.username &&
+           !url.password &&
+           !url.hash &&
+           !url.search &&
+           (!url.port || url.port === '443')
+         )
+       }, 'Use a public HTTPS URL without credentials or query parameters'),
+     token: z
+       .string()
+       .trim()
+       .max(8192)
+       .regex(/^[^\r\n]*$/)
+       .optional(),
+   })
+   .strict()
+ export const customMcpApprovalSchema = z
+   .object({
+     manifestHash: z.string().regex(/^sha256:[a-f0-9]{64}$/),
+     tools: z.array(z.string().min(1).max(200)).max(200),
+   })
+   .strict()
+ 
+diff --git a/common/src/mcp/client.ts b/common/src/mcp/client.ts
+index 31b87bdc2..98b53ae04 100644
+--- a/common/src/mcp/client.ts
++++ b/common/src/mcp/client.ts
+@@ -1,32 +1,33 @@
+ import { Client } from '@modelcontextprotocol/sdk/client/index.js'
+ import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js'
+ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
+ import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
+ 
+ import { getErrorObject } from '../util/error'
+ import { mcpContentToToolResultOutputs } from './content-mapping'
++import { normalizeMcpServerUrl } from './server-url'
+ 
+ import type { MCPConfig } from '../types/mcp'
+ import type { ToolResultOutput } from '../types/messages/content-part'
+ import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js'
+ import type {
+   CallToolResult,
+ } from '@modelcontextprotocol/sdk/types.js'
+ 
+ // Cap on how much of a failed stdio server's stderr we retain for the error
+ // message — enough to show the real failure without unbounded growth.
+ const STDERR_BUFFER_CAP = 8192
+ 
+ const runningClients: Record<string, Client> = {}
+ const listToolsCache: Record<
+   string,
+   ReturnType<typeof Client.prototype.listTools>
+ > = {}
+ 
+ /**
+  * Substitutes environment variable references ($VAR_NAME) in a string with their values.
+  * Supports both simple replacement ("$VAR_NAME") and interpolation ("Bearer $VAR_NAME").
+  */
+ function substituteEnvInValue(value: string): string {
+   return value.replace(/\$([A-Z_][A-Z0-9_]*)/g, (match, varName) => {
+     const envValue = process.env[varName]
+@@ -57,82 +58,94 @@ function hashConfig(config: MCPConfig): string {
+       command: config.command,
+       args: config.args,
+       env: config.env,
+     })
+   }
+   if (config.type === 'http') {
+     return JSON.stringify({
+       type: 'http',
+       url: config.url,
+       params: config.params,
+     })
+   }
+   if (config.type === 'sse') {
+     return JSON.stringify({
+       type: 'sse',
+       url: config.url,
+       params: config.params,
+     })
+   }
+   config.type satisfies never
+   throw new Error(
+     `Internal error in hashConfig: invalid MCP config type ${config.type}`,
+   )
+ }
+ 
++/** The address a remote entry connects to. `mcp.json` often carries a bare `example.com/mcp`. */
++export function remoteMcpUrl(
++  config: Extract<MCPConfig, { url: string }>,
++): URL {
++  const url = new URL(normalizeMcpServerUrl(config.url))
++  if (url.protocol !== 'https:' && url.protocol !== 'http:')
++    throw new Error(
++      `MCP server url must use https (or http), got ${url.protocol} in ${config.url}`,
++    )
++  for (const [key, value] of Object.entries(config.params)) {
++    url.searchParams.set(key, value)
++  }
++  return url
++}
++
+ export async function getMCPClient(config: MCPConfig): Promise<string> {
+   let key = hashConfig(config)
+   if (key in runningClients) {
+     return key
+   }
+ 
+   let transport: Transport
+   // Buffer the child process's stderr so that a server which crashes during
+   // startup produces an actionable error instead of the opaque MCP SDK message
+   // "MCP error -32000: Connection closed".
+   let stderrBuffer = ''
+   if (config.type === 'stdio') {
+     const stdioTransport = new StdioClientTransport({
+       command: config.command,
+       args: config.args,
+       env: substituteEnvInRecord(config.env),
+       stderr: 'pipe',
+     })
+     // When stderr is 'pipe' the SDK exposes a PassThrough immediately (before
+     // the process is spawned), so attaching here captures even early output
+     // from a child that dies during the connection handshake.
+     stdioTransport.stderr?.on('data', (chunk: Buffer) => {
+       if (stderrBuffer.length < STDERR_BUFFER_CAP) {
+         stderrBuffer += chunk.toString('utf8')
+       }
+     })
+     transport = stdioTransport
+   } else {
+-    const url = new URL(config.url)
+-    for (const [key, value] of Object.entries(config.params)) {
+-      url.searchParams.set(key, value)
+-    }
++    const url = remoteMcpUrl(config)
+     const headers = substituteEnvInRecord(config.headers)
+     if (config.type === 'http') {
+       transport = new StreamableHTTPClientTransport(url, {
+         requestInit: {
+           headers,
+         },
+       })
+     } else if (config.type === 'sse') {
+       transport = new SSEClientTransport(url, {
+         requestInit: {
+           headers,
+         },
+       })
+     } else {
+       config.type satisfies never
+       throw new Error(`Internal error: invalid MCP config type ${config.type}`)
+     }
+   }
+ 
+   const client = new Client({
+     name: 'codebuff',
+     version: '1.0.0',
+   })
+ 
+   try {
+diff --git a/common/src/mcp/server-url.ts b/common/src/mcp/server-url.ts
+new file mode 100644
+index 000000000..a23ddaf27
+--- /dev/null
++++ b/common/src/mcp/server-url.ts
+@@ -0,0 +1,34 @@
++// Users paste MCP server addresses the way they type them into a browser: `mcp.example.com/sse`,
++// `example.com/mcp`, `localhost:3000/mcp`. `new URL` rejects the first two and misreads the last
++// as a URL with the scheme `localhost:`, so every surface failed with "not a valid URL".
++//
++// This only supplies a missing scheme. It never removes or changes one the user typed, so each
++// surface's own scheme, host and SSRF checks run unchanged on the result: `javascript:`, `file:`
++// and `ftp:` URLs come back as given and are rejected there, as before.
++
++const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]'])
++
++/** `name:` followed by digits and then the end, a path, a query or a fragment is a port, not a scheme. */
++const HOST_WITH_PORT = /^[^\s/:?#]+:\d+(?:[/?#]|$)/
++const SCHEME = /^[a-z][a-z0-9+.-]*:/i
++
++/**
++ * Trims `raw` and, when it has no scheme, prefixes `https://` — or `http://` for a loopback host,
++ * the only place plain HTTP is allowed and where local MCP servers almost always listen.
++ * A value that already has a scheme is returned trimmed and otherwise untouched.
++ */
++export function normalizeMcpServerUrl(raw: string): string {
++  const value = raw.trim()
++  if (!value) return value
++  if (value.startsWith('//')) return `https:${value}`
++  if (SCHEME.test(value) && !HOST_WITH_PORT.test(value)) return value
++
++  let hostname: string
++  try {
++    hostname = new URL(`https://${value}`).hostname
++  } catch {
++    // Not a URL with any scheme; leave it for the caller's validation to report.
++    return value
++  }
++  return `${LOOPBACK_HOSTS.has(hostname) ? 'http' : 'https'}://${value}`
++}
+
+```
