@@ -1,0 +1,568 @@
+Date: 2026-11-05T05:06:52Z
+Category: Internal
+Areas: Evals
+Commit nature: production
+Stats: +22 / -1
+Analysis notes: Evals changes across 1 file(s) (+22/−1).
+Modified files: evals/buffbench/runners/codebuff.ts
+Key facts (ground the WHY and DETAIL sentences in these): - Luminal and DeepSeek direct, and scored 0.27 lower for it).
+Structured facts (extracted mechanically from the diff; copy names and values verbatim, never round or rename):
+- Exports added: withBenchDefaultReasoning
+Subsystem Architecture Documentation (from nearby package guides):
+- From `evals/buffbench/README.md`:
+```markdown
+# BuffBench
+
+BuffBench is Codebuff's evaluation framework for measuring AI coding agent performance through real-world git commit reconstruction tasks.
+
+## Overview
+
+BuffBench evaluates coding agents by having them reconstruct actual git commits from open source repositories. The system uses AI-powered judging to assess both the quality of implementation and the agent's problem-solving process.
+
+### Key Features
+
+- **Parallel Agent Comparison**: Run multiple agents simultaneously on the same tasks for direct performance comparison
+- **Trace Analysis**: Deep analysis of agent execution traces to understand decision-making patterns and workflows
+- **Meta-Analysis**: Aggregate analysis across all tasks to identify consistent strengths, weaknesses, and patterns
+- **Structured Output**: Judges use structured output for more reliable and consistent scoring
+- **Final Check Commands**: Run custom validation commands (tests, lints, etc.) after agent implementations
+- **Binary Installation**: Support for installing required binaries in isolated environments
+- **Enhanced Metrics**: Track completion score, code quality score, and overall score separately
+
+## Architecture
+
+### System Components
+
+1. **Evaluation Orchestration** (`run-buffbench.ts`)
+   - Manages the complete evaluation pipeline
+   - Handles parallel execution of multiple agents on multiple tasks
+   - Coordinates between agents, judges, and analyzers
+   - Saves comprehensive logs and traces
+
+2. **Agent Runner** (`agent-runner.ts`)
+   - Executes coding agents in isolated test repositories
+   - Captures execution traces and metrics
+   - Extracts git diffs and context files
+   - Runs optional validation commands
+
+3. **Judging System** (`judge.ts`)
+   - Uses AI (GPT-5) to score implementations
+   - Runs 2 parallel judges (GPT and Sonnet), averaging their scores and keeping the median judge's analysis; warns loudly if one fails, since a silently-dropped judge turns the panel into a single opinion
+   - Compares agent output against ground truth git diffs
+   - Provides detailed analysis with strengths and weaknesses
+   - Scores on three dimensions: completion, code quality, and overall
+
+4. **Trace Analyzer** (`trace-analyzer.ts`)
+   - Analyzes agent execution traces after each task
+   - Compares how different agents approached the same problem
+   - Identifies process strengths, weaknesses, and recommendations
+   - Focuses on agent workflows and decision-making patterns
+
+5. **Meta Analyzer** (`meta-analyzer.ts`)
+   - Performs aggregate analysis across all tasks
+   - Identifies consistent patterns in agent behavior
+   - Provides high-level insights and development priorities
+   - Compares agent configurations and their impact on performance
+
+6. **Evaluation Generation** (`gen-evals.ts`, `gen-repo-eval.ts`)
+   - Generates evaluation tasks from git commits
+   - Creates natural language prompts and specifications
+   - Extracts file diffs and supplemental context
+   - Supports batch processing of multiple commits
+
+### Evaluation Workflow
+
+```mermaid
+sequenceDiagram
+    participant Orchestrator as BuffBench Orchestrator
+    participant AgentRunner as Agent Runner
+    participant Agent as Coding Agent
+    participant Judge as AI Judge (3x)
+    participant TraceAnalyzer as Trace Analyzer
+    participant MetaAnalyzer as Meta Analyzer
+
+    loop For each task
+        Orchestrator->>AgentRunner: Run all agents in parallel
+        
+        par Agent 1
+            AgentRunner->>Agent: Execute with prompt
+            Agent->>AgentRunner: Return trace + changes
+        and Agent 2
+            AgentRunner->>Agent: Execute with prompt
+            Agent->>AgentRunner: Return trace + changes
+        end
+```
+Complete Source of Modified Files (for complete module context):
+- File `evals/buffbench/runners/codebuff.ts` (192 lines):
+```
+import { execSync } from 'child_process'
+import fs from 'fs'
+import path from 'path'
+
+import type { AgentStep, ContextLogEntry, Runner, RunnerResult } from './runner'
+import type { CodebuffClient, TerminalCommandBroker } from '@codebuff/sdk'
+
+const DEBUG_ERROR = true
+
+/**
+ * Runs the benchmarked agent at `high` reasoning, Freebuff's default, when it
+ * declares no `reasoningOptions`. The server applies that default only to
+ * free-mode requests and the bench is a normal caller, so without this each
+ * provider used its own default (on 2026-11-04 Pareto reasoned ~25% less than
+ * Luminal and DeepSeek direct, and scored 0.27 lower for it).
+ */
+export function withBenchDefaultReasoning(
+  definitions: any[],
+  agentId: string,
+): any[] {
+  return definitions.map((definition) =>
+    definition?.id === agentId && definition.reasoningOptions === undefined
+      ? { ...definition, reasoningOptions: { enabled: true, effort: 'high' } }
+      : definition,
+  )
+}
+
+export class CodebuffRunner implements Runner {
+  private cwd: string
+  private env?: Record<string, string>
+  private client: CodebuffClient
+  private agentId: string
+  private localAgentDefinitions: any[]
+  private printEvents: boolean
+  private commitId: string
+  private parentSha: string
+  private terminalCommandBroker?: TerminalCommandBroker
+  private overrideTools?: Parameters<CodebuffClient['run']>[0]['overrideTools']
+  private collectDiff: boolean
+
+  constructor(options: {
+    cwd: string
+    env?: Record<string, string>
+    client: CodebuffClient
+    agentId: string
+    localAgentDefinitions: any[]
+    printEvents: boolean
+    commitId: string
+    parentSha: string
+    terminalCommandBroker?: TerminalCommandBroker
+    overrideTools?: Parameters<CodebuffClient['run']>[0]['overrideTools']
+    collectDiff?: boolean
+  }) {
+    this.cwd = options.cwd
+    this.env = options.env
+    this.client = options.client
+    this.agentId = options.agentId
+    this.localAgentDefinitions = options.localAgentDefinitions
+    this.printEvents = options.printEvents
+    this.commitId = options.commitId
+    this.parentSha = options.parentSha
+    this.terminalCommandBroker = options.terminalCommandBroker
+    this.overrideTools = options.overrideTools
+    this.collectDiff = options.collectDiff ?? true
+  }
+
+  async run(prompt: string): Promise<RunnerResult> {
+    const steps: AgentStep[] = []
+    const contextLog: ContextLogEntry[] = []
+    let totalCostUsd = 0
+
+    // 500, not 40 (raised 2026-09-28). At 40 the single-loop base3 arm ran out
+    // of steps before its first edit in 1-5 of 10 tasks per run and scored 0
+    // with an empty diff, while the fan-out arm never came near the cap; the
+    // cap was deciding the comparison. 500 is a runaway guard only; the 60-min
+    // agent timeout in agent-runner.ts is the real bound.
+    const maxAgentSteps = 500
+    const result = await this.client.run({
+      agent: this.agentId,
+      prompt,
+      agentDefinitions: withBenchDefaultReasoning(
+        this.localAgentDefinitions,
+        this.agentId,
+      ),
+      cwd: this.cwd,
+      env: this.env,
+      terminalCommandBroker: this.terminalCommandBroker,
+      overrideTools: this.overrideTools,
+      fileFilter: (filePath) => ({
+        status:
+          path.isAbsolute(filePath) || filePath.split(/[\\/]/).includes('..')
+            ? 'blocked'
+            : 'allow',
+      }),
+      maxAgentSteps,
+      onUsage: (usage) => contextLog.push({ type: 'usage', ...usage }),
+      // The summary text is the history itself; the trace already has it.
+      onCompaction: ({ summary: _, ...data }) =>
+        contextLog.push({ type: 'compaction', ...data }),
+      handleEvent: (event) => {
+        if (
+          (event.type === 'tool_call' || event.type === 'tool_result') &&
+          event.toolName === 'set_messages'
+        ) {
+          return
+        }
+        if (event.type === 'error') {
+          console.error(
+            `[${this.commitId}:${this.agentId}] Error event:`,
+            event.message,
+          )
+          if (DEBUG_ERROR && !event.message.startsWith('Invalid JSON')) {
+            // Save errors in a file, but not tool calls with invalid json.
+            fs.writeFileSync(
+              path.join(
+                __dirname,
+                '..',
+                `${this.commitId}-${this.agentId}-error-${Math.random().toString(36).substring(2, 6)}.json`,
+              ),
+              JSON.stringify(
+                {
+                  error: event.message,
+                  trace: steps,
+                },
+                null,
+                2,
+              ),
+            )
+          }
+        } else if (this.printEvents) {
+          console.log(
+            `[${this.commitId}:${this.agentId}]`,
+            JSON.stringify(event, null, 2),
+          )
+        }
+        steps.push(event)
+      },
+    })
+
+    if (result.output.type === 'error') {
+      console.error(
+        `[${this.commitId}:${this.agentId}] Error:`,
+        result.output.message,
+      )
+      if (DEBUG_ERROR) {
+        // Save errors in a file, but not tool calls with invalid json.
+        fs.writeFileSync(
+          path.join(
+            __dirname,
+            '..',
+            `${this.commitId}-${this.agentId}-error-${Math.random().toString(36).substring(2, 6)}.json`,
+          ),
+          JSON.stringify(
+            {
+              ...result.output,
+              trace: steps,
+            },
+            null,
+            2,
+          ),
+        )
+      }
+    }
+
+    totalCostUsd = (result.sessionState?.mainAgentState.creditsUsed ?? 0) / 100
+
+    // Get git diff after Codebuff has made changes. Sponsored evals disable
+    // this host-side path and collect through their scrubbed OS broker instead.
+    let diff = ''
+    if (this.collectDiff) {
+      try {
+        execSync('git add .', { cwd: this.cwd, stdio: 'ignore' })
+        diff = execSync(`git diff ${this.parentSha}`, {
+          cwd: this.cwd,
+          encoding: 'utf-8',
+          maxBuffer: 10 * 1024 * 1024,
+        })
+      } catch {
+        // Ignore git errors
+      }
+    }
+
+    return {
+      steps,
+      totalCostUsd,
+      diff,
+      contextLog,
+      error: result.output.type === 'error' ? result.output.message : undefined,
+    }
+  }
+}
+```
+Where the symbols this change introduces are used elsewhere, at this same revision (the code that reads them; this is evidence for the WHAT and the WHY, and it is the only source for who consumes this change):
+- File `evals/buffbench/run-buffbench.ts` (3 matching lines):
+```
+}) {
+  const {
+    client,
+    commit,
+    agents,
+    repoUrl,
+    initCommand,
+    env,
+    logsDir,
+    index,
+    totalTasks,
+    analyzerContext,
+    localAgentDefinitions,
+    extractLessons,
+    printEvents,
+    finalCheckCommands,
+    disableAnalysis,
+    saveTraces = false,
+    runInFreestyle,
+    binInstalls,
+  } = options
+
+  console.log(
+    `\n=== Task ${index + 1}/${totalTasks}: ${commit.id} (${commit.sha.slice(0, 7)}) ===`,
+  )
+…
+initCommand,
+          env,
+          binInstalls,
+          finalCheckCommands,
+        })
+      : await runAgentOnCommit({
+          client,
+          agentId,
+          commit,
+          repoUrl,
+          initCommand,
+          env,
+          localAgentDefinitions,
+          printEvents,
+          finalCheckCommands,
+          externalAgentType,
+        })
+
+    const judgeResult = await judgeCommitResult({
+      client,
+      commit,
+      contextFiles: agentResult.contextFiles,
+      agentDiff: agentResult.diff,
+      error: agentResult.error,
+      finalCheckOutputs: agentResult.finalCheckOutputs
+…
+(output) =>
+                `### ${output.command}\n\`\`\`\n${output.stdout}${output.stderr ? '\nSTDERR:\n' + output.stderr : ''}\n\`\`\``,
+            )
+            .join('\n\n')
+        : undefined,
+    })
+
+    // Extract and append agent lessons
+    if (extractLessons) {
+      console.log(`[${commit.id}] Extracting lessons for ${agentId}...`)
+      const { lessons } = await extractAgentLessons({
+        client,
+        localAgentDefinitions,
+        prompt: commit.prompt,
+        groundTruthFileDiffs: commit.fileDiffs,
+        contextFiles: agentResult.contextFiles,
+        agentDiff: agentResult.diff,
+        agentTrace: agentResult.trace,
+        judgeResult,
+        error: agentResult.error,
+      })
+
+      saveAgentLessons({
+        agentId,
+        commitId: commit.id,
+```
+- File `evals/buffbench/agent-runner.ts` (2 matching lines):
+```
+export type AgentTask = Pick<
+  EvalCommitV2,
+  'id' | 'parentSha' | 'prompt' | 'supplementalFiles'
+> & { fileDiffs: Pick<FileDiff, 'path' | 'status'>[] }
+
+export async function runAgentOnCommit({
+  client,
+  agentId,
+  commit,
+  repoUrl,
+  initCommand,
+  env,
+  localAgentDefinitions,
+  printEvents,
+  finalCheckCommands,
+  externalAgentType,
+}: {
+  client: CodebuffClient
+  agentId: string
+  commit: AgentTask
+  repoUrl: string
+  initCommand?: string
+  env?: Record<string, string>
+  localAgentDefinitions: any[]
+  printEvents: boolean
+…
+if (externalAgentType === 'claude') {
+            runner = new ClaudeRunner(repoDir, env)
+          } else if (externalAgentType === 'codex') {
+            runner = new CodexRunner(repoDir, env)
+          } else if (externalAgentType === 'opencode') {
+            runner = new OpenCodeRunner(repoDir, env)
+          } else {
+            runner = new CodebuffRunner({
+              cwd: repoDir,
+              env,
+              client,
+              agentId,
+              localAgentDefinitions,
+              printEvents,
+              commitId: commit.id,
+              parentSha: commit.parentSha,
+              // No arm may read the task's own upstream (tool-overrides.ts).
+              overrideTools: benchToolOverrides({ repoUrl, cwd: repoDir, env }),
+            })
+          }
+
+          console.log(
+            `[${commit.id}] Running agent: ${externalAgentType || 'codebuff'}`,
+          )
+```
+- File `evals/buffbench/lessons-extractor.ts` (1 matching line):
+```
+- Focus on gaps that, if filled, would have improved the outcome
+-[freebuff product prompt text omitted]
+}
+
+export async function extractAgentLessons(
+  input: ExtractAgentLessonsInput,
+): Promise<{
+  lessons: Lesson[]
+}> {
+  try {
+    const {
+      client,
+      localAgentDefinitions,
+      prompt,
+      groundTruthFileDiffs,
+      contextFiles,
+      agentDiff,
+      agentTrace,
+      judgeResult,
+      error,
+    } = input
+
+    const groundTruthDiffs = groundTruthFileDiffs
+      .map(({ path, diff }) => `### ${path}\n\`\`\`diff\n${diff}\n\`\`\``)
+      .join('\n\n')
+```
+Diff (source hunks; lockfiles and pure test hunks omitted, except in a lockfile-only commit):
+```diff
+diff --git a/evals/buffbench/runners/codebuff.ts b/evals/buffbench/runners/codebuff.ts
+index f38036e9d..dce79534e 100644
+--- a/evals/buffbench/runners/codebuff.ts
++++ b/evals/buffbench/runners/codebuff.ts
+@@ -1,34 +1,52 @@
+ import { execSync } from 'child_process'
+ import fs from 'fs'
+ import path from 'path'
+ 
+ import type { AgentStep, ContextLogEntry, Runner, RunnerResult } from './runner'
+ import type { CodebuffClient, TerminalCommandBroker } from '@codebuff/sdk'
+ 
+ const DEBUG_ERROR = true
+ 
++/**
++ * Runs the benchmarked agent at `high` reasoning, Freebuff's default, when it
++ * declares no `reasoningOptions`. The server applies that default only to
++ * free-mode requests and the bench is a normal caller, so without this each
++ * provider used its own default (on 2026-11-04 Pareto reasoned ~25% less than
++ * Luminal and DeepSeek direct, and scored 0.27 lower for it).
++ */
++export function withBenchDefaultReasoning(
++  definitions: any[],
++  agentId: string,
++): any[] {
++  return definitions.map((definition) =>
++    definition?.id === agentId && definition.reasoningOptions === undefined
++      ? { ...definition, reasoningOptions: { enabled: true, effort: 'high' } }
++      : definition,
++  )
++}
++
+ export class CodebuffRunner implements Runner {
+   private cwd: string
+   private env?: Record<string, string>
+   private client: CodebuffClient
+   private agentId: string
+   private localAgentDefinitions: any[]
+   private printEvents: boolean
+   private commitId: string
+   private parentSha: string
+   private terminalCommandBroker?: TerminalCommandBroker
+   private overrideTools?: Parameters<CodebuffClient['run']>[0]['overrideTools']
+   private collectDiff: boolean
+ 
+   constructor(options: {
+     cwd: string
+     env?: Record<string, string>
+     client: CodebuffClient
+     agentId: string
+     localAgentDefinitions: any[]
+     printEvents: boolean
+     commitId: string
+     parentSha: string
+     terminalCommandBroker?: TerminalCommandBroker
+     overrideTools?: Parameters<CodebuffClient['run']>[0]['overrideTools']
+     collectDiff?: boolean
+@@ -38,51 +56,54 @@ export class CodebuffRunner implements Runner {
+     this.client = options.client
+     this.agentId = options.agentId
+     this.localAgentDefinitions = options.localAgentDefinitions
+     this.printEvents = options.printEvents
+     this.commitId = options.commitId
+     this.parentSha = options.parentSha
+     this.terminalCommandBroker = options.terminalCommandBroker
+     this.overrideTools = options.overrideTools
+     this.collectDiff = options.collectDiff ?? true
+   }
+ 
+   async run(prompt: string): Promise<RunnerResult> {
+     const steps: AgentStep[] = []
+     const contextLog: ContextLogEntry[] = []
+     let totalCostUsd = 0
+ 
+     // 500, not 40 (raised 2026-09-28). At 40 the single-loop base3 arm ran out
+     // of steps before its first edit in 1-5 of 10 tasks per run and scored 0
+     // with an empty diff, while the fan-out arm never came near the cap; the
+     // cap was deciding the comparison. 500 is a runaway guard only; the 60-min
+     // agent timeout in agent-runner.ts is the real bound.
+     const maxAgentSteps = 500
+     const result = await this.client.run({
+       agent: this.agentId,
+       prompt,
+-      agentDefinitions: this.localAgentDefinitions,
++      agentDefinitions: withBenchDefaultReasoning(
++        this.localAgentDefinitions,
++        this.agentId,
++      ),
+       cwd: this.cwd,
+       env: this.env,
+       terminalCommandBroker: this.terminalCommandBroker,
+       overrideTools: this.overrideTools,
+       fileFilter: (filePath) => ({
+         status:
+           path.isAbsolute(filePath) || filePath.split(/[\\/]/).includes('..')
+             ? 'blocked'
+             : 'allow',
+       }),
+       maxAgentSteps,
+       onUsage: (usage) => contextLog.push({ type: 'usage', ...usage }),
+       // The summary text is the history itself; the trace already has it.
+       onCompaction: ({ summary: _, ...data }) =>
+         contextLog.push({ type: 'compaction', ...data }),
+       handleEvent: (event) => {
+         if (
+           (event.type === 'tool_call' || event.type === 'tool_result') &&
+           event.toolName === 'set_messages'
+         ) {
+           return
+         }
+         if (event.type === 'error') {
+           console.error(
+             `[${this.commitId}:${this.agentId}] Error event:`,
+
+```
