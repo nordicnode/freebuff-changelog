@@ -1,0 +1,846 @@
+diff --git a/common/src/tools/__tests__/repair-tool-json.test.ts b/common/src/tools/__tests__/repair-tool-json.test.ts
+index f05aea531..6cc850db2 100644
+--- a/common/src/tools/__tests__/repair-tool-json.test.ts
++++ b/common/src/tools/__tests__/repair-tool-json.test.ts
+@@ -1,27 +1,29 @@
+ import { describe, expect, test } from 'bun:test'
+ 
++import { applyPatchParams } from '../params/tool/apply-patch'
++import { strReplaceParams } from '../params/tool/str-replace'
+ import { coerceToArray } from '../params/utils'
+ import { parseToolJson } from '../repair-tool-json'
+ 
+ describe('parseToolJson', () => {
+   test('valid JSON parses without a repair', () => {
+     expect(parseToolJson('{"a": "say \\"hi\\""}')).toEqual({
+       value: { a: 'say "hi"' },
+     })
+   })
+ 
+   test.each([
+     // DeepSeek V4 Flash, replayed from a production context: one quote left bare.
+     [
+       '{"path": "src/Pricing.tsx", "replacements": [{"oldString": "<section id=\\"pricing\\" className="mx-auto px-6\\">", "newString": "<section id=\\"pricing\\" aria-label=\\"Compare plans\\" className=\\"mx-auto px-6\\">"}]}',
+       '<section id="pricing" className="mx-auto px-6">',
+     ],
+     [
+       '{"path": "a.tsx", "replacements": [{"oldString": "import type { Estimate } from "@/lib/types";", "newString": "import type { Estimate, Line } from \\"@/lib/types\\";"}]}',
+       'import type { Estimate } from "@/lib/types";',
+     ],
+     [
+       '{"path": "a.py", "replacements": [{"oldString": "print("a", "b")", "newString": "print("a")"}]}',
+       'print("a", "b")',
+     ],
+   ])('escapes the stray quotes in %#', (text, oldString) => {
+@@ -43,45 +45,78 @@ describe('parseToolJson', () => {
+   })
+ 
+   test('a raw newline inside a string is escaped', () => {
+     expect(parseToolJson('{"path": "a.ts", "content": "a\nb"}')).toEqual({
+       value: { path: 'a.ts', content: 'a\nb' },
+       repair: 'raw-control-character',
+     })
+   })
+ 
+   test('replacements closed with } instead of ]} is closed', () => {
+     expect(
+       parseToolJson('{"path": "a.ts", "replacements": [{"oldString": "a", "newString": "b"}}'),
+     ).toEqual({
+       value: { path: 'a.ts', replacements: [{ oldString: 'a', newString: 'b' }] },
+       repair: 'unclosed-array',
+     })
+   })
+ 
+   test('slips together are repaired together', () => {
+     expect(
+       parseToolJson('{"path": "a.ts", "replacements": [{"oldString": "say "hi"", "newString": "x\ny"}}')
+         ?.repair,
+     ).toBe('unescaped-quote+raw-control-character+unclosed-array')
+   })
+ 
++  test('a backslash JSON does not allow is kept as a literal backslash', () => {
++    // Solar Pro 4: Windows paths, unescaped.
++    expect(parseToolJson('{"paths": ["hunt\\NEXT.md", "src\\main\\App.java"]}')).toEqual({
++      value: { paths: ['hunt\\NEXT.md', 'src\\main\\App.java'] },
++      repair: 'invalid-escape',
++    })
++    // Valid escapes beside it are left alone.
++    expect(
++      (parseToolJson('{"newString": "re = /\\s+/\\n\\u00e9"}')?.value as any).newString,
++    ).toBe('re = /\\s+/\n\u00e9')
++  })
++
+   test('a call cut off by the output limit is never completed', () => {
+     for (const cut of [
+       '{"path":"src/editor.rs","content":"use eframe::egui;\\n\\npub fn mark_saved(&mut',
+       '{"path": "a.ts", "replacements": [{"oldString": "say "hi"", "newString": "x',
+       '{"path": "a.ts", "replacements": [{"oldString": "a", "newString": "b"}',
+     ])
+       expect(parseToolJson(cut)).toBeUndefined()
+   })
+ 
+   test('text no repair can parse stays unparsed', () => {
+     expect(parseToolJson('{"path": "a.ts", "content": "x')).toBeUndefined()
+     expect(parseToolJson('not json')).toBeUndefined()
+   })
+ })
+ 
++test('apply_patch reads an operation sent as a JSON string', () => {
++  expect(
++    applyPatchParams.inputSchema.parse({
++      operation: '{"type": "delete_file", "path": "a.ts"}',
++    }),
++  ).toEqual({ operation: { type: 'delete_file', path: 'a.ts' } })
++})
++
++test('str_replace reads `replacement` or `replaces` holding the edits', () => {
++  for (const key of ['replacement', 'replaces'])
++    expect(
++      strReplaceParams.inputSchema.parse({
++        path: 'a.ts',
++        [key]: [{ oldString: 'x', newString: 'y' }],
++      }),
++    ).toEqual({
++      path: 'a.ts',
++      replacements: [{ oldString: 'x', newString: 'y', allowMultiple: false }],
++    })
++})
++
+ test('a lane that hands over the broken array as a string still yields the edits', () => {
+   expect(
+     coerceToArray('[{"oldString": "<div className="a">", "newString": "<div className=\\"b\\">"}]'),
+   ).toEqual([{ oldString: '<div className="a">', newString: '<div className="b">' }])
+ })
+diff --git a/common/src/tools/params/tool/apply-patch.ts b/common/src/tools/params/tool/apply-patch.ts
+index 1414be181..5dc8ca37c 100644
+--- a/common/src/tools/params/tool/apply-patch.ts
++++ b/common/src/tools/params/tool/apply-patch.ts
+@@ -1,71 +1,75 @@
+ import z from 'zod/v4'
+ 
+-import { $getNativeToolCallExampleString, jsonToolResultSchema } from '../utils'
++import {
++  $getNativeToolCallExampleString,
++  coerceToObject,
++  jsonToolResultSchema,
++} from '../utils'
+ 
+ import type { $ToolParams } from '../../constants'
+ 
+ export const applyPatchResultSchema = z.union([
+   z.object({
+     message: z.string(),
+     applied: z.array(
+       z.object({
+         file: z.string(),
+         action: z.enum(['add', 'update', 'delete']),
+       }),
+     ),
+   }),
+   z.object({
+     errorMessage: z.string(),
+   }),
+ ])
+ 
+ const toolName = 'apply_patch'
+ const endsAgentStep = false
+ 
+ const operationSchema = z.discriminatedUnion('type', [
+   z.object({
+     type: z.literal('create_file'),
+     path: z.string().min(1, 'Path cannot be empty'),
+     diff: z.string().min(1, 'Diff cannot be empty'),
+   }),
+   z.object({
+     type: z.literal('update_file'),
+     path: z.string().min(1, 'Path cannot be empty'),
+     diff: z.string().min(1, 'Diff cannot be empty'),
+   }),
+   z.object({
+     type: z.literal('delete_file'),
+     path: z.string().min(1, 'Path cannot be empty'),
+   }),
+ ])
+ 
+ export type ApplyPatchOperation = z.infer<typeof operationSchema>
+ 
+ const inputSchema = z
+   .object({
+-    operation: operationSchema.describe(
++    operation: z.preprocess(coerceToObject, operationSchema).describe(
+       'The file operation to perform. type is one of create_file, update_file, or delete_file.',
+     ),
+   })
+   .describe('Apply a file operation (create, update, or delete).')
+ 
+ const description = `
+ Use this tool to apply file operations using Codex-style apply_patch format.
+ 
+ Each call performs a single operation on one file.
+ 
+ Operation types:
+ - create_file: Create a new file. Requires path and diff (lines prefixed with +).
+ - update_file: Update an existing file. Requires path and diff (unified diff with @@ hunks).
+ - delete_file: Delete a file. Requires only path.
+ 
+ Example (create):
+ ${$getNativeToolCallExampleString({
+   toolName,
+   inputSchema,
+   input: {
+     operation: {
+       type: 'create_file',
+       path: 'hello.txt',
+       diff: '@@\n+Hello world\n',
+     },
+diff --git a/common/src/tools/params/utils.ts b/common/src/tools/params/utils.ts
+index 2f5eb6527..cb2e789b4 100644
+--- a/common/src/tools/params/utils.ts
++++ b/common/src/tools/params/utils.ts
+@@ -59,50 +59,58 @@ export function normalizeReplacementAliases(val: unknown): unknown {
+   for (const [target, aliases] of [
+     ['oldString', ['old', 'old_str', 'old_string']],
+     ['newString', ['new', 'new_str', 'new_string', 'replacement']],
+   ] as const) {
+     if (replacement[target] !== undefined) {
+       continue
+     }
+     const alias = aliases.find((key) => typeof replacement[key] === 'string')
+     if (alias) {
+       replacement[target] = replacement[alias]
+     }
+   }
+   return replacement
+ }
+ 
+ /**
+  * Accepts a single edit sent at the top level (`{ path, oldString, newString }`)
+  * instead of inside `replacements`, the most common str_replace shape slip in
+  * production traces. Input that already has `replacements`, or has no
+  * `oldString`, is left for the schema to judge.
+  */
+ export function liftSingleReplacement(
+   input: Record<string, unknown>,
+ ): Record<string, unknown> {
+   const edit = normalizeReplacementAliases(input) as Record<string, unknown>
++  if (edit.replacements === undefined) {
++    // `replacement` / `replaces` holding the array (~100 calls/day, Flash, Nov 2026).
++    const alias = edit.replacement ?? edit.replaces
++    if (Array.isArray(alias)) {
++      const { replacement: _, replaces: __, ...rest } = edit
++      return { ...rest, replacements: alias }
++    }
++  }
+   if (edit.replacements !== undefined || typeof edit.oldString !== 'string') {
+     return input
+   }
+   const { oldString, newString, allowMultiple, ...rest } = edit
+   return { ...rest, replacements: [{ oldString, newString, allowMultiple }] }
+ }
+ 
+ /**
+  * Runs `repair` on a copy of the raw tool input, when it is an object, before
+  * `schema` validates it; anything else goes to the schema untouched. The JSON
+  * schema shown to the model is unchanged (zod renders the inner schema); the
+  * description is carried over because tool prompts read `schema.description`.
+  */
+ export function repairInput<T extends z.ZodType>(
+   repair: (input: Record<string, unknown>) => unknown,
+   schema: T,
+ ) {
+   const repaired = z.preprocess(
+     (val) =>
+       val !== null && typeof val === 'object' && !Array.isArray(val)
+         ? repair({ ...(val as Record<string, unknown>) })
+         : val,
+     schema,
+   )
+   return schema.description ? repaired.describe(schema.description) : repaired
+diff --git a/common/src/tools/repair-tool-json.ts b/common/src/tools/repair-tool-json.ts
+index 26831e785..ba1b2a38d 100644
+--- a/common/src/tools/repair-tool-json.ts
++++ b/common/src/tools/repair-tool-json.ts
+@@ -1,46 +1,69 @@
+ /**
+- * Repairs for tool-call argument JSON that a model got slightly wrong.
++ * Repairs for tool calls a model got slightly wrong: argument JSON, and invented tool names.
+  *
+  * Each repair rewrites the raw text and is kept only if the result parses; the tool's schema then
+  * validates it like any other call. To handle a newly common slip, add an entry with the trace
+  * evidence and a test case built from a real failing call.
+  */
+ export const TOOL_JSON_REPAIRS: readonly {
+   name: string
+   repair: (text: string) => string | undefined
+ }[] = [
+   // DeepSeek V4 Flash, Nov 2026 (replayed production contexts, 25 of 429 str_replace calls broken):
+   // a `"` in the code left unescaped (`"newString": "<div className="card">"`, JSX's `{" "}`).
+   // Served through some lanes the broken text arrives as `replacements: "<that text>"`.
+   { name: 'unescaped-quote', repair: escapeStrayQuotes },
+   // Same sample: a raw newline inside a string.
+   { name: 'raw-control-character', repair: escapeControlCharacters },
+   // Same sample: the `replacements` array closed with `}` instead of `]}`.
+   { name: 'unclosed-array', repair: closeArraysBeforeBraces },
++  // Solar Pro 4 and Flash, Nov 2026 (~400/day): a backslash JSON does not allow, mostly Windows
++  // paths (`["hunt\NEXT.md"]`) and regexes in code (`\s`, `\x`).
++  { name: 'invalid-escape', repair: escapeLoneBackslashes },
+ ]
+ 
++/**
++ * Names models invent for a real tool, sending that tool's own arguments (Nov 2026 traces, ~770
++ * calls/day, mostly DeepSeek V4 Flash). A call is renamed only when the agent has the real tool;
++ * its schema then validates the arguments as usual.
++ */
++export const TOOL_NAME_ALIASES: Readonly<Record<string, string>> = {
++  run_command: 'run_terminal_command',
++  run_default: 'run_terminal_command',
++  run_exec_command: 'run_terminal_command',
++  run_terminal_code: 'run_terminal_command',
++  exec_command: 'run_terminal_command',
++  run_code: 'run_terminal_command',
++  terminal_command: 'run_terminal_command',
++  bash: 'run_terminal_command',
++  run_terminal_code_search: 'code_search',
++  run_code_search: 'code_search',
++  grep: 'code_search',
++  run_files: 'read_files',
++}
++
+ /**
+  * `text` parsed, if it parses as is or after the repairs. Repairs apply in order, each to the
+  * previous one's output, since one call can carry several slips.
+  */
+ export function parseToolJson(
+   text: string,
+ ): { value: unknown; repair?: string } | undefined {
+   try {
+     return { value: JSON.parse(text) }
+   } catch {}
+   const applied: string[] = []
+   for (const { name, repair } of TOOL_JSON_REPAIRS) {
+     const repaired = repair(text)
+     if (repaired === undefined) continue
+     text = repaired
+     applied.push(name)
+     try {
+       return { value: JSON.parse(text), repair: applied.join('+') }
+     } catch {}
+   }
+   return undefined
+ }
+ 
+ /** Calls `visit` for each character with whether it sits inside a string (escapes skipped). */
+ function scan(
+@@ -62,50 +85,72 @@ function scan(
+   return out === text ? undefined : out
+ }
+ 
+ function escapeControlCharacters(text: string): string | undefined {
+   return scan(text, (ch, inString) =>
+     inString && ch < ' ' ? JSON.stringify(ch).slice(1, -1) : ch,
+   )
+ }
+ 
+ function closeArraysBeforeBraces(text: string): string | undefined {
+   const containers: string[] = []
+   return scan(text, (ch, inString) => {
+     if (inString) return ch
+     if (ch === '{' || ch === '[') containers.push(ch)
+     if (ch !== '}' && ch !== ']') return ch
+     let closers = ''
+     while (ch === '}' && containers.at(-1) === '[') {
+       containers.pop()
+       closers += ']'
+     }
+     containers.pop()
+     return closers + ch
+   })
+ }
+ 
++/** Doubles each backslash in a string that does not start a valid JSON escape. */
++function escapeLoneBackslashes(text: string): string | undefined {
++  let out = ''
++  let inString = false
++  for (let i = 0; i < text.length; i++) {
++    const ch = text[i]!
++    if (inString && ch === '\\') {
++      const next = text[i + 1] ?? ''
++      if (/["\\/bfnrt]/.test(next) || /^u[0-9a-fA-F]{4}/.test(text.slice(i + 1, i + 6))) {
++        out += ch + next
++        i++
++      } else {
++        out += '\\\\'
++      }
++      continue
++    }
++    if (ch === '"') inString = !inString
++    out += ch
++  }
++  return out === text ? undefined : out
++}
++
+ // What may follow a string's real closing quote, by where the string sits.
+ const AFTER_KEY = /\s*:/y
+ const AFTER_OBJECT_VALUE = /\s*(?:\}\s*(?:[,\]}]|$)|,\s*"(?:[^"\\]|\\.)*"\s*:)/y
+ const AFTER_ARRAY_VALUE = /\s*(?:\]\s*(?:[,\]}]|$)|,\s*["{[\-\dtfn])/y
+ const AFTER_TOP_LEVEL = /\s*$/y
+ 
+ /**
+  * Escapes each `"` inside a string that cannot be its closing quote: one not followed by what the
+  * JSON around it needs next (a `:` after a key; `}` or `, "key":` after an object value). Undefined
+  * when there is nothing to escape.
+  */
+ function escapeStrayQuotes(text: string): string | undefined {
+   const containers: ('{' | '[')[] = []
+   let out = ''
+   let inString = false
+   let isKey = false
+   let expectKey = false
+   for (let i = 0; i < text.length; i++) {
+     const ch = text[i]!
+     if (inString) {
+       if (ch === '\\') {
+         out += ch + (text[i + 1] ?? '')
+         i++
+         continue
+       }
+diff --git a/packages/agent-runtime/src/__tests__/repair-custom-tool-input.test.ts b/packages/agent-runtime/src/__tests__/repair-custom-tool-input.test.ts
+new file mode 100644
+index 000000000..7fae21531
+--- /dev/null
++++ b/packages/agent-runtime/src/__tests__/repair-custom-tool-input.test.ts
+@@ -0,0 +1,38 @@
++import { describe, expect, test } from 'bun:test'
++
++import { repairCustomToolInput } from '../util/repair-custom-tool-input'
++
++const schema = {
++  type: 'object',
++  properties: {
++    calls: { type: 'array', items: { type: 'object' } },
++    timeoutMs: { type: 'number', maximum: 60000 },
++    target: { anyOf: [{ type: 'string' }, { type: 'object' }] },
++    script: { type: 'string' },
++  },
++}
++
++describe('repairCustomToolInput', () => {
++  test('decodes an array sent as a JSON string, repairing it if needed', () => {
++    const input: Record<string, unknown> = { calls: '[{"tool": "NOTION_CREATE_PAGE", "arguments": {"title": "say "hi""}}]' }
++    repairCustomToolInput(input, schema)
++    expect(input.calls).toEqual([
++      { tool: 'NOTION_CREATE_PAGE', arguments: { title: 'say "hi"' } },
++    ])
++  })
++
++  test('clamps a number above the maximum', () => {
++    const input: Record<string, unknown> = { timeoutMs: 90000 }
++    repairCustomToolInput(input, schema)
++    expect(input.timeoutMs).toBe(60000)
++  })
++
++  test('decodes a union object but keeps its plain strings and string parameters', () => {
++    const input: Record<string, unknown> = { target: '{"x": 1}', script: '{"a": 1}' }
++    repairCustomToolInput(input, schema)
++    expect(input).toEqual({ target: { x: 1 }, script: '{"a": 1}' })
++    const plain: Record<string, unknown> = { target: 'the button' }
++    repairCustomToolInput(plain, schema)
++    expect(plain.target).toBe('the button')
++  })
++})
+diff --git a/packages/agent-runtime/src/tools/tool-executor.ts b/packages/agent-runtime/src/tools/tool-executor.ts
+index 94ef56c79..2428f8691 100644
+--- a/packages/agent-runtime/src/tools/tool-executor.ts
++++ b/packages/agent-runtime/src/tools/tool-executor.ts
+@@ -1,39 +1,39 @@
+ import { endsAgentStepParam, toolNames } from '@codebuff/common/tools/constants'
+ import { toolParams } from '@codebuff/common/tools/list'
+ import { FILE_WRITE_GUARD_EVENT } from '@codebuff/common/util/axiom-only-log'
+ import { generateCompactId } from '@codebuff/common/util/string'
+ import { cloneDeepKeepingZod } from '../util/zod-safe-clone'
+ 
+ import { getMCPToolData } from '../mcp'
+ import { MCP_TOOL_SEPARATOR } from '../mcp-constants'
+ import { getAgentShortName, getAgentToolName } from '../templates/prompts'
+ import { formatValueForError } from '../util/format-value'
+ import { codebuffToolHandlers } from './handlers/list'
+ import { getMatchingSpawn } from './handlers/tool/spawn-agent-utils'
+ import { getAgentTemplate } from '../templates/agent-registry'
+-import { repairStringEncodedUnionMembers } from '../util/repair-string-encoded-union-members'
++import { repairCustomToolInput } from '../util/repair-custom-tool-input'
+ import { resolveGravityIndexLink } from './gravity-index-cta'
+ import { ensureZodSchema } from './prompts'
+ import { boundToolResult } from '../util/context-size-guard'
+ import {
+   extractPathFromPartialArguments,
+   isTruncatedJsonPrefix,
+   truncatedToolCallMessage,
+ } from '../util/truncated-write-guard'
+ 
+ import type { AgentTemplate } from '../templates/types'
+ import type { CodebuffToolHandlerFunction } from './handlers/handler-function-type'
+ import type { FileProcessingState } from './handlers/tool/write-file'
+ import type { ToolName } from '@codebuff/common/tools/constants'
+ import type {
+   ClientToolCall,
+   ClientToolName,
+   CodebuffToolCall,
+   CodebuffToolOutput,
+ } from '@codebuff/common/tools/list'
+ import type {
+   AgentRuntimeDeps,
+   AgentRuntimeScopedDeps,
+ } from '@codebuff/common/types/contracts/agent-runtime'
+ import type { Logger } from '@codebuff/common/types/contracts/logger'
+ import type {
+@@ -659,51 +659,51 @@ export function parseRawCustomToolCall(params: {
+   }
+ 
+   const parsedInput = parseStringifiedToolInput(rawToolCall.input, toolName)
+ 
+   if (typeof parsedInput.input === 'string') {
+     return stringInputError(
+       toolName,
+       rawToolCall.toolCallId,
+       parsedInput.parseError,
+     )
+   }
+ 
+   const processedParameters: Record<string, any> = {}
+   for (const [param, val] of Object.entries(parsedInput.input ?? {})) {
+     processedParameters[param] = val
+   }
+ 
+   // Add the required codebuff_end_step parameter with the correct value for this tool if requested
+   if (autoInsertEndStepParam) {
+     processedParameters[endsAgentStepParam] =
+       customToolDefs?.[toolName]?.endsAgentStep
+   }
+ 
+   const rawSchema = customToolDefs?.[toolName]?.inputSchema
+   if (rawSchema) {
+-    repairStringEncodedUnionMembers(processedParameters, rawSchema)
++    repairCustomToolInput(processedParameters, rawSchema)
+     const paramsSchema = ensureZodSchema(rawSchema)
+     const result = paramsSchema.safeParse(processedParameters)
+ 
+     if (!result.success) {
+       return {
+         toolName: toolName,
+         toolCallId: rawToolCall.toolCallId,
+         input: rawToolCall.input,
+         error: `Invalid parameters for ${toolName}: ${JSON.stringify(
+           result.error.issues,
+           null,
+           2,
+         )}`,
+       }
+     }
+   }
+ 
+   // processedParameters is what the schema saw (including the union repair
+   // above), so it - not the untouched raw input - is what the handler gets.
+   const input = JSON.parse(JSON.stringify(processedParameters))
+   if (endsAgentStepParam in input) {
+     delete input[endsAgentStepParam]
+   }
+   return {
+     toolName: toolName,
+diff --git a/packages/agent-runtime/src/util/repair-custom-tool-input.ts b/packages/agent-runtime/src/util/repair-custom-tool-input.ts
+new file mode 100644
+index 000000000..a662e37eb
+--- /dev/null
++++ b/packages/agent-runtime/src/util/repair-custom-tool-input.ts
+@@ -0,0 +1,41 @@
++import { parseToolJson } from '@codebuff/common/tools/repair-tool-json'
++
++/**
++ * Repairs a custom tool's input against its JSON schema where a value's meaning is plain and only
++ * its form is wrong:
++ * - An object or array sent as a JSON-encoded string, where the schema wants an array or object,
++ *   or a union with an object variant (`run_integration_tools` `calls`).
++ *   Decoded with `parseToolJson`, so its repairs apply. Only values that start like JSON are
++ *   decoded, so a union's legitimate string, or a string parameter holding code, is never touched.
++ * - A number above the schema's `maximum`, clamped to it (`preview_wait` `timeoutMs: 90000`,
++ *   `terminal_read` `maxChars: 32000`; ~140 calls/day in Nov 2026 traces).
++ */
++export function repairCustomToolInput(
++  parameters: Record<string, any>,
++  rawSchema: unknown,
++): void {
++  const properties = (rawSchema as { properties?: unknown } | null)?.properties
++  if (!properties || typeof properties !== 'object') return
++  for (const [param, value] of Object.entries(parameters)) {
++    const schema = (properties as Record<string, any>)[param]
++    if (!schema || typeof schema !== 'object') continue
++    if (
++      typeof value === 'number' &&
++      typeof schema.maximum === 'number' &&
++      value > schema.maximum
++    ) {
++      parameters[param] = schema.maximum
++      continue
++    }
++    if (typeof value !== 'string') continue
++    const union: unknown[] | undefined = schema.anyOf ?? schema.oneOf
++    const wantsStructure =
++      schema.type === 'array' ||
++      schema.type === 'object' ||
++      union?.some((variant: any) => variant?.type === 'object')
++    const trimmed = value.trim()
++    if (!wantsStructure || !/^[[{]/.test(trimmed)) continue
++    const decoded = parseToolJson(trimmed)?.value
++    if (decoded && typeof decoded === 'object') parameters[param] = decoded
++  }
++}
+diff --git a/packages/agent-runtime/src/util/repair-string-encoded-union-members.ts b/packages/agent-runtime/src/util/repair-string-encoded-union-members.ts
+deleted file mode 100644
+index 8026db183..000000000
+--- a/packages/agent-runtime/src/util/repair-string-encoded-union-members.ts
++++ /dev/null
+@@ -1,45 +0,0 @@
+-/**
+- * Repairs values the model string-encoded against its schema. When a
+- * parameter's declared schema is a union containing an object variant, a
+- * model may emit the object as a JSON-encoded string (a string is
+- * unambiguously valid for the union, so nothing downstream fails). The
+- * schema-guided decode below restores the object the model meant; plain
+- * strings and params without an object variant are never touched, so
+- * tools whose string parameters legitimately contain JSON (script
+- * sources, file contents) are unaffected.
+- */
+-export function repairStringEncodedUnionMembers(
+-  parameters: Record<string, any>,
+-  rawSchema: unknown,
+-): void {
+-  if (!rawSchema || typeof rawSchema !== 'object') return
+-  const properties = (rawSchema as { properties?: Record<string, unknown> })
+-    .properties
+-  if (!properties) return
+-  for (const [param, value] of Object.entries(parameters)) {
+-    if (typeof value !== 'string') continue
+-    const propSchema = properties[param]
+-    if (!propSchema || typeof propSchema !== 'object') continue
+-    const union =
+-      (propSchema as { anyOf?: unknown[] }).anyOf ??
+-      (propSchema as { oneOf?: unknown[] }).oneOf
+-    if (!Array.isArray(union)) continue
+-    const hasObjectVariant = union.some(
+-      (variant) =>
+-        variant &&
+-        typeof variant === 'object' &&
+-        (variant as { type?: unknown }).type === 'object',
+-    )
+-    if (!hasObjectVariant) continue
+-    const trimmed = value.trim()
+-    if (!trimmed.startsWith('{') && !trimmed.startsWith('[')) continue
+-    try {
+-      const decoded = JSON.parse(trimmed)
+-      if (decoded && typeof decoded === 'object') {
+-        parameters[param] = decoded
+-      }
+-    } catch {
+-      // Not JSON after all - the string is a legitimate value.
+-    }
+-  }
+-}
+diff --git a/sdk/src/impl/__tests__/tool-call-repair.test.ts b/sdk/src/impl/__tests__/tool-call-repair.test.ts
+new file mode 100644
+index 000000000..df3572c30
+--- /dev/null
++++ b/sdk/src/impl/__tests__/tool-call-repair.test.ts
+@@ -0,0 +1,97 @@
++/**
++ * Tool calls a model got slightly wrong, through the AI SDK as users run it: an invented tool name
++ * and arguments with an unescaped quote both reach the agent as the call the model meant.
++ */
++import { jsonSchema, tool } from 'ai'
++import type { JSONSchema7 } from 'ai'
++import { afterEach, expect, test } from 'bun:test'
++
++import { promptAiSdkStream } from '../llm'
++
++const originalFetch = globalThis.fetch
++afterEach(() => {
++  globalThis.fetch = originalFetch
++})
++
++const logger = {
++  debug() {},
++  info() {},
++  warn() {},
++  error() {},
++  fatal() {},
++  trace() {},
++  child() {
++    return this
++  },
++}
++
++async function toolCallsFor(name: string, args: string) {
++  globalThis.fetch = (() =>
++    Promise.resolve(
++      new Response(
++        [
++          {
++            delta: {
++              tool_calls: [
++                { index: 0, id: 'call_1', type: 'function', function: { name, arguments: args } },
++              ],
++            },
++            finish_reason: null,
++          },
++          { delta: {}, finish_reason: 'tool_calls' },
++        ]
++          .map(
++            (choice) =>
++              `data: ${JSON.stringify({ id: 'c', object: 'chat.completion.chunk', created: 1, model: 'test-model', choices: [{ index: 0, ...choice }] })}\n\n`,
++          )
++          .join('') + 'data: [DONE]\n\n',
++        { headers: { 'Content-Type': 'text/event-stream' } },
++      ),
++    )) as unknown as typeof fetch
++
++  const object = (properties: Record<string, JSONSchema7>) =>
++    tool({ inputSchema: jsonSchema({ type: 'object', properties, required: Object.keys(properties) }) })
++  const stream = promptAiSdkStream({
++    apiKey: 'test-key',
++    runId: 'run-1',
++    messages: [{ role: 'user', content: [{ type: 'text', text: 'go' }] }],
++    tools: {
++      run_terminal_command: object({ command: { type: 'string' } }),
++      str_replace: object({ path: { type: 'string' }, replacements: { type: 'array' } }),
++    },
++    clientSessionId: 'session-1',
++    fingerprintId: 'fingerprint-1',
++    model: 'openai/gpt-5.6-luna',
++    userId: 'user-1',
++    userInputId: 'input-1',
++    sendAction: async () => undefined,
++    logger,
++    trackEvent: async () => undefined,
++    signal: new AbortController().signal,
++  } as unknown as Parameters<typeof promptAiSdkStream>[0])
++
++  const calls: { toolName: string; input: unknown }[] = []
++  for await (const chunk of stream)
++    if (chunk.type === 'tool-call') calls.push({ toolName: chunk.toolName, input: chunk.input })
++  return calls
++}
++
++test('an invented tool name runs as the real tool', async () => {
++  expect(await toolCallsFor('run_command', '{"command": "ls"}')).toEqual([
++    { toolName: 'run_terminal_command', input: { command: 'ls' } },
++  ])
++})
++
++test('arguments with an unescaped quote run as the model meant them', async () => {
++  expect(
++    await toolCallsFor(
++      'str_replace',
++      '{"path": "a.tsx", "replacements": [{"oldString": "<div className="a">", "newString": "b"}]}',
++    ),
++  ).toEqual([
++    {
++      toolName: 'str_replace',
++      input: { path: 'a.tsx', replacements: [{ oldString: '<div className="a">', newString: 'b' }] },
++    },
++  ])
++})
+diff --git a/sdk/src/impl/llm.ts b/sdk/src/impl/llm.ts
+index 1b8156c5f..0136d82fe 100644
+--- a/sdk/src/impl/llm.ts
++++ b/sdk/src/impl/llm.ts
+@@ -1,30 +1,33 @@
+ import { models, PROFIT_MARGIN } from '@codebuff/common/old-constants'
+ import { buildArray } from '@codebuff/common/util/array'
+ import { STREAM_RECOVERY_EVENT } from '@codebuff/common/util/axiom-only-log'
+ import { normalizeProviderRequestBodyForCacheDebug } from '@codebuff/common/util/cache-debug'
+-import { parseToolJson } from '@codebuff/common/tools/repair-tool-json'
++import {
++  parseToolJson,
++  TOOL_NAME_ALIASES,
++} from '@codebuff/common/tools/repair-tool-json'
+ import {
+   getErrorObject,
+   promptAborted,
+   promptSuccess,
+ } from '@codebuff/common/util/error'
+ import { convertCbToModelMessages } from '@codebuff/common/util/messages'
+ import { isExplicitlyDefinedModel } from '@codebuff/common/util/model-utils'
+ import { StopSequenceHandler } from '@codebuff/common/util/stop-sequence'
+ import {
+   streamText,
+   generateText,
+   Output,
+   NoSuchToolError,
+   APICallError,
+   ToolCallRepairError,
+   InvalidToolInputError,
+   TypeValidationError,
+ } from 'ai'
+ 
+ import { getModelForRequest } from './model-provider'
+ import type { CodebuffRequestHeadersProvider } from './model-provider'
+ import { byokModelLimits } from '../byok'
+ import type { ResolvedByokConnection } from '../byok'
+ import {
+   classifyErrorChunkRecovery,
+@@ -347,50 +350,57 @@ export async function* promptAiSdkStream(
+           const spawnAgentsInput = {
+             agents: [
+               {
+                 agent_type: correctedAgentType,
+                 ...(prompt !== undefined && { prompt }),
+                 ...(Object.keys(agentParams).length > 0 && {
+                   params: agentParams,
+                 }),
+               },
+             ],
+           }
+ 
+           logger.info(
+             { originalToolName: toolName, transformedInput: spawnAgentsInput },
+             'Transformed agent tool call to spawn_agents',
+           )
+ 
+           return {
+             ...toolCall,
+             toolName: 'spawn_agents',
+             input: JSON.stringify(spawnAgentsInput),
+           }
+         }
+       }
+ 
++      // A name models invent for a real tool (`run_command`): run it as that tool.
++      const alias = TOOL_NAME_ALIASES[toolName]
++      if (NoSuchToolError.isInstance(error) && alias && alias in tools) {
++        logger.info({ toolName, alias }, 'Renamed tool call to a real tool')
++        return { ...toolCall, toolName: alias }
++      }
++
+       // Arguments a model got slightly wrong (an unescaped quote in code): run the call as
+       // repaired, if a repair makes them parse; its schema still validates them.
+       if (InvalidToolInputError.isInstance(error)) {
+         const repaired = parseToolJson(toolCall.input)
+         if (repaired?.repair) {
+           logger.info(
+             { toolName, repair: repaired.repair },
+             'Repaired tool call arguments',
+           )
+           return { ...toolCall, input: JSON.stringify(repaired.value) }
+         }
+       }
+ 
+       // For all other cases (invalid args, unknown tools, etc.), pass through
+       // the original tool call.
+       logger.info(
+         {
+           toolName,
+           errorType: error.name,
+           error: error.message,
+         },
+         'Tool error - passing through for graceful error handling',
+       )
+       return toolCall
+     },
