@@ -1,0 +1,398 @@
+diff --git a/common/src/util/axiom-only-log.ts b/common/src/util/axiom-only-log.ts
+index f38cff132..36051f14d 100644
+--- a/common/src/util/axiom-only-log.ts
++++ b/common/src/util/axiom-only-log.ts
+@@ -334,50 +334,55 @@ const CONTEXT_PRUNING_FIELDS = {
+   cache_expiry_ms: 'number',
+   cache_expiry_min_tokens: 'number',
+   previous_summary_entry_count: 'number',
+   user_budget: 'number',
+   user_entry_count: 'number',
+   dropped_user_entry_count: 'number',
+   assistant_tool_budget: 'number',
+   assistant_tool_entry_count: 'number',
+   dropped_assistant_tool_entry_count: 'number',
+   summary_estimated_tokens: 'number',
+   mid_turn: 'boolean',
+   live_user_prompt_found: 'boolean',
+   live_user_prompt_text_preserved: 'boolean',
+   newest_entry_forced: 'boolean',
+ } as const satisfies AxiomOnlyFieldSchema
+ 
+ const STREAM_RECOVERY_FIELDS = {
+   metric: 'string',
+   source: 'string',
+   model: 'string',
+   agentId: 'string',
+   runId: 'string',
+   userInputId: 'string',
+   finishReason: 'string',
+   hasYieldedContent: 'boolean',
++  /** stream_silent_timeout_*: any model output part (text, reasoning, tool
++   *  input) had arrived before the timeout; the step is then not repeated. */
++  receivedModelOutput: 'boolean',
++  /** stream_silent_timeout_failed: the timed-out request was itself the repeat. */
++  repeated: 'boolean',
+   consecutive: 'number',
+   /** A 'provider-error' recovery's HTTP status (502, 429, ...). */
+   statusCode: 'number',
+ } as const satisfies AxiomOnlyFieldSchema
+ 
+ const FILE_WRITE_GUARD_FIELDS = {
+   metric: 'string',
+   toolName: 'string',
+   model: 'string',
+   agentId: 'string',
+   runId: 'string',
+   receivedChars: 'number',
+   oldLines: 'number',
+   newLines: 'number',
+   openBrackets: 'number',
+ } as const satisfies AxiomOnlyFieldSchema
+ 
+ const MECHANICAL_COMPACTION_SKIPPED_FIELDS = {
+   model: 'string',
+   agent_run_id: 'string',
+   trigger_reason: 'string',
+   /** `no_shrink`, `above_low_water` (the pass would have landed back at its
+    *  own trigger), `over_budget` (the live request alone does not fit) or
+    *  `error`. */
+   error_kind: 'string',
+diff --git a/sdk/src/impl/__tests__/silent-timeout-retry.test.ts b/sdk/src/impl/__tests__/silent-timeout-retry.test.ts
+index 2fada1113..8b0048dfd 100644
+--- a/sdk/src/impl/__tests__/silent-timeout-retry.test.ts
++++ b/sdk/src/impl/__tests__/silent-timeout-retry.test.ts
+@@ -1,159 +1,192 @@
+ /**
+  * The runtime's fetch inactivity timeout (Bun: no byte for 5 minutes) before a
+  * step received any output is sent once more. Hosted Cloud runs failed on it
+  * about 140 times a day (11-03/04), each after a silent 5 minutes, with nothing
+  * else in the stack retrying: the AI SDK treats a TimeoutError as an abort and
+  * the stream recoveries do not classify it.
+  */
+ import { afterEach, describe, expect, it } from 'bun:test'
+ 
++import { getAxiomOnlyLogEvent } from '@codebuff/common/util/axiom-only-log'
++
+ import { promptAiSdkStream } from '../llm'
+ 
+ import type { StreamChunk } from '@codebuff/common/types/contracts/llm'
+ 
+ const sse = (...events: unknown[]) =>
+   events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join('')
+ 
+ const chunk = (delta: Record<string, unknown>, finish: string | null = null) => ({
+   id: 'chatcmpl-1',
+   object: 'chat.completion.chunk',
+   created: 1,
+   model: 'test-model',
+   choices: [{ index: 0, delta, finish_reason: finish }],
+ })
+ 
+ const usage = {
+   id: 'chatcmpl-1',
+   object: 'chat.completion.chunk',
+   created: 1,
+   model: 'test-model',
+   choices: [],
+   usage: { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 },
+ }
+ 
+ const answer = () =>
+   new Response(
+     `${sse(chunk({ content: 'Done.' }), chunk({}, 'stop'), usage)}data: [DONE]\n\n`,
+     { headers: { 'Content-Type': 'text/event-stream' } },
+   )
+ 
+ const timeout = () =>
+   new DOMException('The operation timed out.', 'TimeoutError')
+ 
+ /** A body that streams `text` and then goes silent until the runtime gives up. */
+ const answerThenTimeout = (text: string) =>
+   new Response(
+     new ReadableStream<Uint8Array>({
+       start(controller) {
+         controller.enqueue(new TextEncoder().encode(sse(chunk({ content: text }))))
+         setTimeout(() => controller.error(timeout()), 5)
+       },
+     }),
+     { headers: { 'Content-Type': 'text/event-stream' } },
+   )
+ 
++/** What a host that forwards only allowlisted events (the hosted Cloud
++ *  worker's cloudSdkLogger) would ship of the SDK's logs. */
++let shipped: Array<{ event: string; data: Record<string, unknown> }> = []
++const ship = (data: unknown) => {
++  const event = getAxiomOnlyLogEvent(data)
++  if (event) shipped.push(event as (typeof shipped)[number])
++}
+ const logger = {
+-  debug() {},
+-  info() {},
+-  warn() {},
+-  error() {},
++  debug: ship,
++  info: ship,
++  warn: ship,
++  error: ship,
+   fatal() {},
+   trace() {},
+   child() {
+     return this
+   },
+ }
++const silentTimeoutEvents = () =>
++  shipped
++    .filter((e) => String(e.data.metric).startsWith('stream_silent_timeout'))
++    .map((e) => e.data)
+ 
+ describe('promptAiSdkStream after a silent request timeout', () => {
+   const originalFetch = globalThis.fetch
+   afterEach(() => {
+     globalThis.fetch = originalFetch
++    shipped = []
+   })
+ 
+   const run = (
+     responses: Array<() => Response | Promise<Response>>,
+     signal = new AbortController().signal,
+   ) => {
+     let calls = 0
+     globalThis.fetch = (async () => {
+       const next = responses[Math.min(calls, responses.length - 1)]!
+       calls++
+       return next()
+     }) as unknown as typeof fetch
+     const stream = promptAiSdkStream({
+       apiKey: 'test-key',
+       runId: 'run-1',
+       messages: [{ role: 'user', content: 'hello' }],
+       clientSessionId: 'session-1',
+       fingerprintId: 'fingerprint-1',
+       model: 'openai/gpt-5.6-luna',
+       userId: 'user-1',
+       userInputId: 'input-1',
+       sendAction: async () => undefined,
+       logger,
+       trackEvent: async () => undefined,
+       signal,
+     } as unknown as Parameters<typeof promptAiSdkStream>[0])
+     return { stream, calls: () => calls }
+   }
+ 
+   const drain = async (stream: ReturnType<typeof run>['stream']) => {
+     const chunks: StreamChunk[] = []
+     for (;;) {
+       const next = await stream.next()
+       if (next.done) return { chunks, result: next.value }
+       chunks.push(next.value)
+     }
+   }
+ 
+   it('sends a request that timed out before any output once more', async () => {
+     const attempt = run([
+       () => {
+         throw timeout()
+       },
+       answer,
+     ])
+     const { chunks, result } = await drain(attempt.stream)
+     expect(attempt.calls()).toBe(2)
+     expect(chunks).toEqual([expect.objectContaining({ type: 'text', text: 'Done.' })])
+     expect(result.aborted).toBe(false)
++    expect(silentTimeoutEvents()).toEqual([
++      expect.objectContaining({ metric: 'stream_silent_timeout_retry' }),
++    ])
+   })
+ 
+   it('fails as before when the repeat times out too', async () => {
+     const attempt = run([
+       () => {
+         throw timeout()
+       },
+     ])
+     await expect(drain(attempt.stream)).rejects.toMatchObject({
+       name: 'TimeoutError',
+     })
+     expect(attempt.calls()).toBe(2)
++    expect(silentTimeoutEvents()).toEqual([
++      expect.objectContaining({ metric: 'stream_silent_timeout_retry' }),
++      expect.objectContaining({
++        metric: 'stream_silent_timeout_failed',
++        repeated: true,
++        receivedModelOutput: false,
++      }),
++    ])
+   })
+ 
+   it('never repeats a step that already streamed output', async () => {
+     const attempt = run([() => answerThenTimeout('Looking at the handler, '), answer])
+     const outcome = await drain(attempt.stream).catch((error: unknown) => ({ error }))
+     expect(attempt.calls()).toBe(1)
++    expect(silentTimeoutEvents()).toEqual([
++      expect.objectContaining({
++        metric: 'stream_silent_timeout_failed',
++        repeated: false,
++        receivedModelOutput: true,
++        hasYieldedContent: true,
++      }),
++    ])
+     // What the partial step does is unchanged; it is only never sent again.
+     if ('chunks' in outcome)
+       expect(outcome.chunks.filter((c) => c.type === 'text').map((c) => (c as { text: string }).text))
+         .toEqual(['Looking at the handler, '])
+   })
+ 
+   it('does not repeat a request the user cancelled', async () => {
+     const abort = new AbortController()
+     const attempt = run(
+       [
+         () => {
+           abort.abort()
+           throw timeout()
+         },
+         answer,
+       ],
+       abort.signal,
+     )
+     await drain(attempt.stream).catch(() => {})
+     expect(attempt.calls()).toBe(1)
+   })
+ })
+diff --git a/sdk/src/impl/llm.ts b/sdk/src/impl/llm.ts
+index fe7a027fd..aca9f8f3a 100644
+--- a/sdk/src/impl/llm.ts
++++ b/sdk/src/impl/llm.ts
+@@ -470,56 +470,71 @@ export async function* promptAiSdkStream(
+ 
+   // A healthy stream always delivers a finish part with a real finishReason
+   // (and usage) before ending; its absence after the loop can mean a cut
+   // connection or an incompatible provider stream. See stream-interruption.ts.
+   let finishInfo: StreamFinishInfo | undefined
+   // Bun/undici can throw when a response body is severed instead of ending the
+   // iterator cleanly. Feed that through the same capped continuation path as a
+   // clean end without a finish marker. A retryable provider error reported in
+   // band (5xx/429 error chunk) takes the same path: see
+   // classifyErrorChunkRecovery.
+   let thrownStreamRecovery: StreamEndRecovery | undefined
+   // Any model output part, including one still held by the stop-sequence
+   // buffer or a tool call's streamed input: once one arrived, the step is not
+   // repeated (see silentTimeoutRetry).
+   let receivedModelOutput = false
+   let retryAfterSilentTimeout = false
+   /**
+    * The runtime's 5-minute fetch inactivity timeout (isFetchIdleTimeoutError)
+    * before this step received any output: nothing reached the user and no tool
+    * call exists, so the same request is sent once more. No other layer retries
+    * it: the AI SDK treats a TimeoutError as an abort, and the stream recoveries
+    * below do not classify it. A BYOK request's timeout is sanitized into a
+    * transient network error, which the stream-interrupted recovery already
+    * retries, so it is left to that. A second silent timeout fails as before.
+    */
+-  const silentTimeoutRetry = (error: unknown) =>
+-    !idleTimeoutRetried &&
+-    !params.byok &&
+-    !params.signal.aborted &&
+-    !receivedModelOutput &&
+-    isFetchIdleTimeoutError(error)
++  const silentTimeoutRetry = (error: unknown) => {
++    if (params.byok || params.signal.aborted || !isFetchIdleTimeoutError(error))
++      return false
++    if (!idleTimeoutRetried && !receivedModelOutput) return true
++    // Why this one fails instead: output had arrived, or it was the repeat.
++    // STREAM_RECOVERY_EVENT, so a host that forwards only allowlisted events
++    // (the hosted Cloud worker's cloudSdkLogger) still ships it.
++    logger.warn(
++      {
++        axiomEvent: STREAM_RECOVERY_EVENT,
++        metric: 'stream_silent_timeout_failed',
++        model: params.model,
++        userInputId: params.userInputId,
++        hasYieldedContent,
++        receivedModelOutput,
++        repeated: idleTimeoutRetried,
++      },
++      'Model request timed out with no data and was not sent again',
++    )
++    return false
++  }
+   const streamIterator = response.stream[Symbol.asyncIterator]()
+   const recoverThrownStream = (
+     error: unknown,
+     classify: typeof classifyThrownStreamRecovery = classifyThrownStreamRecovery,
+   ): StreamEndRecovery | null => {
+     const recovery = classify({
+       aborted: params.signal.aborted,
+       error,
+     })
+     if (!recovery) return null
+     // These final-result promises can reject with the same transport error.
+     // Observe them now so the recovery yield below cannot leave an unhandled
+     // rejection while the consumer starts the continuation step.
+     void Promise.allSettled([
+       response.response,
+       response.request,
+       response.usage,
+       response.providerMetadata,
+     ])
+     return recovery
+   }
+ 
+   while (true) {
+     let iteration: Awaited<ReturnType<typeof streamIterator.next>>
+     try {
+@@ -686,53 +701,53 @@ export async function* promptAiSdkStream(
+       }
+     }
+     if (chunkValue.type === 'tool-call') {
+       hasYieldedToolCall = true
+       // The call's provider metadata (e.g. Gemini's thought signature) rides
+       // into the history's tool-call part, so the next request replays it.
+       yield chunkValue.providerMetadata
+         ? {
+             ...chunkValue,
+             providerOptions: chunkValue.providerMetadata as ProviderMetadata,
+           }
+         : chunkValue
+     }
+   }
+   if (retryAfterSilentTimeout) {
+     // The abandoned attempt's final-result promises reject with the same
+     // timeout; observe them so none is left unhandled.
+     void Promise.allSettled([
+       response.response,
+       response.request,
+       response.usage,
+       response.providerMetadata,
+     ])
+     logger.warn(
+       {
++        axiomEvent: STREAM_RECOVERY_EVENT,
+         metric: 'stream_silent_timeout_retry',
+         model: params.model,
+-        userId: params.userId,
+         userInputId: params.userInputId,
+       },
+       'Model request timed out before any output; sending it once more',
+     )
+     return yield* promptAiSdkStream(params, true)
+   }
+   const flushed = stopSequenceHandler.flush()
+   if (flushed) {
+     hasYieldedContent = true
+     yield {
+       type: 'text',
+       text: flushed,
+       ...(agentChunkMetadata ?? {}),
+     }
+   }
+ 
+   if (params.signal.aborted) reportUsageIncomplete()
+   if (thrownStreamRecovery && params.signal.aborted) {
+     return promptAborted('User cancelled input')
+   }
+   const recovery =
+     thrownStreamRecovery ??
+     classifyStreamEndRecovery({
+       aborted: params.signal.aborted,
+       finish: finishInfo,
