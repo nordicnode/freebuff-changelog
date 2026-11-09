@@ -1,0 +1,170 @@
+diff --git a/common/src/util/__tests__/parse-skill-yaml.test.ts b/common/src/util/__tests__/parse-skill-yaml.test.ts
+index a5eb0c73a..096364a23 100644
+--- a/common/src/util/__tests__/parse-skill-yaml.test.ts
++++ b/common/src/util/__tests__/parse-skill-yaml.test.ts
+@@ -1,52 +1,105 @@
+ import { describe, expect, test } from 'bun:test'
+ 
+ import matter from 'gray-matter'
+ 
+-import { parseSkillFileContent } from '../parse-skill'
++import { parseSkillFileContent, readSkillDocument } from '../parse-skill'
+ 
+ // AB827V0 #288: skill frontmatter is user-controlled, and gray-matter's own
+ // YAML engine is js-yaml 3 (below the GHSA-mh29-5h37-fv8m floor). Frontmatter
+ // now goes through `yaml` instead; these pin that a merge-key payload stays
+ // inert and that ordinary frontmatter still parses.
+ describe('skill frontmatter YAML', () => {
+   test('a merge-key payload neither throws nor reaches Object.prototype', () => {
+     const content = [
+       '---',
+       'name: demo-skill',
+       'description: A skill',
+       'base: &base',
+       '  __proto__:',
+       '    polluted: yes',
+       'merged:',
+       '  <<: *base',
+       '---',
+       'Body',
+     ].join('\n')
+     parseSkillFileContent(content, {
+       directoryName: 'demo-skill',
+       filePath: '/tmp/demo-skill/SKILL.md',
+     })
+     expect(({} as Record<string, unknown>).polluted).toBeUndefined()
+   })
+ 
+   test('ordinary frontmatter still parses', () => {
+     const skill = parseSkillFileContent(
+       ['---', 'name: demo-skill', 'description: Does a thing', '---', 'Body'].join('\n'),
+       { directoryName: 'demo-skill', filePath: '/tmp/demo-skill/SKILL.md' },
+     )
+     expect(skill?.name).toBe('demo-skill')
+     expect(skill?.description).toBe('Does a thing')
+   })
+ 
++  // A SKILL.md saved on Windows: gray-matter left the last frontmatter line's
++  // `\r` in the block, so `name: x\r` failed the name rule and the skill was
++  // skipped without a word (Discord #help, 2026-11-08).
++  describe('CRLF and BOM files parse as their LF twins', () => {
++    const lf = (lines: string[]) => [...lines, 'Body', ''].join('\n')
++    const variants = (doc: string) => ({
++      crlf: doc.replace(/\n/g, '\r\n'),
++      'bom + crlf': `﻿${doc.replace(/\n/g, '\r\n')}`,
++      'bom + lf': `﻿${doc}`,
++    })
++    const docs = {
++      'name last': lf(['---', 'description: Does a thing', 'name: demo-skill', '---']),
++      'quoted value last': lf([
++        '---',
++        'name: demo-skill',
++        'description: "Does a thing"',
++        '---',
++      ]),
++      'flag last': lf([
++        '---',
++        'name: demo-skill',
++        'description: Does a thing',
++        'disable-model-invocation: true',
++        '---',
++      ]),
++    }
++    for (const [label, doc] of Object.entries(docs)) {
++      const twin = parseSkillFileContent(doc, {
++        directoryName: 'demo-skill',
++        filePath: '/tmp/demo-skill/SKILL.md',
++      })
++      for (const [variant, content] of Object.entries(variants(doc))) {
++        test(`${label}, ${variant}`, () => {
++          const skill = parseSkillFileContent(content, {
++            directoryName: 'demo-skill',
++            filePath: '/tmp/demo-skill/SKILL.md',
++          })
++          expect(skill?.name).toBe('demo-skill')
++          expect(skill?.description).toBe('Does a thing')
++          expect(skill?.disableModelInvocation).toBe(twin?.disableModelInvocation)
++          // The document itself is kept byte for byte.
++          expect(skill?.content).toBe(content)
++
++          // The Settings upload reads through the same parser.
++          expect(readSkillDocument(content, 'upload')).toMatchObject({
++            skill: { name: 'demo-skill', description: 'Does a thing' },
++            body: 'Body\n',
++          })
++        })
++      }
++    }
++  })
++
+   // gray-matter's DEFAULT engine (still used by the web docs) calls js-yaml 3's
+   // `safeLoad`, which js-yaml 4 removed; patches/gray-matter@4.0.3.patch
+   // switches it to `load`, which is safe by default in 4. Without the patch
+   // this throws "Function yaml.safeLoad is removed in js-yaml 4".
+   test("gray-matter's default engine runs on js-yaml 4 and refuses JS tags", () => {
+     const fresh = (s: string) => matter(s, { excerpt: false })
+     expect(fresh('---\ntitle: Hello\n---\nBody').data).toEqual({ title: 'Hello' })
+     expect(() =>
+       fresh('---\nf: !!js/function "function () {}"\n---\n'),
+     ).toThrow('unknown tag')
+   })
+ })
+diff --git a/common/src/util/parse-skill.ts b/common/src/util/parse-skill.ts
+index 8ab37542a..35eb767e0 100644
+--- a/common/src/util/parse-skill.ts
++++ b/common/src/util/parse-skill.ts
+@@ -106,44 +106,53 @@ const PLAIN_FRONTMATTER_OPENER = /^\uFEFF?---[ \t]*\r?\n/
+ 
+ const refuseEngine = (): never => {
+   throw new Error('SKILL.md frontmatter must be YAML')
+ }
+ 
+ // Passing options also keeps gray-matter from caching every parsed document
+ // in its module-level cache, which it does only when called without options.
+ const MATTER_OPTIONS = {
+   language: 'yaml',
+   engines: {
+     javascript: refuseEngine,
+     coffee: refuseEngine,
+     // gray-matter's own YAML engine is js-yaml 3, whose merge-key handling
+     // can pollute Object.prototype, and a skill's frontmatter is
+     // user-controlled (AB827V0 #288). `yaml` parses YAML 1.2 with merge keys
+     // off by default.
+     yaml: (source: string) => parseYaml(source) as object,
+   },
+ }
+ 
+ /**
+  * YAML frontmatter between `---` markers at the very top, or `null`.
+  *
+  * Empty frontmatter is `null` rather than an empty object: a SKILL.md with no
+  * `name` cannot be addressed, so there is nothing for a caller to do with it.
++ *
++ * Line endings are normalised first. gray-matter hands the engine the block
++ * up to the closing `\n---`, so a CRLF file's last line keeps its `\r`, and
++ * `yaml` (unlike js-yaml) keeps that in the value: `name: x\r` fails the name
++ * rule and a quoted last value fails to parse, silently dropping every skill
++ * saved on Windows.
+  */
+ function parseFrontmatter(content: string): {
+   frontmatter: Record<string, unknown>
+   body: string
+ } | null {
+   if (!PLAIN_FRONTMATTER_OPENER.test(content)) return null
+   try {
+-    const parsed = matter(content, MATTER_OPTIONS)
++    const parsed = matter(
++      content.replace(/^﻿/, '').replace(/\r\n/g, '\n'),
++      MATTER_OPTIONS,
++    )
+     if (!parsed.data || Object.keys(parsed.data).length === 0) {
+       return null
+     }
+     return {
+       frontmatter: parsed.data as Record<string, unknown>,
+       body: parsed.content,
+     }
+   } catch {
+     return null
+   }
+ }
