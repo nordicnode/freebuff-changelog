@@ -1,0 +1,572 @@
+diff --git a/sdk/src/__tests__/byok-run.test.ts b/sdk/src/__tests__/byok-run.test.ts
+index 8dbadc126..367734e7b 100644
+--- a/sdk/src/__tests__/byok-run.test.ts
++++ b/sdk/src/__tests__/byok-run.test.ts
+@@ -152,50 +152,78 @@ describe('direct BYOK SDK runs', () => {
+     if (changed.output.type !== 'error') throw new Error('expected inference pin error')
+     expect(changed.output.message).toContain('different inference connection')
+ 
+     const beforeSwitch = seen.length
+     const hostedHistory = { ...result, inference: { source: 'codebuff' as const } }
+     const switched = await client.run({ agent: agent.id, prompt: 'Continue with my key.', previousRun: hostedHistory })
+     expect(switched.output.type).not.toBe('error')
+     expect(switched.inference).toEqual(result.inference)
+     expect(seen.length).toBeGreaterThan(beforeSwitch)
+     expect(seen.at(-1)!.body).toContain('Create result.txt.')
+     expect(seen.slice(beforeSwitch).every(request => request.url === 'http://127.0.0.1:9876/v1/chat/completions')).toBe(true)
+     const hostedClient = new CodebuffClient({ cwd, apiKey: 'hosted-test-key', agentDefinitions: [agent] })
+     const beforeReverse = seen.length
+     const reverse = await hostedClient.run({ agent: agent.id, prompt: 'Go back.', previousRun: switched })
+     expect(reverse.output.type).toBe('error')
+     expect(seen).toHaveLength(beforeReverse)
+ 
+     const legacy = await client.run({
+       agent: agent.id, prompt: 'Legacy.', previousRun: { ...result, inference: undefined },
+     })
+     expect(legacy.output.type).toBe('error')
+     if (legacy.output.type !== 'error') throw new Error('expected legacy pin error')
+     expect(legacy.output.message).toContain('no inference source pin')
+   }, 30_000)
+ 
++  test('an output limit of window - 1 still gives the root and a carried helper a valid budget', async () => {
++    const bodies: any[] = []
++    globalThis.fetch = (async (_input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
++      bodies.push(JSON.parse(String(init?.body)))
++      return sse({ id: 'done', object: 'chat.completion.chunk', created: 1, model: 'm', choices: [{ index: 0, delta: { content: 'Done.' }, finish_reason: 'stop' }] })
++    }) as unknown as typeof fetch
++    // A hosted turn's helper stays in the chat's saved state, and the next
++    // turn on the user's key validates it with the root (Cloud, 2026-11).
++    const helper: AgentDefinition = {
++      id: 'researcher-web', displayName: 'Web Researcher', model: 'openai/gpt-6-luna',
++      toolNames: ['read_url'], systemPrompt: 'Research the question.',
++    }
++    const client = new CodebuffClient({
++      agentDefinitions: [agent, helper],
++      byok: connection({ contextWindow: 131_072, maxOutputTokens: 131_071 }),
++    })
++    const result = await client.run({ agent: agent.id, prompt: 'Summarize.' })
++
++    expect(result.output.type).not.toBe('error')
++    const templates = result.sessionState!.fileContext.agentTemplates
++    for (const id of [agent.id, helper.id]) {
++      expect(templates[id]!.compactContext).toMatchObject({ maxContextLength: 58_982, maxOutputTokens: 65_536 })
++    }
++    // The request asks for no more output than the window leaves it.
++    expect(bodies).toHaveLength(1)
++    expect(bodies[0].max_tokens ?? bodies[0].max_completion_tokens).toBe(65_536)
++  })
++
+   test('refuses server-side web_search without contacting a hosted backend', async () => {
+     const requests: string[] = []
+     const bodies: string[] = []
+     let step = 0
+     globalThis.fetch = (async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+       requests.push(String(input))
+       bodies.push(String(init?.body))
+       step += 1
+       if (step === 1) {
+         return sse({ id: 'tool', object: 'chat.completion.chunk', created: 1, model: 'm', choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: 'search', type: 'function', function: { name: 'web_search', arguments: JSON.stringify({ query: 'test' }) } }] }, finish_reason: 'tool_calls' }] })
+       }
+       return sse({ id: 'done', object: 'chat.completion.chunk', created: 1, model: 'm', choices: [{ index: 0, delta: { content: 'done' }, finish_reason: 'stop' }] })
+     }) as unknown as typeof fetch
+     const client = new CodebuffClient({
+       agentDefinitions: [{ ...agent, id: 'byok-web-agent', toolNames: ['web_search'] }],
+       byok: { id: 'web-connection', revision: 1, name: 'web', provider: 'openai-compatible', baseUrl: 'http://127.0.0.1:9876/v1', model: 'm', credentialRef: 'connection:web-connection:1', createdAt: '2026-01-01T00:00:00.000Z', updatedAt: '2026-01-01T00:00:00.000Z', apiKey: 'web-canary' },
+     })
+     const result = await client.run({ agent: 'byok-web-agent', prompt: 'Search.' })
+     expect(result.output.type).not.toBe('error')
+     expect(requests).toHaveLength(2)
+     expect(requests.every((url) => url === 'http://127.0.0.1:9876/v1/chat/completions')).toBe(true)
+     // The refusal is what the model sees as the tool result.
+     expect(bodies[1]).toContain('unavailable in a direct BYOK run')
+   })
+ 
+diff --git a/sdk/src/byok.test.ts b/sdk/src/byok.test.ts
+index 3639930f7..616183acc 100644
+--- a/sdk/src/byok.test.ts
++++ b/sdk/src/byok.test.ts
+@@ -1,50 +1,52 @@
+ import { afterEach, describe, expect, test } from 'bun:test'
+ import { promises as fs } from 'node:fs'
+ import { tmpdir } from 'node:os'
+ import path from 'node:path'
+ import {
+   ByokCredentialError,
+   createByokConnectionStore,
+   createBunByokConnectionStore,
+   createBunByokMetadataStore,
+   normalizeByokBaseUrl,
+   byokModelLimits,
+   byokCompletionUrl,
+   BYOK_DEFAULT_CONTEXT_WINDOW,
++  BYOK_DEFAULT_MAX_OUTPUT_TOKENS,
+   BYOK_DISCOVERED_CONTEXT_WINDOW_CAP,
+   BYOK_UNKNOWN_REMOTE_CONTEXT_WINDOW,
+   clearByokContextWindowCache,
+   contextWindowFromModelList,
+   withEffectiveByokLimits,
+   type ResolvedByokConnection,
+   type ByokConnection,
+   type ByokSecretStore,
+ } from './byok'
+ import {
+   CHATGPT_CONTEXT_WINDOW,
+   CHATGPT_DEFAULT_MODELS,
++  CHATGPT_MAX_OUTPUT_TOKENS,
+   CHATGPT_SIGN_IN_AGAIN,
+   type ChatGptTokens,
+ } from './chatgpt'
+ import { fakeChatGptJwt } from './__tests__/fixtures/chatgpt-jwt'
+ 
+ const directories: string[] = []
+ afterEach(async () => {
+   for (const dir of directories.splice(0))
+     await fs.rm(dir, { recursive: true, force: true })
+ })
+ const input = {
+   name: 'Fixture',
+   provider: 'openai-compatible' as const,
+   model: 'fixture-model',
+   baseUrl: 'http://127.0.0.1:9999/v1',
+   apiKey: 'canary-secret',
+ }
+ function secrets() {
+   const values = new Map<string, string>()
+   const store: ByokSecretStore = {
+     get: async (ref) => values.get(ref),
+     set: async (ref, value) => {
+       values.set(ref, value)
+     },
+     delete: async (ref) => {
+@@ -576,58 +578,109 @@ describe('shared persistent BYOK store', () => {
+     }
+     try {
+       const store = createBunByokConnectionStore({ directory })
+       const added = await store.create(input)
+       expect(calls).toEqual([
+         [
+           'com.freebuff.byok.v1',
+           added.credentialRef,
+           input.apiKey,
+         ],
+       ])
+       expect((await store.resolve(added)).apiKey).toBe(input.apiKey)
+       await store.remove(added)
+     } finally {
+       ;(Bun as unknown as { secrets: unknown }).secrets = nativeSecrets
+     }
+   })
+ })
+ 
+ test('custom model limits reserve output and reject impossible capacities', () => {
+   expect(
+     byokModelLimits({ contextWindow: 8192, maxOutputTokens: 2048 }),
+   ).toEqual({
+     contextWindow: 8192,
+     maxOutputTokens: 2048,
++    reservedOutputTokens: 2048,
+     maxContextLength: 5529,
+   })
+   expect(() =>
+     byokModelLimits({ contextWindow: 8192, maxOutputTokens: 8192 }),
+   ).toThrow()
+   expect(() => byokModelLimits({ contextWindow: NaN })).toThrow()
+ })
+ 
++test('an output limit just under the window still leaves a positive compaction budget', () => {
++  // window - 1 is what the settings form's `max` offers; it gave a budget of 0,
++  // which the agent schema refuses, so every Cloud run on it failed (2026-11).
++  for (const contextWindow of [4096, 32_768, 131_072, 202_752, 2_000_000]) {
++    const half = Math.floor(contextWindow / 2)
++    for (const maxOutputTokens of [contextWindow - 1, contextWindow - 2, half + 1]) {
++      const limits = byokModelLimits({ contextWindow, maxOutputTokens })
++      expect(limits.maxOutputTokens).toBe(maxOutputTokens)
++      expect(limits.reservedOutputTokens).toBe(half)
++      expect(limits.maxContextLength).toBe(Math.floor((contextWindow - half) * 0.9))
++      expect(Number.isInteger(limits.maxContextLength)).toBe(true)
++      expect(limits.maxContextLength).toBeGreaterThanOrEqual(1843)
++    }
++  }
++  expect(byokModelLimits({ contextWindow: 131_072, maxOutputTokens: 131_071 })).toEqual({
++    contextWindow: 131_072,
++    maxOutputTokens: 131_071,
++    reservedOutputTokens: 65_536,
++    maxContextLength: 58_982,
++  })
++})
++
++test('limits whose output fits in half the window keep their budget and output', () => {
++  for (const [contextWindow, maxOutputTokens] of [
++    [BYOK_DEFAULT_CONTEXT_WINDOW, BYOK_DEFAULT_MAX_OUTPUT_TOKENS],
++    [BYOK_UNKNOWN_REMOTE_CONTEXT_WINDOW, BYOK_DEFAULT_MAX_OUTPUT_TOKENS],
++    [CHATGPT_CONTEXT_WINDOW, CHATGPT_MAX_OUTPUT_TOKENS],
++    // The Claude Code and Codex key rows (web/src/server/byok/agent-keys.ts).
++    [200_000, 32_000],
++    [272_000, 32_000],
++    [102_400, 8_192],
++    [8_192, 4_096],
++  ] as const) {
++    expect(byokModelLimits({ contextWindow, maxOutputTokens })).toEqual({
++      contextWindow,
++      maxOutputTokens,
++      reservedOutputTokens: maxOutputTokens,
++      maxContextLength: Math.floor((contextWindow - maxOutputTokens) * 0.9),
++    })
++  }
++  // An unset output limit is still a quarter of the window, at most 4,096.
++  expect(byokModelLimits({})).toEqual({
++    contextWindow: 32_768,
++    maxOutputTokens: 4_096,
++    reservedOutputTokens: 4_096,
++    maxContextLength: 25_804,
++  })
++  expect(byokModelLimits({ contextWindow: 8_192 }).maxContextLength).toBe(5_529)
++})
++
+ describe('effective BYOK limits for a run', () => {
+   afterEach(() => clearByokContextWindowCache())
+   function resolved(
+     overrides: Partial<ByokConnection> = {},
+   ): ResolvedByokConnection {
+     const connection = {
+       id: '11111111-1111-4111-8111-111111111111',
+       revision: 1,
+       name: 'Fixture',
+       provider: 'openai-compatible' as const,
+       baseUrl: 'https://llm.example.com/v1',
+       model: 'acme/coder',
+       contextWindow: 32_768,
+       maxOutputTokens: 4_096,
+       credentialRef: 'connection:11111111-1111-4111-8111-111111111111:1',
+       createdAt: '2026-09-27T00:00:00.000Z',
+       updatedAt: '2026-09-27T00:00:00.000Z',
+       ...overrides,
+     }
+     const assertCurrent = async () => {}
+     Object.defineProperty(connection, 'apiKey', {
+       value: 'listing-secret',
+       enumerable: false,
+     })
+     Object.defineProperty(connection, 'assertCurrent', {
+diff --git a/sdk/src/byok.ts b/sdk/src/byok.ts
+index 5280ec95c..ba49ebec6 100644
+--- a/sdk/src/byok.ts
++++ b/sdk/src/byok.ts
+@@ -280,74 +280,90 @@ function parseConnections(value: unknown): ByokConnection[] {
+           !item.credentialRef.startsWith(`connection:${item.id}:`)
+     ) {
+       throw new ByokConnectionStateError(
+         'BYOK credential reference belongs to a different connection',
+       )
+     }
+   }
+   return parsed.data
+ }
+ /**
+  * The limits a connection gets when nobody chose any. The Desktop settings
+  * form pre-fills exactly this pair, and the store persists it, so a stored
+  * 32,768 / 4,096 almost always means "not configured" rather than a decision.
+  */
+ export const BYOK_DEFAULT_CONTEXT_WINDOW = 32_768
+ export const BYOK_DEFAULT_MAX_OUTPUT_TOKENS = 4_096
+ /** A remote endpoint that does not report its model's window. */
+ export const BYOK_UNKNOWN_REMOTE_CONTEXT_WINDOW = 131_072
+ /**
+  * The most an automatically-chosen window may be: the hosted budget's order of
+  * magnitude, since every token of a BYOK request is billed to the user's key.
+  * A user who wants more types it into the connection.
+  */
+ export const BYOK_DISCOVERED_CONTEXT_WINDOW_CAP = 400_000
+ 
++/**
++ * A connection's limits as a run uses them. `maxOutputTokens` is the stored
++ * setting; `reservedOutputTokens` is the most output a request asks for, and
++ * `maxContextLength` (the compaction budget) is 90% of the window left after it.
++ *
++ * The reservation is at most half the window. The settings form's `max`
++ * offers an output limit of window - 1, which left a budget of 0: the agent
++ * schema then refused every agent of the run before any model call (Cloud,
++ * 2026-11). A prompt plus output over the window is also a request a strict
++ * endpoint refuses. Any valid window keeps a budget of at least 1,843.
++ */
+ export function byokModelLimits(connection: {
+   contextWindow?: number
+   maxOutputTokens?: number
+ }) {
+   const contextWindow = connection.contextWindow ?? BYOK_DEFAULT_CONTEXT_WINDOW
+   const maxOutputTokens =
+     connection.maxOutputTokens ??
+     Math.min(BYOK_DEFAULT_MAX_OUTPUT_TOKENS, Math.floor(contextWindow / 4))
+   if (
+     !Number.isInteger(contextWindow) ||
+     contextWindow < 4096 ||
+     contextWindow > 2_000_000 ||
+     !Number.isInteger(maxOutputTokens) ||
+     maxOutputTokens < 1 ||
+     maxOutputTokens >= contextWindow
+   ) {
+     throw new Error(
+       'Choose a context limit of 4096–2000000 tokens and a smaller positive output limit',
+     )
+   }
++  const reservedOutputTokens = Math.min(
++    maxOutputTokens,
++    Math.floor(contextWindow / 2),
++  )
+   return {
+     contextWindow,
+     maxOutputTokens,
+-    maxContextLength: Math.floor((contextWindow - maxOutputTokens) * 0.9),
++    reservedOutputTokens,
++    maxContextLength: Math.floor((contextWindow - reservedOutputTokens) * 0.9),
+   }
+ }
+ 
+ /** True when the connection carries the untouched default limits (see above). */
+ export function hasDefaultByokLimits(connection: {
+   contextWindow?: number
+   maxOutputTokens?: number
+ }): boolean {
+   return (
+     (connection.contextWindow ?? BYOK_DEFAULT_CONTEXT_WINDOW) ===
+       BYOK_DEFAULT_CONTEXT_WINDOW &&
+     (connection.maxOutputTokens ?? BYOK_DEFAULT_MAX_OUTPUT_TOKENS) ===
+       BYOK_DEFAULT_MAX_OUTPUT_TOKENS
+   )
+ }
+ 
+ function isLoopbackByokEndpoint(
+   connection: Pick<ByokConnection, 'provider' | 'baseUrl'>,
+ ): boolean {
+   if (connection.provider !== 'openai-compatible') return false
+   try {
+     const { hostname } = new URL(
+       normalizeByokBaseUrl(connection.provider, connection.baseUrl),
+     )
+     return ['localhost', '127.0.0.1', '[::1]'].includes(hostname)
+diff --git a/sdk/src/impl/llm.ts b/sdk/src/impl/llm.ts
+index 39f59c6f4..f253ed9d9 100644
+--- a/sdk/src/impl/llm.ts
++++ b/sdk/src/impl/llm.ts
+@@ -239,52 +239,52 @@ export async function* promptAiSdkStream(
+ 
+   if (params.signal.aborted) {
+     logger.info(
+       {
+         userId: params.userId,
+         userInputId: params.userInputId,
+       },
+       'Skipping stream due to canceled user input',
+     )
+     return promptAborted('User cancelled input')
+   }
+ 
+   const aiSDKModel = getModelForRequest({
+     apiKey: params.apiKey,
+     model: params.model,
+     costMode: params.costMode,
+     userId: params.userId,
+     byok: params.byok,
+     requestHeaders: params.requestHeaders,
+   })
+ 
+   const response = streamText({
+     ...streamParams,
+     ...(params.byok && {
+       maxOutputTokens: Math.min(
+-        params.maxOutputTokens ?? byokModelLimits(params.byok).maxOutputTokens,
+-        byokModelLimits(params.byok).maxOutputTokens,
++        params.maxOutputTokens ?? byokModelLimits(params.byok).reservedOutputTokens,
++        byokModelLimits(params.byok).reservedOutputTokens,
+       ),
+     }),
+     abortSignal: params.signal,
+     prompt: undefined,
+     model: aiSDKModel,
+     messages: convertCbToModelMessages(params),
+     allowSystemInMessages: true,
+     include: {
+       ...streamParams.include,
+       requestBody: true,
+     },
+     providerOptions: params.byok ? originalProviderOptions : getProviderOptions({
+       ...params,
+       providerOptions: originalProviderOptions,
+       agentProviderOptions: params.agentProviderOptions,
+     }),
+     // Handle tool call errors gracefully by passing them through to our validation layer
+     // instead of throwing (which would halt the agent). The only special case is when
+     // the tool name matches a spawnable agent - transform those to spawn_agents calls.
+     experimental_repairToolCall: async ({ toolCall, tools, error }) => {
+       const { spawnableAgents = [], localAgentTemplates = {} } = params
+       const toolName = toolCall.toolName
+ 
+       // Check if this is a NoSuchToolError for a spawnable agent
+       // If so, transform to spawn_agents call
+@@ -855,52 +855,52 @@ export async function promptAiSdk(
+ 
+   if (params.signal.aborted) {
+     logger.info(
+       {
+         userId: params.userId,
+         userInputId: params.userInputId,
+       },
+       'Skipping prompt due to canceled user input',
+     )
+     return promptAborted('User cancelled input')
+   }
+ 
+   const aiSDKModel = getModelForRequest({
+     apiKey: params.apiKey,
+     model: params.model,
+     costMode: params.costMode,
+     userId: params.userId,
+     byok: params.byok,
+     requestHeaders: params.requestHeaders,
+   })
+ 
+   const response = await generateText({
+     ...params,
+     ...(params.byok && {
+       maxOutputTokens: Math.min(
+-        params.maxOutputTokens ?? byokModelLimits(params.byok).maxOutputTokens,
+-        byokModelLimits(params.byok).maxOutputTokens,
++        params.maxOutputTokens ?? byokModelLimits(params.byok).reservedOutputTokens,
++        byokModelLimits(params.byok).reservedOutputTokens,
+       ),
+     }),
+     prompt: undefined,
+     model: aiSDKModel,
+     messages: convertCbToModelMessages(params),
+     allowSystemInMessages: true,
+     include: {
+       ...params.include,
+       requestBody: true,
+     },
+     providerOptions: params.byok ? undefined : getProviderOptions({
+       ...params,
+       agentProviderOptions: params.agentProviderOptions,
+       cacheDebugCorrelation: params.cacheDebugCorrelation,
+     }),
+   })
+   emitCacheDebugProviderRequest({
+     callback: params.onCacheDebugProviderRequestBuilt,
+     provider: getModelProvider(aiSDKModel),
+     rawBody: response.request?.body,
+   })
+   emitCacheDebugUsage({
+     callback: params.onCacheDebugUsageReceived,
+     usage: response.usage,
+   })
+@@ -938,52 +938,52 @@ export async function promptAiSdkStructured<T>(
+   const { logger } = params
+ 
+   if (params.signal.aborted) {
+     logger.info(
+       {
+         userId: params.userId,
+         userInputId: params.userInputId,
+       },
+       'Skipping structured prompt due to canceled user input',
+     )
+     return promptAborted('User cancelled input')
+   }
+   const aiSDKModel = getModelForRequest({
+     apiKey: params.apiKey,
+     model: params.model,
+     costMode: params.costMode,
+     userId: params.userId,
+     byok: params.byok,
+     requestHeaders: params.requestHeaders,
+   })
+ 
+   const response = await generateText({
+     ...params,
+     ...(params.byok && {
+       maxOutputTokens: Math.min(
+-        params.maxTokens ?? byokModelLimits(params.byok).maxOutputTokens,
+-        byokModelLimits(params.byok).maxOutputTokens,
++        params.maxTokens ?? byokModelLimits(params.byok).reservedOutputTokens,
++        byokModelLimits(params.byok).reservedOutputTokens,
+       ),
+     }),
+     prompt: undefined,
+     model: aiSDKModel,
+     output: Output.object({ schema: params.schema }),
+     messages: convertCbToModelMessages(params),
+     allowSystemInMessages: true,
+     include: { requestBody: true },
+     providerOptions: params.byok ? undefined : getProviderOptions({
+       ...params,
+       agentProviderOptions: params.agentProviderOptions,
+       cacheDebugCorrelation: params.cacheDebugCorrelation,
+     }),
+   })
+ 
+   emitCacheDebugProviderRequest({
+     callback: params.onCacheDebugProviderRequestBuilt,
+     provider: getModelProvider(aiSDKModel),
+     rawBody: response.request?.body,
+   })
+   emitCacheDebugUsage({
+     callback: params.onCacheDebugUsageReceived,
+     usage: response.usage,
+   })
+ 
+diff --git a/sdk/src/run.ts b/sdk/src/run.ts
+index 7fd176915..d36b8cbea 100644
+--- a/sdk/src/run.ts
++++ b/sdk/src/run.ts
+@@ -774,51 +774,51 @@ async function runOnce({
+       spawn,
+       logger,
+     })
+   }
+   const traceSessionId =
+     previousRun?.traceSessionId ?? traceSessionIdOption ?? crypto.randomUUID()
+   applyTerminalShell(sessionState, terminalShell)
+ 
+   if (byok) {
+     // The selected connection is a run snapshot. Apply its model to every
+     // local helper/subagent template so no helper silently consumes Freebuff
+     // inference or switches to a different provider.
+     const limits = byokModelLimits(byok)
+     for (const template of Object.values(sessionState.fileContext.agentTemplates)) {
+       if (template && typeof template === 'object') {
+         const byokTemplate = template as {
+           model?: string
+           compactContext?: boolean | Record<string, unknown>
+         }
+         byokTemplate.model = byok.model
+         byokTemplate.compactContext = {
+           ...(typeof byokTemplate.compactContext === 'object'
+             ? byokTemplate.compactContext
+             : {}),
+           maxContextLength: limits.maxContextLength,
+-          maxOutputTokens: limits.maxOutputTokens,
++          maxOutputTokens: limits.reservedOutputTokens,
+         }
+       }
+     }
+   }
+ 
+   let resolvePromise: (value: RunReturnType) => any = () => {}
+   let _reject: (error: any) => any = () => {}
+   const promise = new Promise<RunReturnType>((res, rej) => {
+     resolvePromise = res
+     _reject = rej
+   })
+ 
+   // Snapshot support: stop emitting the moment the run settles so a late
+   // snapshot can never overwrite the final state persisted by the host.
+   let settled = false
+   let snapshotTimer: ReturnType<typeof setInterval> | null = null
+   const resolve = (value: RunReturnType) => {
+     settled = true
+     if (snapshotTimer !== null) {
+       clearInterval(snapshotTimer)
+       snapshotTimer = null
+     }
+     resolvePromise(value)
+   }
+ 
