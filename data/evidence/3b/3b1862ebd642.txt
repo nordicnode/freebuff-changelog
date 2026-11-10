@@ -1,0 +1,4915 @@
+Date: 2026-11-10T23:01:05Z
+Category: SDK
+Areas: SDK
+Commit nature: production
+Stats: +105 / -8
+Analysis notes: SDK changes across 3 file(s) (+105/−8).
+Modified files: sdk/src/byok.ts, sdk/src/impl/llm.ts, sdk/src/run.ts
+Key facts (ground the WHY and DETAIL sentences in these): - A connection's limits as a run uses them. `maxOutputTokens` is the stored setting; `reservedOutputTokens` is the most output a request asks for, and `maxContextLength` (the compaction budget) is 90% of the window left after it.
+Structured facts (extracted mechanically from the diff; copy names and values verbatim, never round or rename):
+- Behavior asserted by new tests (test titles, verbatim; the hunks themselves are omitted): "an output limit of window - 1 still gives the root and a carried helper a valid budget" ; "an output limit just under the window still leaves a positive compaction budget" ; "limits whose output fits in half the window keep their budget and output"
+Module & File Purpose (ground-truth documentation from touched files):
+- File `sdk/src/byok.ts`:
+```
+/** Machine-local connection metadata, separate from OS-protected credentials. */
+```
+- File `sdk/src/impl/llm.ts`:
+```
+/** Resolves after `ms`, or as soon as `signal` aborts. Never rejects. */
+```
+Subsystem Architecture Documentation (from nearby package guides):
+- From `sdk/README.md`:
+```markdown
+# @codebuff/sdk
+
+Official SDK for Codebuff - AI coding agent and framework
+
+## Installation
+
+```bash
+npm install @codebuff/sdk
+```
+
+## Prerequisites
+
+- Create a Codebuff account and get your [Codebuff API key here](https://www.codebuff.com/api-keys).
+
+## Usage
+
+### Basic Example
+
+```typescript
+import { CodebuffClient } from '@codebuff/sdk'
+
+async function main() {
+  const client = new CodebuffClient({
+    //[freebuff product prompt text omitted]
+    // Get one here: https://www.codebuff.com/api-keys
+    apiKey: process.env.CODEBUFF_API_KEY,
+    cwd: process.cwd(),
+  })
+
+  // First run
+  const runState1 = await client.run({
+    // The agent id. Any agent on the store (https://codebuff.com/store)
+    agent: 'codebuff/base@0.0.16',
+    prompt: 'Create a simple calculator class',
+    handleEvent: (event) => {
+      // All events that happen during the run: agent start/finish, tool calls/results, text responses, errors.
+      console.log('Codebuff Event', JSON.stringify(event))
+    },
+  })
+
+  // Continue the same session with a follow-up
+  const runOrError2 = await client.run({
+    agent: 'codebuff/base@0.0.16',
+    prompt: 'Add unit tests for the calculator',
+    previousRun: runState1, // <-- this is where your next run differs from the previous run
+    handleEvent: (event) => {
+      console.log('Codebuff Event', JSON.stringify(event))
+    },
+  })
+}
+
+main()
+```
+
+### Example 2: Custom Agents and Tools
+
+Here, we create a full agent and custom tools that can be reused between runs.
+
+```typescript
+import { z } from 'zod/v4'
+
+import { CodebuffClient, getCustomToolDefinition } from '@codebuff/sdk'
+
+import type { AgentDefinition } from '@codebuff/sdk'
+
+async function main() {
+  const client = new CodebuffClient({
+    //[freebuff product prompt text omitted]
+    // Get it here: https://www.codebuff.com/profile?tab=api-keys
+    apiKey: process.env.CODEBUFF_API_KEY,
+    // Optional directory agent runs from (if applicable).
+    cwd: process.cwd(),
+  })
+
+  // Define your own custom agents!
+  const myCustomAgent: AgentDefinition = {
+    id: 'my-custom-agent',
+    model: 'google/gemini-3.1-flash-lite',
+    displayName: 'Sentiment analyzer',
+    toolNames: ['fetch_api_data'], // Defined below!
+```
+Complete Source of Modified Files (for complete module context):
+- File `sdk/src/byok.ts` (1327 lines):
+```
+/** Machine-local connection metadata, separate from OS-protected credentials. */
+import { promises as fs } from 'node:fs'
+import { homedir } from 'node:os'
+import path from 'node:path'
+import { z } from 'zod/v4'
+import { byokReasoningEfforts } from '@codebuff/common/constants/reasoning-effort'
+import type { ReasoningEffort } from '@codebuff/common/constants/reasoning-effort'
+import {
+  CHATGPT_BYOK_PROVIDER,
+  CHATGPT_CODEX_BASE_URL,
+  CHATGPT_CODEX_RESPONSES_URL,
+  CHATGPT_CONTEXT_WINDOW,
+  CHATGPT_DEFAULT_MODELS,
+  CHATGPT_MAX_OUTPUT_TOKENS,
+  ChatGptAuthError,
+  needsChatGptRefresh,
+  parseChatGptTokens,
+  refreshChatGptTokens,
+  serializeChatGptTokens,
+  type ChatGptModelChoice,
+  type ChatGptTokens,
+} from './chatgpt'
+import { getSystemProcessEnv } from './env'
+import { recoverByokLock } from './impl/byok-lock'
+
+export const BYOK_SECRET_SERVICE = 'com.freebuff.byok.v1'
+const envReference = /^env:[A-Za-z_][A-Za-z0-9_]*$/
+const ownedReference = /^connection:[a-f0-9-]+:[1-9][0-9]*$/
+/** One ChatGPT sign-in, shared by every model saved from it (see saveChatGptSignIn). */
+const chatGptReference = /^chatgpt:[a-f0-9-]+$/
+const text = z.string().trim().min(1).max(256)
+const connectionSchema = z
+  .object({
+    id: z.uuid(),
+    revision: z.number().int().positive(),
+    name: text,
+    provider: z.enum(['openrouter', 'openai-compatible', CHATGPT_BYOK_PROVIDER]),
+    model: text,
+    baseUrl: z.string().max(2048).optional(),
+    contextWindow: z.number().int().min(4096).max(2_000_000).optional(),
+    maxOutputTokens: z.number().int().min(1).max(1_000_000).optional(),
+    credentialRef: z
+      .string()
+      .refine(
+        (value) =>
+          envReference.test(value) ||
+          ownedReference.test(value) ||
+          chatGptReference.test(value),
+      ),
+    createdAt: z.iso.datetime(),
+    updatedAt: z.iso.datetime(),
+  })
+  .strict()
+export type ByokConnection = z.infer<typeof connectionSchema>
+export type ByokProvider = ByokConnection['provider']
+/** Runtime-only. The built-in resolver makes apiKey non-enumerable. */
+export type ResolvedByokConnection = ByokConnection & {
+  apiKey: string
+  /** Recheck revocation before every provider request; never serialized. */
+  assertCurrent?: () => Promise<void>
+  /**
+   * ChatGPT sign-ins only: a current access token, refreshed when it is about
+   * to expire. `apiKey` holds the token current when the run started, for
+   * scrubbing; requests must use this instead. Never serialized.
+   */
+  accessToken?: () => Promise<string>
+  /**
+   * The run's reasoning effort, a per-task choice rather than connection
+   * metadata (so never stored). Absent sends no reasoning field at all, which
+   * is the provider's own default. One of the provider's own rungs (`byokReasoningEfforts`): a
+   * ChatGPT plan's reach `ultra`, any other provider's stop at `high`. See `withByokReasoningEffort`.
+   */
+  reasoningEffort?: ReasoningEffort
+}
+export type ByokSecretStore = {
+  get(reference: string): Promise<string | undefined>
+  set(reference: string, value: string): Promise<void>
+  delete(reference: string): Promise<void>
+}
+export type ByokMetadataStore = {
+  get(): Promise<ByokConnection[]>
+  set(connections: ByokConnection[]): Promise<void>
+  /** Must serialize read/modify/write across processes for persistent stores. */
+  withLock?<T>(operation: () => Promise<T>): Promise<T>
+}
+export type ByokConnectionInput = {
+  /** User-configured limits, not a claim of tested model capability. */
+  contextWindow?: number
+  maxOutputTokens?: number
+  name: string
+  provider: ByokProvider
+  model: string
+  baseUrl?: string
+  apiKey?: string
+  credentialRef?: string
+}
+export type ByokConnectionPatch = Partial<ByokConnectionInput>
+export type ByokValidationResult =
+  | {
+      ok: true
+      connection: ByokConnection
+      /** The endpoint check's HTTP status. */
+      statusCode?: number
+      /**
+       * OpenAI-compatible only, when `/models` returned a list: whether the
+       * connection's model id is in it. A proxy may route ids it does not
+       * list, so false is a warning, not a failed check.
+       */
+      modelListed?: boolean
+      /** When the model is not listed: the ids the endpoint does list (capped). */
+      availableModels?: string[]
+    }
+  | {
+      ok: false
+      connection: ByokConnection
+      message: string
+      statusCode?: number
+    }
+export type ByokConnectionStore = {
+  create(input: ByokConnectionInput): Promise<ByokConnection>
+  addModel(input: {
+    id: string
+    revision: number
+    model: Pick<
+      ByokConnectionInput,
+      'name' | 'model' | 'contextWindow' | 'maxOutputTokens'
+    >
+  }): Promise<ByokConnection>
+  list(): Promise<ByokConnection[]>
+  update(input: {
+    id: string
+    revision: number
+    patch: ByokConnectionPatch
+  }): Promise<ByokConnection>
+  /**
+   * Remove a connection. A ChatGPT model is part of one sign-in, so removing
+   * any of them removes every model on that sign-in, and the sign-in itself.
+   */
+  remove(input: { id: string; revision: number }): Promise<void>
+  resolve(input: {
+    id: string
+    revision: number
+  }): Promise<ResolvedByokConnection>
+  validate(input: {
+    id: string
+    revision: number
+  }): Promise<ByokValidationResult>
+  /**
+   * Save a ChatGPT sign-in and a connection for each of `models` (the plan's
+   * list, see listChatGptModels; CHATGPT_DEFAULT_MODELS by default). Signing
+   * in again replaces the tokens every saved ChatGPT model shares and adds
+   * the listed models not saved yet, leaving saved ones (and their names and
+   * limits) as they are. Returns every ChatGPT connection.
+   */
+  saveChatGptSignIn(
+    tokens: ChatGptTokens,
+    models?: readonly ChatGptModelChoice[],
+  ): Promise<ByokConnection[]>
+}
+
+/**
+ * The connection's credential could not be read. Its message is ours, names
+ * at most an environment-variable NAME, and never carries a key value, so a
+ * caller may show it as is.
+ */
+export class ByokCredentialError extends Error {
+  override name = 'ByokCredentialError'
+}
+
+/** A local connection-state failure with a safe, SDK-authored message. */
+export class ByokConnectionStateError extends Error {
+  override name = 'ByokConnectionStateError'
+}
+
+/** The environment variable a connection reads its key from, if any. */
+export function byokCredentialVariable(
+  connection: Pick<ByokConnection, 'credentialRef'>,
+): string | undefined {
+  return envReference.test(connection.credentialRef)
+    ? connection.credentialRef.slice(4)
+    : undefined
+}
+
+/**
+ * Unset (or empty) in THIS process. The usual cause is starting Freebuff
+ * before exporting the variable, or from another terminal: a running process
+ * never sees a later `export`, so saying "restart" is the actual fix.
+ */
+export function missingEnvironmentCredentialMessage(variable: string): string {
+  return `${variable} is not set in this Freebuff process. Set it and restart Freebuff from that terminal.`
+}
+
+/**
+ * The provider refused the key (401/403). For an environment reference the
+ * variable IS set (an unset one never reaches the provider), so name it and
+ * point at its value rather than at its presence.
+ */
+export function rejectedByokCredentialMessage(
+  connection: Pick<ByokConnection, 'credentialRef'>,
+  status: number,
+): string {
+  const variable = byokCredentialVariable(connection)
+  return variable
+    ? `The provider rejected the key in ${variable} (HTTP ${status}). ${variable} is set in this Freebuff process; check that it holds the key this endpoint expects, then restart Freebuff from that terminal.`
+    : `The provider rejected the saved API key (HTTP ${status}). Check or replace the key.`
+}
+
+/** Validate before either storing a connection or attaching credentials to a request. */
+export function normalizeByokBaseUrl(
+  provider: ByokProvider,
+  baseUrl?: string,
+): string {
+  if (provider === 'openrouter') return 'https://openrouter.ai/api/v1'
+  if (provider === CHATGPT_BYOK_PROVIDER) return CHATGPT_CODEX_BASE_URL
+  if (provider !== 'openai-compatible')
+    throw new Error('Unsupported BYOK provider')
+  let url: URL
+  try {
+    url = new URL(baseUrl ?? '')
+  } catch {
+    throw new Error('Enter a valid provider base URL')
+  }
+  const loopback = ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname)
+  if (url.protocol !== 'https:' && !(url.protocol === 'http:' && loopback)) {
+    throw new Error(
+      'Provider endpoints require HTTPS; HTTP is allowed only on loopback',
+    )
+  }
+  if (url.username || url.password || url.search || url.hash) {
+    throw new Error(
+      'Provider URLs cannot contain credentials, query parameters or fragments',
+    )
+  }
+  return url.toString().replace(/\/+$/, '')
+}
+/**
+ * Headers for a provider's `/models` listing. OpenRouter lists without a key.
+ * Anthropic's OpenAI-compatible endpoint answers `/chat/completions` on the
+ * bearer alone but its `/models` is the native API, which refuses any request
+ * without `anthropic-version` (HTTP 400 "anthropic-version: header is required").
+ */
+export function byokListingHeaders(
+  connection: Pick<ResolvedByokConnection, 'provider' | 'apiKey'>,
+  base: string,
+): Record<string, string> {
+  if (connection.provider === 'openrouter') return {}
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${connection.apiKey}`,
+  }
+  if (new URL(base).hostname === 'api.anthropic.com')
+    headers['anthropic-version'] = '2023-06-01'
+  return headers
+}
+export function byokCompletionUrl(
+  connection: Pick<ByokConnection, 'provider' | 'baseUrl'>,
+): string {
+  if (connection.provider === CHATGPT_BYOK_PROVIDER)
+    return CHATGPT_CODEX_RESPONSES_URL
+  return (
+    normalizeByokBaseUrl(connection.provider, connection.baseUrl) +
+    '/chat/completions'
+  )
+}
+function parseConnections(value: unknown): ByokConnection[] {
+  const parsed = z.array(connectionSchema).safeParse(value)
+  if (!parsed.success)
+    throw new ByokConnectionStateError(
+      'BYOK connection metadata is corrupt; restore it before continuing',
+    )
+  if (new Set(parsed.data.map((item) => item.id)).size !== parsed.data.length) {
+    throw new ByokConnectionStateError('BYOK connection metadata contains duplicate connections')
+  }
+  for (const item of parsed.data) {
+    byokModelLimits(item)
+    normalizeByokBaseUrl(item.provider, item.baseUrl)
+    if (
+      item.provider === CHATGPT_BYOK_PROVIDER
+        ? !chatGptReference.test(item.credentialRef)
+        : !envReference.test(item.credentialRef) &&
+          !item.credentialRef.startsWith(`connection:${item.id}:`)
+    ) {
+      throw new ByokConnectionStateError(
+        'BYOK credential reference belongs to a different connection',
+      )
+    }
+  }
+  return parsed.data
+}
+/**
+ * The limits a connection gets when nobody chose any. The Desktop settings
+ * form pre-fills exactly this pair, and the store persists it, so a stored
+ * 32,768 / 4,096 almost always means "not configured" rather than a decision.
+ */
+export const BYOK_DEFAULT_CONTEXT_WINDOW = 32_768
+export const BYOK_DEFAULT_MAX_OUTPUT_TOKENS = 4_096
+/** A remote endpoint that does not report its model's window. */
+export const BYOK_UNKNOWN_REMOTE_CONTEXT_WINDOW = 131_072
+/**
+ * The most an automatically-chosen window may be: the hosted budget's order of
+ * magnitude, since every token of a BYOK request is billed to the user's key.
+ * A user who wants more types it into the connection.
+ */
+export const BYOK_DISCOVERED_CONTEXT_WINDOW_CAP = 400_000
+
+/**
+ * A connection's limits as a run uses them. `maxOutputTokens` is the stored
+ * setting; `reservedOutputTokens` is the most output a request asks for, and
+ * `maxContextLength` (the compaction budget) is 90% of the window left after it.
+ *
+ * The reservation is at most half the window. The settings form's `max`
+ * offers an output limit of window - 1, which left a budget of 0: the agent
+ * schema then refused every agent of the run before any model call (Cloud,
+ * 2026-11). A prompt plus output over the window is also a request a strict
+ * endpoint refuses. Any valid window keeps a budget of at least 1,843.
+ */
+export function byokModelLimits(connection: {
+  contextWindow?: number
+  maxOutputTokens?: number
+}) {
+  const contextWindow = connection.contextWindow ?? BYOK_DEFAULT_CONTEXT_WINDOW
+  const maxOutputTokens =
+    connection.maxOutputTokens ??
+    Math.min(BYOK_DEFAULT_MAX_OUTPUT_TOKENS, Math.floor(contextWindow / 4))
+  if (
+    !Number.isInteger(contextWindow) ||
+    contextWindow < 4096 ||
+    contextWindow > 2_000_000 ||
+    !Number.isInteger(maxOutputTokens) ||
+    maxOutputTokens < 1 ||
+    maxOutputTokens >= contextWindow
+  ) {
+    throw new Error(
+      'Choose a context limit of 4096–2000000 tokens and a smaller positive output limit',
+    )
+  }
+  const reservedOutputTokens = Math.min(
+    maxOutputTokens,
+    Math.floor(contextWindow / 2),
+  )
+  return {
+    contextWindow,
+    maxOutputTokens,
+    reservedOutputTokens,
+    maxContextLength: Math.floor((contextWindow - reservedOutputTokens) * 0.9),
+  }
+}
+
+/** True when the connection carries the untouched default limits (see above). */
+export function hasDefaultByokLimits(connection: {
+  contextWindow?: number
+  maxOutputTokens?: number
+}): boolean {
+  return (
+    (connection.contextWindow ?? BYOK_DEFAULT_CONTEXT_WINDOW) ===
+      BYOK_DEFAULT_CONTEXT_WINDOW &&
+    (connection.maxOutputTokens ?? BYOK_DEFAULT_MAX_OUTPUT_TOKENS) ===
+      BYOK_DEFAULT_MAX_OUTPUT_TOKENS
+  )
+}
+
+function isLoopbackByokEndpoint(
+  connection: Pick<ByokConnection, 'provider' | 'baseUrl'>,
+): boolean {
+  if (connection.provider !== 'openai-compatible') return false
+  try {
+    const { hostname } = new URL(
+      normalizeByokBaseUrl(connection.provider, connection.baseUrl),
+    )
+    return ['localhost', '127.0.0.1', '[::1]'].includes(hostname)
+  } catch {
+    return false
+  }
+}
+
+/** Fields OpenAI-compatible `/models` listings use for a model's window:
+ *  OpenRouter/Together (`context_length`), Groq (`context_window`), vLLM
+ *  (`max_model_len`), LM Studio (`loaded_context_length`), and others. */
+const CONTEXT_WINDOW_FIELDS = [
+  'context_length',
+  'context_window',
+  'max_model_len',
+  'max_context_length',
+  'loaded_context_length',
+] as const
+
+function positiveInteger(value: unknown): number | undefined {
+  const number = typeof value === 'string' ? Number(value) : value
+  return typeof number === 'number' && Number.isInteger(number) && number > 0
+    ? number
+    : undefined
+}
+
+/** The window a `/models` listing reports for `model`, or undefined. */
+export function contextWindowFromModelList(
+  body: unknown,
+  model: string,
+): number | undefined {
+  const list = Array.isArray(body)
+    ? body
+    : body && typeof body === 'object' && Array.isArray((body as any).data)
+      ? ((body as any).data as unknown[])
+      : []
+  const entries = list.filter(
+    (entry): entry is Record<string, unknown> =>
+      !!entry && typeof entry === 'object',
+  )
+  // OpenRouter variants (`vendor/model:free`) fall back to the base model.
+  const candidates = [model, model.replace(/:[^/:]+$/, '')]
+  for (const id of candidates) {
+    const entry = entries.find(
+      (item) => item.id === id || item.canonical_slug === id,
+    )
+    if (!entry) continue
+    const topProvider =
+      entry.top_provider && typeof entry.top_provider === 'object'
+        ? (entry.top_provider as Record<string, unknown>)
+        : {}
+    for (const value of [
+      ...CONTEXT_WINDOW_FIELDS.map((field) => entry[field]),
+      topProvider.context_length,
+    ]) {
+      const window = positiveInteger(value)
+      if (window !== undefined) return window
+    }
+  }
+  return undefined
+}
+
+const discoveredWindows = new Map<
+  string,
+  { expiresAt: number; window: Promise<number | undefined> }
+>()
+const DISCOVERY_HIT_TTL_MS = 6 * 60 * 60 * 1000
+const DISCOVERY_MISS_TTL_MS = 10 * 60 * 1000
+const DISCOVERY_TIMEOUT_MS = 4_000
+
+/** Test seam: forget every cached discovery. */
+export function clearByokContextWindowCache(): void {
+  discoveredWindows.clear()
+}
+
+/**
+ * Ask the provider's `/models` listing how large this model's window is.
+ * Best effort: never throws, and a miss is remembered briefly so a provider
+ * without the field is not asked on every turn. The listing is what the
+ * connection check already calls; OpenRouter's is public, so the key is sent
+ * only to an OpenAI-compatible endpoint that needs it.
+ */
+export async function discoverByokContextWindow(
+  connection: Pick<
+    ResolvedByokConnection,
+    'provider' | 'baseUrl' | 'model' | 'apiKey'
+  >,
+  fetchImpl: typeof globalThis.fetch = globalThis.fetch,
+): Promise<number | undefined> {
+  // The Codex backend serves no OpenAI-style listing.
+  if (connection.provider === CHATGPT_BYOK_PROVIDER) return undefined
+  let base: string
+  try {
+    base = normalizeByokBaseUrl(connection.provider, connection.baseUrl)
+  } catch {
+    return undefined
+  }
+  const key = `${base}\n${connection.model}`
+  const now = Date.now()
+  const cached = discoveredWindows.get(key)
+  if (cached && cached.expiresAt > now) return cached.window
+  const window = (async () => {
+    try {
+      const response = await fetchImpl(`${base}/models`, {
+        headers: byokListingHeaders(connection, base),
+        redirect: 'error',
+        signal: AbortSignal.timeout(DISCOVERY_TIMEOUT_MS),
+      })
+      if (!response.ok) {
+        await response.body?.cancel()
+        return undefined
+      }
+      return contextWindowFromModelList(await response.json(), connection.model)
+    } catch {
+      return undefined
+    }
+  })()
+  discoveredWindows.set(key, { expiresAt: now + DISCOVERY_HIT_TTL_MS, window })
+  const result = await window
+  if (result === undefined)
+    discoveredWindows.set(key, {
+      expiresAt: now + DISCOVERY_MISS_TTL_MS,
+      window,
+    })
+  return result
+}
+
+/**
+ * The connection with a run's reasoning effort attached, or the connection
+ * itself when there is none to attach (anything that is not one of this provider's rungs means
+ * "the provider's default"). A copy, never a mutation: the resolved connection
+ * is frozen and shared. The credential and revocation check stay
+ * non-enumerable on the copy, exactly as the resolver made them.
+ */
+export function withByokReasoningEffort(
+  connection: ResolvedByokConnection,
+  effort: unknown,
+): ResolvedByokConnection {
+  if (!byokReasoningEfforts(connection.provider).includes(effort as ReasoningEffort)) {
+    if (connection.reasoningEffort === undefined) return connection
+    const { reasoningEffort: _dropped, ...rest } = connection
+    return copyRuntimeFields(rest as ResolvedByokConnection, connection)
+  }
+  if (connection.reasoningEffort === effort) return connection
+  return copyRuntimeFields(
+    { ...connection, reasoningEffort: effort as ReasoningEffort } as ResolvedByokConnection,
+    connection,
+  )
+}
+
+function copyRuntimeFields(
+  target: ResolvedByokConnection,
+  source: ResolvedByokConnection,
+): ResolvedByokConnection {
+  Object.defineProperty(target, 'apiKey', {
+    value: source.apiKey,
+    enumerable: false,
+  })
+  for (const field of ['assertCurrent', 'accessToken'] as const)
+    if (source[field])
+      Object.defineProperty(target, field, {
+        value: source[field],
+        enumerable: false,
+      })
+  return target
+}
+
+/**
+ * The connection a run should use: identical, unless its limits are the
+ * untouched defaults. Those are a 32,768-token guess, and for a coding agent
+ * whose tool schemas and prompt alone are ~15-20k tokens, compacting at 80% of
+ * 90% of (32,768 - 4,096) leaves a few thousand tokens of conversation: every
+ * few tool calls the run compacted, and the summary itself sat above the line
+ * (Desktop feedback 2026-09-24 and 09-27, "compacts every 3-5 turns").
+ *
+ * The provider's own number wins when its `/models` listing reports one
+ * (capped at BYOK_DISCOVERED_CONTEXT_WINDOW_CAP). Otherwise a remote endpoint
+ * gets 128k, which nearly every hosted coding model supports, and a loopback
+ * server keeps the configured default, because a local server's window is
+ * whatever it was launched with. Limits a user actually typed are never
+ * replaced. The credential stays non-enumerable on the copy.
+ */
+export async function withEffectiveByokLimits(
+  connection: ResolvedByokConnection,
+  options: { fetch?: typeof globalThis.fetch } = {},
+): Promise<ResolvedByokConnection> {
+  if (!hasDefaultByokLimits(connection)) return connection
+  const discovered = await discoverByokContextWindow(connection, options.fetch)
+  const contextWindow =
+    // A window must exceed the output limit (byokModelLimits' own rule).
+    discovered !== undefined && discovered > BYOK_DEFAULT_MAX_OUTPUT_TOKENS
+      ? Math.min(discovered, BYOK_DISCOVERED_CONTEXT_WINDOW_CAP)
+      : isLoopbackByokEndpoint(connection)
+        ? BYOK_DEFAULT_CONTEXT_WINDOW
+        : BYOK_UNKNOWN_REMOTE_CONTEXT_WINDOW
+  if (
+    contextWindow === (connection.contextWindow ?? BYOK_DEFAULT_CONTEXT_WINDOW)
+  )
+    return connection
+  const effective = {
+    ...connection,
+    contextWindow,
+    maxOutputTokens:
+      connection.maxOutputTokens ?? BYOK_DEFAULT_MAX_OUTPUT_TOKENS,
+  } as ResolvedByokConnection
+  return Object.freeze(copyRuntimeFields(effective, connection))
+}
+
+function cleanInput(input: ByokConnectionInput) {
+  if (input.provider === CHATGPT_BYOK_PROVIDER)
+    throw new Error('Sign in with ChatGPT to add a ChatGPT provider')
+  const limits = byokModelLimits(input)
+  const name = text.safeParse(input.name),
+    model = text.safeParse(input.model)
+  if (!name.success || !model.success)
+    throw new Error('Connection name and model must contain 1–256 characters')
+  const baseUrl = normalizeByokBaseUrl(input.provider, input.baseUrl)
+  if (
+    input.apiKey !== undefined &&
+    (!input.apiKey.trim() ||
+      /[\r\n]/.test(input.apiKey) ||
+      input.apiKey.length > 4096)
+  ) {
+    throw new Error(
+      'Enter a non-empty API key without line breaks (maximum 4096 characters)',
+    )
+  }
+  if (
+    input.credentialRef !== undefined &&
+    !envReference.test(input.credentialRef)
+  ) {
+    throw new Error(
+      'Only explicit env:VARIABLE credential references may be supplied',
+    )
+  }
+  if (input.apiKey !== undefined && input.credentialRef !== undefined) {
+    throw new Error('Choose an API key or an environment reference, not both')
+  }
+  return {
+    contextWindow: limits.contextWindow,
+    maxOutputTokens: limits.maxOutputTokens,
+    name: name.data,
+    model: model.data,
+    provider: input.provider,
+    baseUrl,
+  }
+}
+/** At most this many listed ids are returned when the model is not among them. */
+export const BYOK_AVAILABLE_MODELS_LIMIT = 50
+
+/** The ids of an OpenAI-compatible `/models` listing (`{data: [...]}` or a bare array). */
+function modelIdsFromListing(body: unknown): string[] {
+  const list = Array.isArray(body)
+    ? body
+    : body && typeof body === 'object' && Array.isArray((body as any).data)
+      ? ((body as any).data as unknown[])
+      : []
+  return list
+    .map((entry) =>
+      entry && typeof entry === 'object'
+        ? (entry as Record<string, unknown>).id
+        : undefined,
+    )
+    .filter((id): id is string => typeof id === 'string')
+}
+
+/**
+ * What a successful `/models` answer says about this connection. A web page
+ * (an SPA or dashboard answering every path) means the base URL is wrong —
+ * typically a proxy's root instead of its `/v1`. Ids echoed back are printable,
+ * bounded, and never contain the key.
+ */
+async function readModelListing(
+  response: Response,
+  connection: Pick<ResolvedByokConnection, 'provider' | 'model' | 'apiKey'>,
+): Promise<
+  | { webPage: true }
+  | { webPage: false; modelListed?: boolean; availableModels?: string[] }
+> {
+  if (connection.provider !== 'openai-compatible') {
+    await response.body?.cancel()
+    return { webPage: false }
+  }
+  let text: string
+  try {
+    text = await response.text()
+  } catch {
+    return { webPage: false }
+  }
+  if (
+    /text\/html/i.test(response.headers.get('content-type') ?? '') ||
+    /^\s*<(?:!doctype|html)/i.test(text)
+  )
+    return { webPage: true }
+  let body: unknown
+  try {
+    body = JSON.parse(text)
+  } catch {
+    return { webPage: false }
+  }
+  const ids = modelIdsFromListing(body)
+  if (ids.length === 0) return { webPage: false }
+  if (ids.includes(connection.model)) return { webPage: false, modelListed: true }
+  const shown = ids.filter(
+    (id) =>
+      id.length <= 200 &&
+      /^[\x21-\x7e]+$/.test(id) &&
+      !id.includes(connection.apiKey),
+  )
+  return {
+    webPage: false,
+    modelListed: false,
+    availableModels: shown.slice(0, BYOK_AVAILABLE_MODELS_LIMIT),
+  }
+}
+
+/** The fix for a base URL that answered 404 or a web page at `/models`. */
+function baseUrlHint(base: string): string {
+  const { pathname } = new URL(base)
+  return /\/v\d+[a-z0-9]*(?:\/|$)/i.test(pathname)
+    ? 'Check the base URL.'
+    : `OpenAI-compatible base URLs usually end in /v1; try ${base}/v1.`
+}
+
+/**
+ * A transport failure, classified by its code. Only the endpoint's origin is
+ * shown — the thrown error itself can echo request details.
+ */
+function unreachableProviderMessage(
+  error: unknown,
+  base: string | undefined,
+): string {
+  const origin = base ? new URL(base).origin : 'the provider'
+  const code = [
+    (error as { code?: unknown } | null)?.code,
+    ((error as { cause?: { code?: unknown } } | null)?.cause ?? {}).code,
+  ].find((value): value is string => typeof value === 'string')
+  if (code === 'ConnectionRefused' || code === 'ECONNREFUSED')
+    return `Nothing is accepting connections at ${origin} (connection refused). Start the provider or proxy, or check the host and port.`
+  if ((error as { name?: unknown } | null)?.name === 'TimeoutError')
+    return `${origin} did not answer within 10 seconds. Check that the provider or proxy is running and reachable.`
+  return 'Could not reach the provider securely. Check its URL, connection and credentials.'
+}
+
+const queues = new WeakMap<ByokMetadataStore, Promise<unknown>>()
+export function createByokConnectionStore(params: {
+  metadataStore: ByokMetadataStore
+  secretStore: ByokSecretStore
+  fetch?: typeof globalThis.fetch
+}): ByokConnectionStore {
+  const {
+    metadataStore,
+    secretStore,
+    fetch: fetchImpl = globalThis.fetch,
+  } = params
+  const read = async () => parseConnections(await metadataStore.get())
+  function exclusive<T>(operation: () => Promise<T>): Promise<T> {
+    const previous = queues.get(metadataStore) ?? Promise.resolve()
+    const next = previous
+      .catch(() => {})
+      .then(() =>
+        metadataStore.withLock
+          ? metadataStore.withLock(operation)
+          : operation(),
+      )
+    queues.set(
+      metadataStore,
+      next.catch(() => {}),
+    )
+    return next
+  }
+  async function lookup(id: string, revision: number) {
+    const connections = await read()
+    const connection = connections.find((item) => item.id === id)
+    if (!connection)
+      throw new ByokConnectionStateError(
+        'BYOK connection was removed; select another provider or a Freebuff model to continue',
+      )
+    if (connection.revision !== revision)
+      throw new ByokConnectionStateError(
+        'BYOK connection changed; select its current revision to continue',
+      )
+    return { connection, connections }
+  }
+  async function getSecret(reference: string) {
+    let key: string | undefined
+    try {
+      key = await secretStore.get(reference)
+    } catch {
+      throw new ByokCredentialError('Could not unlock the BYOK credential store')
+    }
+    // Surrounding whitespace is not part of a key: a CRLF `.env` file leaves
+    // a trailing "\r" on the value, which used to reject a correct key.
+    const trimmed = key?.trim()
+    const variable = envReference.test(reference)
+      ? reference.slice(4)
+      : undefined
+    if (!trimmed)
+      throw new ByokCredentialError(
+        variable
+          ? missingEnvironmentCredentialMessage(variable)
+          : 'BYOK credential is unavailable or invalid',
+      )
+    if (/[\r\n]/.test(trimmed))
+      throw new ByokCredentialError(
+        variable
+          ? `${variable} contains a line break. Set it to the key alone and restart Freebuff from that terminal.`
+          : 'BYOK credential is unavailable or invalid',
+      )
+    return trimmed
+  }
+  async function writeSecret(reference: string, key: string) {
+    try {
+      await secretStore.set(reference, key.trim())
+    } catch {
+      throw new Error('Could not save the API key in OS credential storage')
+    }
+  }
+  async function eraseSecret(reference: string) {
+    if (envReference.test(reference)) return
+    try {
+      await secretStore.delete(reference)
+    } catch {
+      throw new Error(
+        'Could not remove the OS credential; unlock the store and retry',
+      )
+    }
+  }
+  // Called only under the metadata lock, including when copying a saved provider.
+  async function create(input: ByokConnectionInput) {
+    const fields = cleanInput(input)
+    if (!input.apiKey && !input.credentialRef)
+      throw new Error('An API key or environment reference is required')
+    const connections = await read()
+    const id = crypto.randomUUID(),
+      now = new Date().toISOString()
+    const credentialRef = input.credentialRef ?? `connection:${id}:1`
+    const connection = {
+      ...fields,
+      id,
+      revision: 1,
+      credentialRef,
+      createdAt: now,
+      updatedAt: now,
+    }
+    if (input.apiKey !== undefined)
+      await writeSecret(credentialRef, input.apiKey)
+    try {
+      await metadataStore.set([...connections, connection])
+    } catch (error) {
+      if (input.apiKey !== undefined)
+        await secretStore.delete(credentialRef).catch(() => {})
+      throw error
+    }
+    return { ...connection }
+  }
+  // Under the metadata lock. A ChatGPT model shares its sign-in's credential
+  // instead of copying it: OpenAI rotates the refresh token on every use, so
+  // a copy would stop working the first time a sibling refreshed.
+  async function createChatGptModel(
+    credentialRef: string,
+    fields: { name: string; model: string; contextWindow?: number; maxOutputTokens?: number },
+  ): Promise<ByokConnection> {
+    const name = text.safeParse(fields.name),
+      model = text.safeParse(fields.model)
+    if (!name.success || !model.success)
+      throw new Error('Connection name and model must contain 1–256 characters')
+    const limits = byokModelLimits({
+      contextWindow: fields.contextWindow ?? CHATGPT_CONTEXT_WINDOW,
+      maxOutputTokens: fields.maxOutputTokens ?? CHATGPT_MAX_OUTPUT_TOKENS,
+    })
+    const now = new Date().toISOString()
+    return {
+      id: crypto.randomUUID(),
+      revision: 1,
+      name: name.data,
+      provider: CHATGPT_BYOK_PROVIDER,
+      model: model.data,
+      baseUrl: CHATGPT_CODEX_BASE_URL,
+      contextWindow: limits.contextWindow,
+      maxOutputTokens: limits.maxOutputTokens,
+      credentialRef,
+      createdAt: now,
+      updatedAt: now,
+    }
+  }
+  // Under the metadata lock, which serializes refreshes across processes:
+  // whoever refreshes second re-reads the rotated token instead of reusing
+  // the old one.
+  async function freshChatGptTokens(reference: string): Promise<ChatGptTokens> {
+    const tokens = parseChatGptTokens(await getSecret(reference))
+    if (!needsChatGptRefresh(tokens)) return tokens
+    const refreshed = await refreshChatGptTokens(tokens, fetchImpl)
+    try {
+      await secretStore.set(reference, serializeChatGptTokens(refreshed))
+    } catch {
+      throw new ByokConnectionStateError(
+        'Could not save your refreshed ChatGPT sign-in in OS credential storage. Unlock it, then sign in with ChatGPT again.',
+      )
+    }
+    return refreshed
+  }
+  /** Sign-in problems become the safe, typed error the model provider shows. */
+  async function chatGptStateErrors<T>(operation: () => Promise<T>): Promise<T> {
+    try {
+      return await operation()
+    } catch (error) {
+      if (error instanceof ChatGptAuthError)
+        throw new ByokConnectionStateError(error.message)
+      throw error
+    }
+  }
+  const store: ByokConnectionStore = {
+    create: (input) => exclusive(() => create(input)),
+    addModel: ({ id, revision, model }) =>
+      exclusive(async () => {
+        const { connection, connections } = await lookup(id, revision)
+        if (connection.provider === CHATGPT_BYOK_PROVIDER) {
+          const created = await createChatGptModel(connection.credentialRef, model)
+          await metadataStore.set([...connections, created])
+          return { ...created }
+        }
+        return create({
+          name: model.name,
+          model: model.model,
+          contextWindow: model.contextWindow,
+          maxOutputTokens: model.maxOutputTokens,
+          provider: connection.provider,
+          baseUrl: connection.baseUrl,
+          // Each saved model owns its key, so rotation/removal cannot break siblings.
+          // Environment references remain references, never copied key values.
+          ...(envReference.test(connection.credentialRef)
+            ? { credentialRef: connection.credentialRef }
+            : { apiKey: await getSecret(connection.credentialRef) }),
+        })
+      }),
+    list: read,
+    update: ({ id, revision, patch }) =>
+      exclusive(async () => {
+        const { connection: existing, connections } = await lookup(id, revision)
+        if (existing.provider === CHATGPT_BYOK_PROVIDER) {
+          if (
+            patch.provider !== undefined ||
+            patch.baseUrl !== undefined ||
+            patch.apiKey !== undefined ||
+            patch.credentialRef !== undefined
+          )
+            throw new Error(
+              'A ChatGPT provider has no key or endpoint to change. Sign in with ChatGPT again to replace its sign-in.',
+            )
+          const fields = await createChatGptModel(existing.credentialRef, {
+            name: patch.name ?? existing.name,
+            model: patch.model ?? existing.model,
+            contextWindow: patch.contextWindow ?? existing.contextWindow,
+            maxOutputTokens: patch.maxOutputTokens ?? existing.maxOutputTokens,
+          })
+          const updated = {
+            ...existing,
+            name: fields.name,
+            model: fields.model,
+            contextWindow: fields.contextWindow,
+            maxOutputTokens: fields.maxOutputTokens,
+            revision: revision + 1,
+            updatedAt: fields.updatedAt,
+          }
+          await metadataStore.set(
+            connections.map((item) => (item.id === id ? updated : item)),
+          )
+          return { ...updated }
+        }
+        const fields = cleanInput({
+          ...existing,
+          ...patch,
+          credentialRef: patch.credentialRef,
+          apiKey: patch.apiKey,
+        })
+        const changedEndpoint =
+          fields.baseUrl !==
+          normalizeByokBaseUrl(existing.provider, existing.baseUrl)
+        if (
+          (changedEndpoint || fields.provider !== existing.provider) &&
+          patch.apiKey === undefined &&
+          patch.credentialRef === undefined
+        ) {
+          throw new Error(
+            'Changing provider endpoints requires explicitly supplying the credential again',
+          )
+        }
+        const nextRevision = revision + 1
+        // New stored revision gets its own credential, so old reads cannot observe replacement keys.
+        const credentialRef =
+          patch.credentialRef ??
+          (patch.apiKey === undefined &&
+          envReference.test(existing.credentialRef)
+            ? existing.credentialRef
+            : `connection:${id}:${nextRevision}`)
+        const ownsNewSecret = !envReference.test(credentialRef)
+        if (ownsNewSecret)
+          await writeSecret(
+            credentialRef,
+            patch.apiKey ?? (await getSecret(existing.credentialRef)),
+          )
+        const updated = {
+          ...existing,
+          ...fields,
+          credentialRef,
+          revision: nextRevision,
+          updatedAt: new Date().toISOString(),
+        }
+        try {
+          await metadataStore.set(
+            connections.map((item) => (item.id === id ? updated : item)),
+          )
+        } catch (error) {
+          if (ownsNewSecret)
+            await secretStore.delete(credentialRef).catch(() => {})
+          throw error
+        }
+        if (credentialRef !== existing.credentialRef) {
+          try {
+            await eraseSecret(existing.credentialRef)
+          } catch {
+            // Keep the old reference reachable so cleanup can be retried.
+            await metadataStore.set(connections)
+            if (ownsNewSecret)
+              await secretStore.delete(credentialRef).catch(() => {})
+            throw new Error(
+              'Could not rotate the OS credential; connection unchanged. Unlock the store and retry.',
+            )
+          }
+        }
+        return { ...updated }
+      }),
+    remove: ({ id, revision }) =>
+      exclusive(async () => {
+        const { connection, connections } = await lookup(id, revision)
+        // A ChatGPT model goes with its whole sign-in; any other connection
+        // goes alone (environment-backed siblings keep their reference).
+        const removed =
+          connection.provider === CHATGPT_BYOK_PROVIDER
+            ? (item: ByokConnection) =>
+                item.credentialRef === connection.credentialRef
+            : (item: ByokConnection) => item.id === id
+        const shared = connections.some(
+          (item) =>
+            !removed(item) && item.credentialRef === connection.credentialRef,
+        )
+        // Erase first: on failure metadata remains so the user can retry.
+        if (!shared) await eraseSecret(connection.credentialRef)
+        await metadataStore.set(connections.filter((item) => !removed(item)))
+      }),
+    resolve: ({ id, revision }) =>
+      exclusive(async () => {
+        const { connection } = await lookup(id, revision)
+        const result = { ...connection } as ResolvedByokConnection
+        if (connection.provider === CHATGPT_BYOK_PROVIDER) {
+          const reference = connection.credentialRef
+          let current = await chatGptStateErrors(() =>
+            freshChatGptTokens(reference),
+          )
+          Object.defineProperty(result, 'apiKey', {
+            value: current.accessToken,
+            enumerable: false,
+          })
+          Object.defineProperty(result, 'accessToken', {
+            value: async () => {
+              if (needsChatGptRefresh(current))
+                current = await exclusive(() =>
+                  chatGptStateErrors(() => freshChatGptTokens(reference)),
+                )
+              return current.accessToken
+            },
+            enumerable: false,
+          })
+        } else {
+          Object.defineProperty(result, 'apiKey', {
+            value: await getSecret(connection.credentialRef),
+            enumerable: false,
+          })
+        }
+        Object.defineProperty(result, 'assertCurrent', {
+          value: () =>
+            exclusive(async () => {
+              await lookup(id, revision)
+            }),
+          enumerable: false,
+        })
+        return Object.freeze(result)
+      }),
+    async validate(selection) {
+      let resolved: ResolvedByokConnection
+      try {
+        resolved = await store.resolve(selection)
+      } catch (error) {
+        // A missing key is a failed check of an existing connection, not a
+        // failed command: `/byok add` has already saved it by now. So is an
+        // expired ChatGPT sign-in.
+        if (
+          !(error instanceof ByokCredentialError) &&
+          !(error instanceof ByokConnectionStateError)
+        )
+          throw error
+        const saved = (await read()).find(
+          (item) =>
+            item.id === selection.id && item.revision === selection.revision,
+        )
+        if (!saved) throw error
+        return { ok: false, connection: { ...saved }, message: error.message }
+      }
+      const connection = { ...resolved }
+      // Resolving already proved the sign-in works: it refreshed the token if
+      // it had to. The Codex backend has no cheap listing to probe.
+      if (resolved.provider === CHATGPT_BYOK_PROVIDER)
+        return { ok: true, connection }
+      let base: string | undefined
+      try {
+        await resolved.assertCurrent?.()
+        base = normalizeByokBaseUrl(resolved.provider, resolved.baseUrl)
+        const response = await fetchImpl(
+          base + (resolved.provider === 'openrouter' ? '/key' : '/models'),
+          {
+            headers: {
+              Authorization: `Bearer ${resolved.apiKey}`,
+              ...byokListingHeaders(resolved, base),
+            },
+            redirect: 'error',
+            signal: AbortSignal.timeout(10_000),
+          },
+        )
+        // No provider-controlled error body is logged or returned; it may echo
+        // headers. Only a successful model list is read, and only model ids
+        // (filtered, never the key) leave it.
+        const listing = response.ok
+          ? await readModelListing(response, resolved)
+          : (await response.body?.cancel(), undefined)
+        if (response.status === 404 && resolved.provider === 'openai-compatible')
+          return {
+            ok: false,
+            connection,
+            message: `Provider connection check failed (HTTP 404 from ${base}/models). ${baseUrlHint(base)}`,
+            statusCode: response.status,
+          }
+        if (!response.ok)
+          return {
+            ok: false,
+            connection,
+            message:
+              response.status === 401
+                ? rejectedByokCredentialMessage(resolved, response.status)
+                : `Provider connection check failed (HTTP ${response.status})`,
+            statusCode: response.status,
+          }
+        if (listing?.webPage)
+          return {
+            ok: false,
+            connection,
+            message: `${base}/models answered with a web page, not an OpenAI-compatible model list (HTTP ${response.status}). ${baseUrlHint(base)}`,
+            statusCode: response.status,
+          }
+        return {
+          ok: true,
+          connection,
+          statusCode: response.status,
+          ...(listing?.modelListed !== undefined
+            ? { modelListed: listing.modelListed }
+            : {}),
+          ...(listing?.availableModels
+            ? { availableModels: listing.availableModels }
+            : {}),
+        }
+      } catch (error) {
+        return {
+          ok: false,
+          connection,
+          message: unreachableProviderMessage(error, base),
+        }
+      }
+    },
+    saveChatGptSignIn: (tokens, models = CHATGPT_DEFAULT_MODELS) =>
+      exclusive(async () => {
+        const connections = await read()
+        const saved = connections.filter(
+          (item) => item.provider === CHATGPT_BYOK_PROVIDER,
+        )
+        const value = serializeChatGptTokens(tokens)
+        const fresh = !saved.length
+        const credentialRef = fresh
+          ? `chatgpt:${crypto.randomUUID()}`
+          : saved[0]!.credentialRef
+        if (fresh) await writeSecret(credentialRef, value)
+        else
+          for (const reference of new Set(saved.map((item) => item.credentialRef)))
+            await writeSecret(reference, value)
+        const have = new Set(saved.map((item) => item.model))
+        const created: ByokConnection[] = []
+        for (const model of models)
+          if (!have.has(model.model)) {
+            have.add(model.model)
+            created.push(await createChatGptModel(credentialRef, model))
+          }
+        if (created.length) {
+          try {
+            await metadataStore.set([...connections, ...created])
+          } catch (error) {
+            if (fresh) await secretStore.delete(credentialRef).catch(() => {})
+            throw error
+          }
+        }
+        return [...saved, ...created].map((item) => ({ ...item }))
+      }),
+  }
+  return store
+}
+
+type BunSecrets = {
+  get(options: { service: string; name: string }): Promise<string | null>
+  set(service: string, name: string, value: string): Promise<void>
+  delete(options: { service: string; name: string }): Promise<boolean>
+}
+function bunSecrets(): BunSecrets {
+  const secrets = (
+    globalThis as typeof globalThis & { Bun?: { secrets?: BunSecrets } }
+  ).Bun?.secrets
+  if (!secrets)
+    throw new Error(
+      'OS credential storage requires Bun; use an explicit environment credential for this runtime',
+    )
+  return secrets
+}
+export function createEnvironmentByokSecretStore(
+  environment: NodeJS.ProcessEnv = getSystemProcessEnv(),
+): ByokSecretStore {
+  return {
+    async get(reference) {
+      return envReference.test(reference)
+        ? environment[reference.slice(4)]
+        : undefined
+    },
+    async set() {
+      throw new Error('Environment credentials are read-only')
+    },
+    async delete() {},
+  }
+}
+
+/** Metadata only. Same default directory in packaged Desktop and standalone CLI. */
+export function createBunByokMetadataStore(
+  options: { directory?: string } = {},
+): ByokMetadataStore {
+  const directory =
+    options.directory ??
+    getSystemProcessEnv().FREEBUFF_BYOK_CONFIG_DIR ??
+    path.join(homedir(), '.config', 'freebuff', 'byok')
+  const file = path.join(directory, 'connections.json')
+  const lock = path.join(directory, 'connections.lock')
+  return {
+    async get() {
+      try {
+        return parseConnections(JSON.parse(await fs.readFile(file, 'utf8')))
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []
+        throw new ByokConnectionStateError(
+          'Cannot read BYOK connection metadata; restore the configuration before continuing',
+        )
+      }
+    },
+    async set(connections) {
+      const parsed = parseConnections(connections)
+      await fs.mkdir(directory, { recursive: true, mode: 0o700 })
+      const temporary = path.join(
+        directory,
+        `connections-${crypto.randomUUID()}.tmp`,
+      )
+      try {
+        await fs.writeFile(temporary, JSON.stringify(parsed, null, 2) + '\n', {
+          mode: 0o600,
+          flag: 'wx',
+        })
+        await fs.rename(temporary, file)
+      } finally {
+        await fs.unlink(temporary).catch(() => {})
+      }
+    },
+    async withLock(operation) {
+      await fs.mkdir(directory, { recursive: true, mode: 0o700 })
+      const started = Date.now()
+      const candidate = path.join(
+        directory,
+        `connections-lock-${crypto.randomUUID()}.tmp`,
+      )
+      let acquired = false
+      try {
+        // Publish an already-complete PID atomically. Creating an empty lock and
+        // then writing its owner leaves an unrecoverable lock if killed between.
+        await fs.writeFile(candidate, String(process.pid), {
+          flag: 'wx',
+          mode: 0o600,
+        })
+        while (!acquired) {
+          try {
+            await fs.link(candidate, lock)
+            acquired = true
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
+            await recoverByokLock(lock)
+            if (Date.now() - started >= 5000)
+              throw new ByokConnectionStateError(
+                'BYOK settings are locked. Close other Freebuff processes and retry. If the problem persists, close all Freebuff processes before removing connections.lock from the BYOK configuration directory.',
+              )
+            await new Promise((resolve) => setTimeout(resolve, 25))
+          }
+        }
+        await fs.unlink(candidate)
+        return await operation()
+      } finally {
+        try {
+          if (acquired) await fs.unlink(lock)
+        } finally {
+          await fs.unlink(candidate).catch(() => {})
+        }
+      }
+    },
+  }
+}
+export function createBunByokConnectionStore(
+  options: {
+    directory?: string
+    environment?: NodeJS.ProcessEnv
+    secretStore?: ByokSecretStore
+    fetch?: typeof globalThis.fetch
+  } = {},
+): ByokConnectionStore {
+  const environment = options.environment ?? getSystemProcessEnv()
+  const secretStore: ByokSecretStore = options.secretStore ?? {
+    async get(reference) {
+      if (envReference.test(reference)) return environment[reference.slice(4)]
+      return (
+        (await bunSecrets().get({
+          service: BYOK_SECRET_SERVICE,
+          name: reference,
+        })) ?? undefined
+      )
+    },
+    async set(reference, value) {
+      await bunSecrets().set(BYOK_SECRET_SERVICE, reference, value)
+    },
+    async delete(reference) {
+      if (!envReference.test(reference))
+        await bunSecrets().delete({
+          service: BYOK_SECRET_SERVICE,
+          name: reference,
+        })
+    },
+  }
+  return createByokConnectionStore({
+    metadataStore: createBunByokMetadataStore(options),
+    secretStore,
+    fetch: options.fetch,
+  })
+}
+```
+- File `sdk/src/impl/llm.ts` (1014 lines):
+```
+import { models, PROFIT_MARGIN } from '@codebuff/common/old-constants'
+import { buildArray } from '@codebuff/common/util/array'
+import {
+  STREAM_RECOVERY_EVENT,
+  TOOL_CALL_REPAIR_EVENT,
+} from '@codebuff/common/util/axiom-only-log'
+import { normalizeProviderRequestBodyForCacheDebug } from '@codebuff/common/util/cache-debug'
+import {
+  parseToolJson,
+  TOOL_NAME_ALIASES,
+} from '@codebuff/common/tools/repair-tool-json'
+import {
+  getErrorObject,
+  isFetchIdleTimeoutError,
+  promptAborted,
+  promptSuccess,
+} from '@codebuff/common/util/error'
+import { convertCbToModelMessages } from '@codebuff/common/util/messages'
+import { isExplicitlyDefinedModel } from '@codebuff/common/util/model-utils'
+import { StopSequenceHandler } from '@codebuff/common/util/stop-sequence'
+import {
+  streamText,
+  generateText,
+  Output,
+  NoSuchToolError,
+  APICallError,
+  ToolCallRepairError,
+  InvalidToolInputError,
+  TypeValidationError,
+} from 'ai'
+
+import { getModelForRequest } from './model-provider'
+import type { CodebuffRequestHeadersProvider } from './model-provider'
+import { byokModelLimits } from '../byok'
+import type { ResolvedByokConnection } from '../byok'
+import {
+  classifyErrorChunkRecovery,
+  classifyStreamEndRecovery,
+  classifyThrownStreamRecovery,
+  streamFinishInfoOf,
+  type StreamEndRecovery,
+  type StreamFinishInfo,
+} from './stream-interruption'
+
+import type {
+  OpenRouterProviderOptions,
+  OpenRouterProviderRoutingOptions,
+} from '@codebuff/common/types/agent-template'
+import type {
+  PromptAiSdkFn,
+  PromptAiSdkStreamFn,
+  PromptAiSdkStructuredInput,
+  PromptAiSdkStructuredOutput,
+} from '@codebuff/common/types/contracts/llm'
+import type { ParamsOf } from '@codebuff/common/types/function-params'
+import type { ProviderMetadata } from '@codebuff/common/types/messages/provider-metadata'
+import type { LanguageModel } from 'ai'
+
+/** Resolves after `ms`, or as soon as `signal` aborts. Never rejects. */
+function sleepUnlessAborted(ms: number, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) return Promise.resolve()
+  return new Promise((resolve) => {
+    const done = () => {
+      clearTimeout(timer)
+      signal.removeEventListener('abort', done)
+      resolve()
+    }
+    const timer = setTimeout(done, ms)
+    signal.addEventListener('abort', done, { once: true })
+  })
+}
+
+// Provider routing documentation: https://openrouter.ai/docs/features/provider-routing
+const providerOrder = {
+  [models.openrouter_claude_sonnet_4_5]: [
+    'Google',
+    'Anthropic',
+    'Amazon Bedrock',
+  ],
+}
+
+function calculateUsedCredits(params: { costDollars: number }): number {
+  const { costDollars } = params
+
+  return Math.round(costDollars * (1 + PROFIT_MARGIN) * 100)
+}
+
+export function getProviderOptions(params: {
+  model: string
+  runId: string
+  clientSessionId: string
+  providerOptions?: ProviderMetadata
+  agentProviderOptions?: OpenRouterProviderRoutingOptions
+  n?: number
+  costMode?: string
+  cacheDebugCorrelation?: string
+  extraCodebuffMetadata?: Record<string, string>
+}): ProviderMetadata {
+  const {
+    model,
+    runId,
+    clientSessionId,
+    providerOptions,
+    agentProviderOptions,
+    n,
+    costMode,
+    cacheDebugCorrelation,
+    extraCodebuffMetadata,
+  } = params
+
+  let providerConfig: Record<string, any>
+
+  // Use agent's provider options if provided, otherwise use defaults
+  if (agentProviderOptions) {
+    providerConfig = agentProviderOptions
+  } else {
+    // Set allow_fallbacks based on whether model is explicitly defined
+    const isExplicitlyDefined = isExplicitlyDefinedModel(model)
+
+    providerConfig = {
+      order: providerOrder[model as keyof typeof providerOrder],
+      allow_fallbacks: !isExplicitlyDefined,
+    }
+  }
+
+  return {
+    ...providerOptions,
+    // Could either be "codebuff" or "openaiCompatible"
+    codebuff: {
+      ...providerOptions?.codebuff,
+      // All values here get appended to the request body
+      codebuff_metadata: {
+        // Caller-supplied keys go first so they can't override reserved
+        // identifiers the SDK sets, like run_id/client_id/cost_mode.
+        ...(extraCodebuffMetadata ?? {}),
+        run_id: runId,
+        client_id: clientSessionId,
+        ...(n && { n }),
+        ...(costMode && { cost_mode: costMode }),
+        ...(cacheDebugCorrelation && {
+          cache_debug_correlation: cacheDebugCorrelation,
+        }),
+      },
+      provider: providerConfig,
+    },
+  }
+}
+
+// Usage accounting type for OpenRouter/Codebuff backend responses
+// Forked from https://github.com/OpenRouterTeam/ai-sdk-provider/
+type OpenRouterUsageAccounting = {
+  cost: number | null
+  costDetails: {
+    upstreamInferenceCost: number | null
+  }
+}
+
+function getModelProvider(model: LanguageModel): string {
+  if (typeof model === 'string') return model
+  return model.provider
+}
+
+function emitCacheDebugProviderRequest(params: {
+  callback?: (params: {
+    provider: string
+    rawBody: unknown
+    normalizedBody?: unknown
+  }) => void
+  provider: string
+  rawBody: unknown
+}) {
+  if (!params.callback) return
+
+  const normalized = normalizeProviderRequestBodyForCacheDebug({
+    provider: params.provider,
+    body: params.rawBody,
+  })
+
+  params.callback({
+    provider: params.provider,
+    rawBody: params.rawBody,
+    normalizedBody: normalized,
+  })
+}
+
+function emitCacheDebugUsage(params: {
+  callback?: (usage: {
+    inputTokens: number
+    outputTokens: number
+    reasoningOutputTokens?: number
+    cachedInputTokens: number
+    totalTokens: number
+  }) => void
+  usage: {
+    inputTokens?: number
+    outputTokens?: number
+    totalTokens?: number
+    inputTokenDetails?: {
+      cacheReadTokens?: number
+    }
+    outputTokenDetails?: {
+      reasoningTokens?: number
+    }
+  }
+}) {
+  if (!params.callback) return
+
+  params.callback({
+    inputTokens: params.usage.inputTokens ?? 0,
+    outputTokens: params.usage.outputTokens ?? 0,
+    ...(params.usage.outputTokenDetails?.reasoningTokens !== undefined
+      ? {
+          reasoningOutputTokens:
+            params.usage.outputTokenDetails.reasoningTokens,
+        }
+      : {}),
+    cachedInputTokens: params.usage.inputTokenDetails?.cacheReadTokens ?? 0,
+    totalTokens: params.usage.totalTokens ?? 0,
+  })
+}
+
+export async function* promptAiSdkStream(
+  params: ParamsOf<PromptAiSdkStreamFn> & {
+    byok?: ResolvedByokConnection
+    requestHeaders?: CodebuffRequestHeadersProvider
+  },
+  /** Internal: this is the one repeat of a request that timed out silently. */
+  idleTimeoutRetried = false,
+): ReturnType<PromptAiSdkStreamFn> {
+  const {
+    providerOptions: originalProviderOptions,
+    onFinishReason,
+    ...streamParams
+  } = params
+
+  const { logger } = params
+  const agentChunkMetadata =
+    params.agentId != null ? { agentId: params.agentId } : undefined
+
+  if (params.signal.aborted) {
+    logger.info(
+      {
+        userId: params.userId,
+        userInputId: params.userInputId,
+      },
+      'Skipping stream due to canceled user input',
+    )
+    return promptAborted('User cancelled input')
+  }
+
+  const aiSDKModel = getModelForRequest({
+    apiKey: params.apiKey,
+    model: params.model,
+    costMode: params.costMode,
+    userId: params.userId,
+    byok: params.byok,
+    requestHeaders: params.requestHeaders,
+  })
+
+  const response = streamText({
+    ...streamParams,
+    ...(params.byok && {
+      maxOutputTokens: Math.min(
+        params.maxOutputTokens ?? byokModelLimits(params.byok).reservedOutputTokens,
+        byokModelLimits(params.byok).reservedOutputTokens,
+      ),
+    }),
+    abortSignal: params.signal,
+    prompt: undefined,
+    model: aiSDKModel,
+    messages: convertCbToModelMessages(params),
+    allowSystemInMessages: true,
+    include: {
+      ...streamParams.include,
+      requestBody: true,
+    },
+    providerOptions: params.byok ? originalProviderOptions : getProviderOptions({
+      ...params,
+      providerOptions: originalProviderOptions,
+      agentProviderOptions: params.agentProviderOptions,
+    }),
+    // Handle tool call errors gracefully by passing them through to our validation layer
+    // instead of throwing (which would halt the agent). The only special case is when
+    // the tool name matches a spawnable agent - transform those to spawn_agents calls.
+    experimental_repairToolCall: async ({ toolCall, tools, error }) => {
+      const { spawnableAgents = [], localAgentTemplates = {} } = params
+      const toolName = toolCall.toolName
+
+      // Check if this is a NoSuchToolError for a spawnable agent
+      // If so, transform to spawn_agents call
+      if (NoSuchToolError.isInstance(error) && 'spawn_agents' in tools) {
+        // Also check for underscore variant (e.g., "file_picker" -> "file-picker")
+        const toolNameWithHyphens = toolName.replace(/_/g, '-')
+
+        const matchingAgentId = spawnableAgents.find((agentId) => {
+          const withoutVersion = agentId.split('@')[0]
+          const parts = withoutVersion.split('/')
+          const agentName = parts[parts.length - 1]
+          return (
+            agentName === toolName ||
+            agentName === toolNameWithHyphens ||
+            agentId === toolName
+          )
+        })
+        const isSpawnableAgent = matchingAgentId !== undefined
+        const isLocalAgent =
+          toolName in localAgentTemplates ||
+          toolNameWithHyphens in localAgentTemplates
+
+        if (isSpawnableAgent || isLocalAgent) {
+          // Transform agent tool call to spawn_agents
+          const deepParseJson = (value: unknown): unknown => {
+            if (typeof value === 'string') {
+              try {
+                return deepParseJson(JSON.parse(value))
+              } catch {
+                return value
+              }
+            }
+            if (Array.isArray(value)) return value.map(deepParseJson)
+            if (value !== null && typeof value === 'object') {
+              return Object.fromEntries(
+                Object.entries(value).map(([k, v]) => [k, deepParseJson(v)]),
+              )
+            }
+            return value
+          }
+
+          let input: Record<string, unknown> = {}
+          try {
+            const rawInput =
+              typeof toolCall.input === 'string'
+                ? JSON.parse(toolCall.input)
+                : (toolCall.input as Record<string, unknown>)
+            input = deepParseJson(rawInput) as Record<string, unknown>
+          } catch {
+            // If parsing fails, use empty object
+          }
+
+          const prompt =
+            typeof input.prompt === 'string' ? input.prompt : undefined
+          const agentParams = Object.fromEntries(
+            Object.entries(input).filter(
+              ([key, value]) =>
+                !(key === 'prompt' && typeof value === 'string'),
+            ),
+          )
+
+          // Use the matching agent ID or corrected name with hyphens
+          const correctedAgentType =
+            matchingAgentId ??
+            (toolNameWithHyphens in localAgentTemplates
+              ? toolNameWithHyphens
+              : toolName)
+
+          const spawnAgentsInput = {
+            agents: [
+              {
+                agent_type: correctedAgentType,
+                ...(prompt !== undefined && { prompt }),
+                ...(Object.keys(agentParams).length > 0 && {
+                  params: agentParams,
+                }),
+              },
+            ],
+          }
+
+          logger.info(
+            { originalToolName: toolName, transformedInput: spawnAgentsInput },
+            'Transformed agent tool call to spawn_agents',
+          )
+
+          return {
+            ...toolCall,
+            toolName: 'spawn_agents',
+            input: JSON.stringify(spawnAgentsInput),
+          }
+        }
+      }
+
+      // A name models invent for a real tool (`run_command`): run it as that tool.
+      const alias = TOOL_NAME_ALIASES[toolName]
+      if (NoSuchToolError.isInstance(error) && alias && alias in tools) {
+        logger.info(
+          {
+            axiomEvent: TOOL_CALL_REPAIR_EVENT,
+            metric: 'tool_renamed',
+            toolName,
+            alias,
+            model: params.model,
+          },
+          'Renamed tool call to a real tool',
+        )
+        return { ...toolCall, toolName: alias }
+      }
+
+      // Arguments a model got slightly wrong (an unescaped quote in code): run the call as
+      // repaired, if a repair makes them parse; its schema still validates them.
+      if (InvalidToolInputError.isInstance(error)) {
+        const repaired = parseToolJson(toolCall.input)
+        if (repaired?.repair) {
+          logger.info(
+            {
+              axiomEvent: TOOL_CALL_REPAIR_EVENT,
+              metric: 'arguments_repaired',
+              toolName,
+              repair: repaired.repair,
+              model: params.model,
+            },
+            'Repaired tool call arguments',
+          )
+          return { ...toolCall, input: JSON.stringify(repaired.value) }
+        }
+      }
+
+      // For all other cases (invalid args, unknown tools, etc.), pass through
+      // the original tool call.
+      logger.info(
+        {
+          toolName,
+          errorType: error.name,
+          error: error.message,
+        },
+        'Tool error - passing through for graceful error handling',
+      )
+      return toolCall
+    },
+  })
+
+  let usageReported = false
+  let usageIncompleteReported = false
+  const reportUsageIncomplete = () => {
+    if (usageReported || usageIncompleteReported) return
+    usageIncompleteReported = true
+    params.onUsageIncomplete?.()
+  }
+  const reportUsage = (usage: {
+    inputTokens?: number
+    outputTokens?: number
+    totalTokens?: number
+    inputTokenDetails?: {
+      cacheReadTokens?: number
+    }
+    outputTokenDetails?: {
+      reasoningTokens?: number
+    }
+  }) => {
+    if (usageReported || usageIncompleteReported) return
+    usageReported = true
+    emitCacheDebugUsage({
+      callback: params.onCacheDebugUsageReceived,
+      usage,
+    })
+    emitCacheDebugUsage({
+      callback: params.onUsageReceived,
+      usage,
+    })
+  }
+
+  let costReported = false
+  let finishProviderMetadata: ProviderMetadata | undefined
+  const reportCost = async (providerMetadata: ProviderMetadata | undefined) => {
+    if (costReported) return
+    const openrouterUsage = providerMetadata?.codebuff?.usage as
+      | OpenRouterUsageAccounting
+      | undefined
+    const costOverrideDollars = openrouterUsage
+      ? (openrouterUsage.cost ?? 0) +
+        (openrouterUsage.costDetails?.upstreamInferenceCost ?? 0)
+      : undefined
+    if (!params.onCostCalculated || !costOverrideDollars) return
+    costReported = true
+    await params.onCostCalculated(
+      calculateUsedCredits({ costDollars: costOverrideDollars }),
+    )
+  }
+
+  const stopSequenceHandler = new StopSequenceHandler(params.stopSequences)
+
+  // Track if we've yielded any content - if so, we can't safely fall back
+  let hasYieldedContent = false
+  // Native reasoning is not visible answer content, but it distinguishes a
+  // silent model stop from a legitimate empty completion.
+  let hasReceivedReasoning = false
+  // Tool calls tracked separately: a step that produced tool calls is
+  // actionable even with no text, so it is never a silent stop.
+  let hasYieldedToolCall = false
+
+  // A healthy stream always delivers a finish part with a real finishReason
+  // (and usage) before ending; its absence after the loop can mean a cut
+  // connection or an incompatible provider stream. See stream-interruption.ts.
+  let finishInfo: StreamFinishInfo | undefined
+  // Bun/undici can throw when a response body is severed instead of ending the
+  // iterator cleanly. Feed that through the same capped continuation path as a
+  // clean end without a finish marker. A retryable provider error reported in
+  // band (5xx/429 error chunk) takes the same path: see
+  // classifyErrorChunkRecovery.
+  let thrownStreamRecovery: StreamEndRecovery | undefined
+  // Any model output part, including one still held by the stop-sequence
+  // buffer or a tool call's streamed input: once one arrived, the step is not
+  // repeated (see silentTimeoutRetry).
+  let receivedModelOutput = false
+  let retryAfterSilentTimeout = false
+  /**
+   * The runtime's 5-minute fetch inactivity timeout (isFetchIdleTimeoutError)
+   * before this step received any output: nothing reached the user and no tool
+   * call exists, so the same request is sent once more. No other layer retries
+   * it: the AI SDK treats a TimeoutError as an abort, and the stream recoveries
+   * below do not classify it. A BYOK request's timeout is sanitized into a
+   * transient network error, which the stream-interrupted recovery already
+   * retries, so it is left to that. A second silent timeout fails as before.
+   */
+  const silentTimeoutRetry = (error: unknown) => {
+    if (params.byok || params.signal.aborted || !isFetchIdleTimeoutError(error))
+      return false
+    if (!idleTimeoutRetried && !receivedModelOutput) return true
+    // Why this one fails instead: output had arrived, or it was the repeat.
+    // STREAM_RECOVERY_EVENT, so a host that forwards only allowlisted events
+    // (the hosted Cloud worker's cloudSdkLogger) still ships it.
+    logger.warn(
+      {
+        axiomEvent: STREAM_RECOVERY_EVENT,
+        metric: 'stream_silent_timeout_failed',
+        model: params.model,
+        userInputId: params.userInputId,
+        hasYieldedContent,
+        receivedModelOutput,
+        repeated: idleTimeoutRetried,
+      },
+      'Model request timed out with no data and was not sent again',
+    )
+    return false
+  }
+  const streamIterator = response.stream[Symbol.asyncIterator]()
+  const recoverThrownStream = (
+    error: unknown,
+    classify: typeof classifyThrownStreamRecovery = classifyThrownStreamRecovery,
+  ): StreamEndRecovery | null => {
+    const recovery = classify({
+      aborted: params.signal.aborted,
+      error,
+    })
+    if (!recovery) return null
+    // These final-result promises can reject with the same transport error.
+    // Observe them now so the recovery yield below cannot leave an unhandled
+    // rejection while the consumer starts the continuation step.
+    void Promise.allSettled([
+      response.response,
+      response.request,
+      response.usage,
+      response.providerMetadata,
+    ])
+    return recovery
+  }
+
+  while (true) {
+    let iteration: Awaited<ReturnType<typeof streamIterator.next>>
+    try {
+      iteration = await streamIterator.next()
+    } catch (error) {
+      if (params.signal.aborted) reportUsageIncomplete()
+      if (silentTimeoutRetry(error)) {
+        retryAfterSilentTimeout = true
+        break
+      }
+      const recovery = recoverThrownStream(error)
+      if (!recovery) throw error
+      thrownStreamRecovery = recovery
+      break
+    }
+    if (iteration.done) break
+    const chunkValue = iteration.value
+    if (/^(text|reasoning|tool)-/.test(chunkValue.type)) receivedModelOutput = true
+    if (chunkValue.type === 'finish-step') {
+      finishProviderMetadata = chunkValue.providerMetadata as
+        | ProviderMetadata
+        | undefined
+    }
+    if (chunkValue.type === 'finish') {
+      finishInfo = streamFinishInfoOf(
+        chunkValue,
+        typeof aiSDKModel !== 'string' &&
+          aiSDKModel.specificationVersion === 'v2',
+      )
+      if (finishInfo.hasUsage) reportUsage(chunkValue.totalUsage)
+      await reportCost(finishProviderMetadata)
+      onFinishReason?.(finishInfo.finishReason)
+    }
+    if (chunkValue.type !== 'text-delta') {
+      const flushed = stopSequenceHandler.flush()
+      if (flushed) {
+        hasYieldedContent = true
+        yield {
+          type: 'text',
+          text: flushed,
+          ...(agentChunkMetadata ?? {}),
+        }
+      }
+    }
+    if (chunkValue.type === 'error') {
+      if (params.signal.aborted) reportUsageIncomplete()
+      // Error chunks are usually model/tool/API failures. Some runtimes surface
+      // a response-body transport drop here instead of rejecting iterator.next;
+      // the final branch below recognizes that one recoverable exception.
+
+      const errorBody = APICallError.isInstance(chunkValue.error)
+        ? chunkValue.error.responseBody
+        : undefined
+      const mainErrorMessage =
+        chunkValue.error instanceof Error
+          ? chunkValue.error.message
+          : typeof chunkValue.error === 'string'
+            ? chunkValue.error
+            : JSON.stringify(chunkValue.error)
+      const errorMessage = buildArray([mainErrorMessage, errorBody]).join('\n')
+
+      // Pass these errors back to the agent so it can see what went wrong and retry.
+      // Note: If you find any other error types that should be passed through to the agent, add them here!
+      if (
+        NoSuchToolError.isInstance(chunkValue.error) ||
+        InvalidToolInputError.isInstance(chunkValue.error) ||
+        ToolCallRepairError.isInstance(chunkValue.error) ||
+        TypeValidationError.isInstance(chunkValue.error)
+      ) {
+        logger.warn(
+          {
+            chunk: { ...chunkValue, error: undefined },
+            error: getErrorObject(chunkValue.error),
+            model: params.model,
+          },
+          'Tool call error in AI SDK stream - passing through to agent to retry',
+        )
+        yield {
+          type: 'error',
+          message: errorMessage,
+        }
+        continue
+      }
+
+      if (silentTimeoutRetry(chunkValue.error)) {
+        retryAfterSilentTimeout = true
+        break
+      }
+
+      // A transport error can also arrive as an AI SDK error chunk instead of
+      // making iterator.next() reject. Recover both runtime shapes identically.
+      // So does a provider that reported a retryable failure (5xx/429) in
+      // band: the same outage, just announced instead of a cut body — and an
+      // announced failure outranks a guess from the error's wording, which is
+      // why classifyErrorChunkRecovery tries it first.
+      const recovery = recoverThrownStream(
+        chunkValue.error,
+        classifyErrorChunkRecovery,
+      )
+      if (recovery) {
+        thrownStreamRecovery = recovery
+        break
+      }
+
+      logger.error(
+        {
+          chunk: { ...chunkValue, error: undefined },
+          error: getErrorObject(chunkValue.error),
+          model: params.model,
+        },
+        'Error in AI SDK stream',
+      )
+
+      // For all other errors, throw them -- they are fatal.
+      throw chunkValue.error
+    }
+    if (chunkValue.type === 'reasoning-delta') {
+      if (chunkValue.text) {
+        hasReceivedReasoning = true
+      }
+      const reasoningExcluded = (['openrouter', 'codebuff'] as const).some(
+        (p) =>
+          (params.providerOptions?.[p] as OpenRouterProviderOptions | undefined)
+            ?.reasoning?.exclude,
+      )
+      if (!reasoningExcluded) {
+        yield {
+          type: 'reasoning',
+          text: chunkValue.text,
+        }
+      }
+    }
+    if (chunkValue.type === 'reasoning-end') {
+      if (chunkValue.providerMetadata) {
+        hasReceivedReasoning = true
+        yield {
+          type: 'reasoning',
+          text: '',
+          providerOptions: chunkValue.providerMetadata as ProviderMetadata,
+        }
+      }
+    }
+    if (chunkValue.type === 'text-delta') {
+      if (!params.stopSequences) {
+        if (chunkValue.text) {
+          hasYieldedContent = true
+          yield {
+            type: 'text',
+            text: chunkValue.text,
+            ...(agentChunkMetadata ?? {}),
+          }
+        }
+        continue
+      }
+
+      const stopSequenceResult = stopSequenceHandler.process(chunkValue.text)
+      if (stopSequenceResult.text) {
+        hasYieldedContent = true
+        yield {
+          type: 'text',
+          text: stopSequenceResult.text,
+          ...(agentChunkMetadata ?? {}),
+        }
+      }
+    }
+    if (chunkValue.type === 'tool-call') {
+      hasYieldedToolCall = true
+      // The call's provider metadata (e.g. Gemini's thought signature) rides
+      // into the history's tool-call part, so the next request replays it.
+      yield chunkValue.providerMetadata
+        ? {
+            ...chunkValue,
+            providerOptions: chunkValue.providerMetadata as ProviderMetadata,
+          }
+        : chunkValue
+    }
+  }
+  if (retryAfterSilentTimeout) {
+    // The abandoned attempt's final-result promises reject with the same
+    // timeout; observe them so none is left unhandled.
+    void Promise.allSettled([
+      response.response,
+      response.request,
+      response.usage,
+      response.providerMetadata,
+    ])
+    logger.warn(
+      {
+        axiomEvent: STREAM_RECOVERY_EVENT,
+        metric: 'stream_silent_timeout_retry',
+        model: params.model,
+        userInputId: params.userInputId,
+      },
+      'Model request timed out before any output; sending it once more',
+    )
+    return yield* promptAiSdkStream(params, true)
+  }
+  const flushed = stopSequenceHandler.flush()
+  if (flushed) {
+    hasYieldedContent = true
+    yield {
+      type: 'text',
+      text: flushed,
+      ...(agentChunkMetadata ?? {}),
+    }
+  }
+
+  if (params.signal.aborted) reportUsageIncomplete()
+  if (thrownStreamRecovery && params.signal.aborted) {
+    return promptAborted('User cancelled input')
+  }
+  const recovery =
+    thrownStreamRecovery ??
+    classifyStreamEndRecovery({
+      aborted: params.signal.aborted,
+      finish: finishInfo,
+      receivedReasoning: hasReceivedReasoning,
+      yieldedText: hasYieldedContent,
+      yieldedToolCall: hasYieldedToolCall,
+    })
+  if (recovery) {
+    reportUsageIncomplete()
+    // The stream ended in a recoverable silent stop (connection cut, or
+    // reasoning ended without an answer). Yield an error chunk instead of
+    // ending like a normal completion: the agent loop appends the note to
+    // the conversation and forces another step (with a consecutive cap), so
+    // the model continues rather than the turn silently stopping.
+    logger.warn(
+      {
+        // axiomEvent bypasses the CLI's default redaction of non-error log
+        // payloads (see common/src/util/axiom-only-log.ts) — without it,
+        // `source`/`model`/etc. below would ship to Axiom as a
+        // {kind, keyCount, keys} shape summary instead of real values,
+        // since only error/fatal-level CLI logs ship raw data otherwise.
+        // Queryable via scripts/logs/stream-interruptions.ts — one event per
+        // detection. Outcomes (rescued/gave_up) are emitted by the agent
+        // loop, which knows the consecutive streak.
+        axiomEvent: STREAM_RECOVERY_EVENT,
+        metric: 'stream_recovery_detected',
+        source: recovery.source,
+        model: params.model,
+        userId: params.userId,
+        userInputId: params.userInputId,
+        finishReason: finishInfo?.finishReason,
+        hasYieldedContent,
+        hasReceivedReasoning,
+        ...(recovery.statusCode !== undefined && {
+          statusCode: recovery.statusCode,
+        }),
+      },
+      'Completion stream ended without a usable response; forcing a retry step',
+    )
+    // A provider that just failed or rate-limited us gets a short, bounded
+    // pause before the forced retry step asks it again. A cancel during the
+    // pause ends the stream as a cancel, not a retry.
+    if (recovery.delayMs) {
+      await sleepUnlessAborted(recovery.delayMs, params.signal)
+      if (params.signal.aborted) return promptAborted('User cancelled input')
+    }
+    yield {
+      type: 'error',
+      source: recovery.source,
+      message: recovery.message,
+      ...(recovery.detail !== undefined && { detail: recovery.detail }),
+    }
+  }
+
+  // A thrown response body has no reliable final metadata to collect. The
+  // recovery chunk above preserves partial output and forces a fresh agent
+  // step, which continues from that saved context.
+  if (thrownStreamRecovery) return promptSuccess(null)
+
+  const responseValue = await response.response
+  const messageId = responseValue.id
+
+  const requestMetadata = await response.request
+  emitCacheDebugProviderRequest({
+    callback: params.onCacheDebugProviderRequestBuilt,
+    provider: getModelProvider(aiSDKModel),
+    rawBody: requestMetadata.body,
+  })
+
+  const usageResult = await response.usage
+  if (finishInfo?.hasUsage) reportUsage(usageResult)
+  else reportUsageIncomplete()
+
+  const providerMetadata = (await response.providerMetadata) ?? {}
+  await reportCost(providerMetadata as ProviderMetadata)
+
+  return promptSuccess(messageId)
+}
+
+export async function promptAiSdk(
+  params: ParamsOf<PromptAiSdkFn> & {
+    byok?: ResolvedByokConnection
+    requestHeaders?: CodebuffRequestHeadersProvider
+  },
+): ReturnType<PromptAiSdkFn> {
+  const { logger } = params
+
+  if (params.signal.aborted) {
+    logger.info(
+      {
+        userId: params.userId,
+        userInputId: params.userInputId,
+      },
+      'Skipping prompt due to canceled user input',
+    )
+    return promptAborted('User cancelled input')
+  }
+
+  const aiSDKModel = getModelForRequest({
+    apiKey: params.apiKey,
+    model: params.model,
+    costMode: params.costMode,
+    userId: params.userId,
+    byok: params.byok,
+    requestHeaders: params.requestHeaders,
+  })
+
+  const response = await generateText({
+    ...params,
+    ...(params.byok && {
+      maxOutputTokens: Math.min(
+        params.maxOutputTokens ?? byokModelLimits(params.byok).reservedOutputTokens,
+        byokModelLimits(params.byok).reservedOutputTokens,
+      ),
+    }),
+    prompt: undefined,
+    model: aiSDKModel,
+    messages: convertCbToModelMessages(params),
+    allowSystemInMessages: true,
+    include: {
+      ...params.include,
+      requestBody: true,
+    },
+    providerOptions: params.byok ? undefined : getProviderOptions({
+      ...params,
+      agentProviderOptions: params.agentProviderOptions,
+      cacheDebugCorrelation: params.cacheDebugCorrelation,
+    }),
+  })
+  emitCacheDebugProviderRequest({
+    callback: params.onCacheDebugProviderRequestBuilt,
+    provider: getModelProvider(aiSDKModel),
+    rawBody: response.request?.body,
+  })
+  emitCacheDebugUsage({
+    callback: params.onCacheDebugUsageReceived,
+    usage: response.usage,
+  })
+  const content = response.text
+
+  const providerMetadata = response.providerMetadata ?? {}
+  let costOverrideDollars: number | undefined
+  if (providerMetadata.codebuff) {
+    if (providerMetadata.codebuff.usage) {
+      const openrouterUsage = providerMetadata.codebuff
+        .usage as OpenRouterUsageAccounting
+
+      costOverrideDollars =
+        (openrouterUsage.cost ?? 0) +
+        (openrouterUsage.costDetails?.upstreamInferenceCost ?? 0)
+    }
+  }
+
+  // Call the cost callback if provided
+  if (params.onCostCalculated && costOverrideDollars) {
+    await params.onCostCalculated(
+      calculateUsedCredits({ costDollars: costOverrideDollars }),
+    )
+  }
+
+  return promptSuccess(content)
+}
+
+export async function promptAiSdkStructured<T>(
+  params: PromptAiSdkStructuredInput<T> & {
+    byok?: ResolvedByokConnection
+    requestHeaders?: CodebuffRequestHeadersProvider
+  },
+): PromptAiSdkStructuredOutput<T> {
+  const { logger } = params
+
+  if (params.signal.aborted) {
+    logger.info(
+      {
+        userId: params.userId,
+        userInputId: params.userInputId,
+      },
+      'Skipping structured prompt due to canceled user input',
+    )
+    return promptAborted('User cancelled input')
+  }
+  const aiSDKModel = getModelForRequest({
+    apiKey: params.apiKey,
+    model: params.model,
+    costMode: params.costMode,
+    userId: params.userId,
+    byok: params.byok,
+    requestHeaders: params.requestHeaders,
+  })
+
+  const response = await generateText({
+    ...params,
+    ...(params.byok && {
+      maxOutputTokens: Math.min(
+        params.maxTokens ?? byokModelLimits(params.byok).reservedOutputTokens,
+        byokModelLimits(params.byok).reservedOutputTokens,
+      ),
+    }),
+    prompt: undefined,
+    model: aiSDKModel,
+    output: Output.object({ schema: params.schema }),
+    messages: convertCbToModelMessages(params),
+    allowSystemInMessages: true,
+    include: { requestBody: true },
+    providerOptions: params.byok ? undefined : getProviderOptions({
+      ...params,
+      agentProviderOptions: params.agentProviderOptions,
+      cacheDebugCorrelation: params.cacheDebugCorrelation,
+    }),
+  })
+
+  emitCacheDebugProviderRequest({
+    callback: params.onCacheDebugProviderRequestBuilt,
+    provider: getModelProvider(aiSDKModel),
+    rawBody: response.request?.body,
+  })
+  emitCacheDebugUsage({
+    callback: params.onCacheDebugUsageReceived,
+    usage: response.usage,
+  })
+
+  const content = response.output
+
+  const providerMetadata = response.providerMetadata ?? {}
+  let costOverrideDollars: number | undefined
+  if (providerMetadata.codebuff) {
+    if (providerMetadata.codebuff.usage) {
+      const openrouterUsage = providerMetadata.codebuff
+        .usage as OpenRouterUsageAccounting
+
+      costOverrideDollars =
+        (openrouterUsage.cost ?? 0) +
+        (openrouterUsage.costDetails?.upstreamInferenceCost ?? 0)
+    }
+  }
+
+  // Call the cost callback if provided
+  if (params.onCostCalculated && costOverrideDollars) {
+    await params.onCostCalculated(
+      calculateUsedCredits({ costDollars: costOverrideDollars }),
+    )
+  }
+
+  return promptSuccess(content)
+}
+```
+- File `sdk/src/run.ts` (1839 lines):
+```
+import path from 'path'
+
+import { callWebFetchAPI } from '@codebuff/agent-runtime/llm-api/codebuff-web-api'
+import { callMainPrompt } from '@codebuff/agent-runtime/main-prompt'
+import { adjustContextTokenCountForHistoryEdit } from '@codebuff/agent-runtime/util/context-token-count'
+import {
+  buildUserMessageContent,
+  USER_INTERRUPTED_MESSAGE,
+  withSystemTags,
+} from '@codebuff/agent-runtime/util/messages'
+import { MAX_AGENT_STEPS_DEFAULT } from '@codebuff/common/constants/agents'
+import { BYOK_LOCAL_USER_ID } from '@codebuff/common/constants/byok'
+import { toRepoSnapshot } from '@codebuff/common/util/file'
+import { dropUnansweredToolCalls } from '@codebuff/common/util/messages'
+import {
+  FILE_READ_STATUS,
+  toOptionalFile,
+} from '@codebuff/common/constants/paths'
+import {
+  getMCPClient,
+  listMCPTools,
+  callMCPTool,
+} from '@codebuff/common/mcp/client'
+import { toolNames } from '@codebuff/common/tools/constants'
+import { clientToolCallSchema, type CodebuffToolCall } from '@codebuff/common/tools/list'
+import { AgentOutputSchema } from '@codebuff/common/types/session-state'
+import {
+  FETCH_IDLE_TIMEOUT_USER_MESSAGE,
+  TRANSIENT_NETWORK_ERROR_USER_MESSAGE,
+  extractApiErrorDetails,
+  isFetchIdleTimeoutError,
+  isTransientNetworkError,
+} from '@codebuff/common/util/error'
+import { isSensitiveEnvFilePath } from '@codebuff/common/util/env-file-path'
+import { PROJECT_UNDERSTANDING_OUTSIDE_PROJECT_MESSAGE } from '@codebuff/common/project-understanding/non-text-files'
+import { cloneDeep } from 'lodash'
+
+import { byokModelLimits } from './byok'
+import type { ResolvedByokConnection } from './byok'
+import { getErrorStatusCode } from './error-utils'
+import { getAgentRuntimeImpl } from './impl/agent-runtime'
+import {
+  createProjectProfileClient,
+  projectProfileSurface,
+  resolveProjectKey,
+} from './project-profile'
+import { getUserInfoFromApiKey } from './impl/database'
+import { initialSessionState, applyOverridesToSessionState } from './run-state'
+import type { ComputedProjectIndex } from './run-state'
+import { changeFile } from './tools/change-file'
+import { applyPatchTool } from './tools/apply-patch'
+import { codeSearch } from './tools/code-search'
+import { glob } from './tools/glob'
+import { listDirectory } from './tools/list-directory'
+import {
+  findFileLookupKey,
+  getProjectPathLookupKeys,
+  resolveFilePath,
+} from './tools/path-utils'
+import { createProjectFence } from './tools/project-confinement'
+import { getFiles, getImageFile } from './tools/read-files'
+import { readUrl } from './tools/read-url'
+import { runTerminalCommand } from './tools/run-terminal-command'
+import type { TerminalCommandBroker } from './tools/run-terminal-command'
+
+import type { CustomToolDefinition } from './custom-tool'
+import type { CodebuffRequestHeadersProvider } from './impl/model-provider'
+import type { RunState } from './run-state'
+import type { ProjectFence } from './tools/project-confinement'
+import type { FileFilter } from './tools/read-files'
+import type { ServerAction } from '@codebuff/common/actions'
+import type { FileReadWindow } from '@codebuff/common/types/contracts/client'
+import type { AgentDefinition } from '@codebuff/common/templates/initial-agents-dir/types/agent-definition'
+import type { ToolName } from '@codebuff/common/tools/constants'
+import type { PublishedClientToolName } from '@codebuff/common/tools/list'
+import type { Logger } from '@codebuff/common/types/contracts/logger'
+import type {
+  AgentUsageData,
+  ContextCompactionData,
+} from '@codebuff/common/types/contracts/llm'
+import type { TraceWriter } from '@codebuff/common/types/contracts/trace'
+import type { DrainSteeringMessages } from '@codebuff/common/types/contracts/steering'
+import type { CodebuffFileSystem } from '@codebuff/common/types/filesystem'
+import type {
+  Message,
+  ToolMessage,
+} from '@codebuff/common/types/messages/codebuff-message'
+import type { ToolResultOutput } from '@codebuff/common/types/messages/content-part'
+import type { PrintModeEvent } from '@codebuff/common/types/print-mode'
+import type {
+  ConversationSummary,
+  SessionState,
+} from '@codebuff/common/types/session-state'
+import type { SkillsMap } from '@codebuff/common/types/skill'
+import type { Source } from '@codebuff/common/types/source'
+import type { CodebuffSpawn } from '@codebuff/common/types/spawn'
+
+/**
+ * Client-side replacements for the tools the SDK would otherwise execute
+ * itself, keyed by tool name. `read_files` is EXCLUDED from the mapped half
+ * and declared on its own because its signature differs: it answers a map of
+ * path to content rather than a tool-result array. As an intersection with the
+ * mapped half it was unsatisfiable — an implementation had to be assignable to
+ * both signatures at once — which is why callers cast to `never`.
+ */
+export type OverrideToolHandlers = {
+  [K in Exclude<PublishedClientToolName, 'read_files'>]?: (
+    input: any,
+    context?: { toolCallId?: string },
+  ) => Promise<ToolResultOutput[]>
+} & {
+  read_image?: import('@codebuff/common/types/contracts/client').RequestImageFileFn
+  read_files?: (input: {
+    filePaths: string[]
+    /** Present only for `windowedFileReads` agents. An override that ignores
+     *  it returns whole files, which is a cost regression rather than a
+     *  correctness bug — but it is the whole point of the flag, so overrides
+     *  on hosted surfaces window the content themselves (they hold the file
+     *  before their own read budget truncates it). */
+    fileWindows?: Record<string, FileReadWindow[]>
+    /** Set only when the SDK reads a file to compute an edit (str_replace,
+     *  write_file), never from a model's read_files call. The override must
+     *  then return the whole file, skipping its read budget: an edit computed
+     *  from a truncated read cannot match anything past the cut, and the patch
+     *  it produces carries the truncation notice, so it fails to apply to the
+     *  real file. An override that ignores it keeps that old behaviour. */
+    fullContent?: true
+  }) => Promise<Record<string, string | null>>
+}
+
+function isRunPauseError(error: unknown) {
+  return (
+    !!error &&
+    typeof error === 'object' &&
+    (('codebuffRunPaused' in error &&
+      (error as { codebuffRunPaused?: unknown }).codebuffRunPaused === true) ||
+      ('name' in error &&
+        (error as { name?: unknown }).name === 'CodebuffRunPausedError'))
+  )
+}
+
+/** Remove the resolved credential and conventional provider variables before a
+ * terminal tool inherits the host environment. This does not disable normal
+ * user tooling network access; it only prevents an agent from reading BYOK
+ * credentials through a subprocess. */
+function scrubByokCredentialEnv(
+  env: Record<string, string> | undefined,
+  credential: string,
+): Record<string, string> {
+  const result: Record<string, string> = {}
+  for (const [key, value] of Object.entries(env ?? {})) {
+    if (value === credential || /(?:openrouter|openai|anthropic).*api.*key/i.test(key)) continue
+    result[key] = value
+  }
+  return result
+}
+
+export type CodebuffClientOptions = {
+  apiKey?: string
+  /** Direct, local inference for this run. The key is intentionally runtime-only. */
+  byok?: ResolvedByokConnection
+  /**
+   * Registry publishers whose agents may run executable `handleSteps` in this
+   * process. A template fetched from the public registry with a `handleSteps`
+   * source string is code the runtime evals on this machine, so it is refused
+   * unless its publisher is `codebuff`, listed here, or named in the
+   * `CODEBUFF_TRUSTED_AGENT_PUBLISHERS` env var (comma-separated). Local
+   * `.agents` files and `agentDefinitions` are never gated. See
+   * `sdk/src/agent-publisher-trust.ts`.
+   */
+  trustedAgentPublishers?: string[]
+  /**
+   * Refuse every agent-registry fetch for this run. Unknown or missing agent
+   * ids fail as "not found" instead of falling back to
+   * `codebuff/<id>@latest` on the public registry. For hosts that bundle
+   * every agent they will ever run (the embedded Freebuff Web runner): a
+   * registry template can carry executable `handleSteps`, and `codebuff` is
+   * an always-trusted publisher, so on a server the fallback is a code path
+   * from a publisher account into the host process for no benefit.
+   */
+  disableAgentRegistry?: boolean
+  /**
+   * Extra headers for every request this client makes to the Codebuff
+   * backend's completions endpoint, computed per request from its final body
+   * (so a host can sign it). Not used by BYOK runs. Omitted: requests are
+   * unchanged. See `CodebuffRequestHeadersProvider`.
+   */
+  requestHeaders?: CodebuffRequestHeadersProvider
+
+  cwd?: string
+  /** Optional directory path to load skills from. Skills found here will be available to the `skill` tool. */
+  skillsDir?: string
+  /**
+   * Supplies the run's skills instead of the default local-filesystem walk.
+   *
+   * Set this when the repo being acted on is NOT on the machine running this
+   * SDK — the default loader reads this machine's disk, which for a
+   * server-embedded runner means the server's own files. See
+   * `InitialSessionStateOptions.skillsLoader` in ./run-state.ts.
+   */
+  skillsLoader?: () => Promise<SkillsMap>
+  /**
+   * Also load the user's `~/.claude/skills` and `~/.agents/skills`. Defaults
+   * to false. Set it only in a process that BELONGS to that user — an
+   * interactive CLI on their own machine. Anything server-side must leave it
+   * unset. See `LoadSkillsOptions.includeHomeSkills`.
+   */
+  includeHomeSkills?: boolean
+  projectFiles?: Record<string, string>
+  /** Precomputed index for exactly these `projectFiles` (build it with
+   *  `computeProjectIndexFromFiles`). Skips the per-run tree-sitter parse;
+   *  ignored when `projectFiles` is absent. */
+  projectIndex?: ComputedProjectIndex
+  /** See `InitialSessionStateOptions.skipSymbolIndex`. */
+  skipSymbolIndex?: boolean
+  knowledgeFiles?: Record<string, string>
+  agentDefinitions?: AgentDefinition[]
+  /** See `InitialSessionStateOptions.agentDirs`: the directories a fresh
+   *  session may import agent modules from when `agentDefinitions` is
+   *  omitted. Defaults to `~/.agents`; never the repository. */
+  agentDirs?: string[]
+  maxAgentSteps?: number
+  env?: Record<string, string>
+  /** Optional host process boundary that keeps terminal tools away from an
+   * interactive console. Headless consumers can omit it. */
+  terminalCommandBroker?: TerminalCommandBroker
+
+  handleEvent?: (event: PrintModeEvent) => void | Promise<void>
+  handleStreamChunk?: (
+    chunk:
+      | string
+      | {
+          type: 'subagent_chunk'
+          agentId: string
+          agentType: string
+          chunk: string
+        }
+      | {
+          type: 'reasoning_chunk'
+          agentId: string
+          ancestorRunIds: string[]
+          chunk: string
+        },
+  ) => void | Promise<void>
+
+  /** Optional filter to classify files before reading (runs before gitignore check) */
+  fileFilter?: FileFilter
+
+  overrideTools?: OverrideToolHandlers
+  customToolDefinitions?: CustomToolDefinition[]
+
+  fsSource?: Source<CodebuffFileSystem>
+  spawnSource?: Source<CodebuffSpawn>
+  logger?: Logger
+  /** Optional debug trace of agent message histories. Called with the full
+   *  history at each agent step boundary; implementations should append each
+   *  message once (see TraceWriter). */
+  traceWriter?: TraceWriter
+}
+
+export type ImageContent = {
+  type: 'image'
+  image: string // base64 encoded
+  mediaType: string
+}
+
+export type TextContent = {
+  type: 'text'
+  text: string
+}
+
+export type MessageContent = TextContent | ImageContent
+
+export type RunOptions = {
+  agent: string | AgentDefinition
+  prompt: string
+  /** End user represented by this run. Trusted service accounts may use this
+   *  to run on behalf of a signed-in user; ordinary API keys cannot delegate. */
+  userId?: string
+  /** The API key's own user id, when the host already knows it (the Cloud
+   *  runner mints a per-run key for the chat's owner). Skips the identity
+   *  lookup before the first model call; the same id is used, so nothing
+   *  downstream changes. Not a delegation: see `userId` for that. */
+  apiKeyUserId?: string
+  /** Content array for multimodal messages (text + images) */
+  content?: MessageContent[]
+  params?: Record<string, any>
+  previousRun?: RunState
+  /** Explicitly resume this history on the selected inference source. Hosts must
+   * only enable this for a user-selected connection, never as an error fallback.
+   * The returned state and checkpoints pin the new source for subsequent runs. */
+  allowInferenceSourceChange?: boolean
+  extraToolResults?: ToolMessage[]
+  signal?: AbortSignal
+  /** Optional wall-clock deadline (Unix milliseconds), used for budget reminders.
+   * The host remains responsible for enforcing its timeout via signal. */
+  deadlineAt?: number
+  /** Optional steering hook. Drained at each agent step boundary during the run;
+   * any returned messages are appended to the conversation as user prompts (and keep
+   * the turn going) before the next LLM call. Lets a host inject messages into a
+   * running agent without aborting — i.e. "steer" it, as opposed to queuing a new
+   * prompt for after the turn finishes. Supports plain strings or { prompt, content }
+   * messages with images, and async attachment loading. */
+  drainSteeringMessages?: DrainSteeringMessages
+  /** The prompt is the host carrying on work the user already asked for (a
+   * turn resumed after a restart, an automatic follow-up pass), not a new
+   * message. It never counts as the user returning after an idle gap, so it
+   * never swaps the history for its summary on that ground. */
+  promptIsContinuation?: boolean
+  costMode?: string
+  /** Extra key/values merged into each LLM request's `codebuff_metadata`.
+   *  Used by hosts (e.g. the CLI) to forward client-scoped identifiers like
+   *  `freebuff_instance_id`, sent with the request. */
+  extraCodebuffMetadata?: Record<string, string>
+  /** Optional checkpoint hook. Called once when the run starts and then
+   * periodically while it is in flight, with a RunState snapshot that
+   * preserves all progress so far (the user's prompt plus any completed
+   * agent steps, ending with an interruption note). Hosts can persist these
+   * snapshots so that a killed process (closed terminal, crash) does not
+   * lose the in-flight turn. The final resolved RunState supersedes any
+   * snapshot; no snapshots are emitted after the run settles. */
+  onStateSnapshot?: (runState: RunState) => void
+  /** Provider-reported usage for each root-agent model request. */
+  onUsage?: (usage: AgentUsageData) => void
+  /** A model request ended before an exact provider usage receipt arrived. */
+  onUsageIncomplete?: () => void
+  /** Successful compaction, including the exact saved summary. */
+  onCompaction?: (data: ContextCompactionData) => void
+  /** A compaction pass began. `onCompactionEnd` always follows, after any `onCompaction`. */
+  onCompactionStart?: (data: Pick<ContextCompactionData, 'trigger'>) => void
+  onCompactionEnd?: () => void
+  /**
+   * A structured summary of the conversation, made in the background. It
+   * usually arrives after the run returned, so add it to the state you saved
+   * with `withCompactionSummary`; without it a restart loses the summary.
+   */
+  onCompactionSummary?: (summary: ConversationSummary) => void
+  /**
+   * The shell this run's terminal commands actually execute in, when the host's
+   * broker picks one other than the default (the sponsored Windows floor runs
+   * Windows PowerShell 5.1). Reported to the model as `systemInfo.shell`, so it
+   * writes commands for the shell that will run them. Unset keeps the default.
+   */
+  terminalShell?: 'bash' | 'powershell'
+  /** Stable id of the project this run works on. Defaults to a hash of the
+   *  repository root resolved from `cwd`. */
+  projectKey?: string
+  /** Trace session id for a run with no `previousRun` (a UUID). Lets a host
+   *  know a new conversation's trace session before its first run returns.
+   *  Ignored when `previousRun` carries one. Unset mints a random UUID. */
+  traceSessionId?: string
+  /**
+   * Hold the SDK's own read tools to the project at `cwd`. Off by default:
+   * only the project-understanding agent sets it (docs/freebuff-project-understanding.md).
+   * When true:
+   *  - read_files refuses, per file, any path outside `cwd` as written OR
+   *    through a symlink (realpaths compared), with a
+   *    `[FILE_OUTSIDE_PROJECT]` status, and reads the rest;
+   *  - list_directory refuses a folder outside `cwd`, and glob a `cwd`
+   *    outside it, with a tool error the model can act on; glob also drops
+   *    matches that resolve outside through a symlinked folder;
+   *  - code_search is refused outright: its `cwd` and flags can name any path.
+   * It covers only the SDK's local handlers: an `overrideTools` handler owns
+   * its own policy. Write and terminal tools are untouched.
+   */
+  confineFileToolsToProject?: boolean
+  /**
+   * read_files refuses what the project-understanding agent never reads:
+   * non-text files (images, PDFs, archives, office documents, media, fonts,
+   * binaries, databases: by extension, and any file with a NUL in its first
+   * 4 KB), so an image is never attached; and lockfiles, generated files
+   * (minified bundles, source maps, dependency and build folders) and text
+   * files over 100 KB, refused by path and by size before they are read
+   * (`common/src/project-understanding/skipped-files.ts`). Off by default:
+   * only the project-understanding agent sets it. Local reads only, like
+   * `confineFileToolsToProject`.
+   */
+  refuseNonTextFileReads?: boolean
+}
+
+/**
+ * Report the host broker's shell to the model (`RunOptions.terminalShell`).
+ * Applied on every run, previous state or not: the shell is a fact about THIS
+ * host's broker, and a resumed state must not carry another one's answer.
+ */
+export function applyTerminalShell(
+  sessionState: SessionState,
+  terminalShell: RunOptions['terminalShell'],
+): void {
+  if (!terminalShell) return
+  sessionState.fileContext.systemInfo = {
+    ...sessionState.fileContext.systemInfo,
+    shell: terminalShell,
+  }
+}
+
+/** How often onStateSnapshot fires while a run is in flight. */
+const STATE_SNAPSHOT_INTERVAL_MS = 5_000
+
+export const STATE_SNAPSHOT_INTERRUPTION_MESSAGE =
+  'The session ended before this response completed. Partial progress has been preserved.'
+
+/**
+ * Copy a SessionState for a checkpoint / cancellation snapshot: the caller
+ * appends an interruption message and must not disturb the live session.
+ *
+ * lodash cloneDeep of the whole session is expensive — ~230ms on an ~8 MB
+ * session — and this runs on the CLI's render/input thread every ~5s at each
+ * in-flight snapshot, a major source of long-session freezes.
+ *
+ * Only mainAgentState needs an independent copy: the mutations that would
+ * otherwise bleed into an already-captured snapshot all live there —
+ * messageHistory (.push), agentContext subgoals (update_subgoal). We copy it
+ * with a JSON round-trip, which is ~50x faster than cloneDeep (~4ms). The
+ * snapshot is only ever consumed as JSON — persisted to disk, and re-serialized
+ * when fed back as previousRunState — so a JSON round-trip is byte-for-byte
+ * parity with the prior cloneDeep→JSON.stringify path. It also can't choke on
+ * the URL / Buffer / Uint8Array instances the message schema permits in
+ * image/file content (structuredClone throws on URL and rewrites
+ * Buffer→Uint8Array; both change the persisted bytes or fall back).
+ *
+ * fileContext is large, effectively read-only during a run, and already
+ * persisted as-is, so we share it by reference rather than copy it.
+ *
+ * Falls back to cloneDeep only if JSON.stringify throws (circular refs /
+ * BigInt — which AgentState isn't expected to contain, as it uses IDs rather
+ * than object back-refs) so a snapshot — or the final error state, which shares
+ * this path — can never fail to build.
+ */
+export function cloneSessionState(
+  state: SessionState,
+  logger?: Logger,
+): SessionState {
+  let mainAgentState: SessionState['mainAgentState']
+  try {
+    mainAgentState = JSON.parse(JSON.stringify(state.mainAgentState))
+  } catch (error) {
+    logger?.debug?.(
+      { error: error instanceof Error ? error.message : String(error) },
+      'JSON clone of mainAgentState failed; falling back to cloneDeep',
+    )
+    mainAgentState = cloneDeep(state.mainAgentState)
+  }
+  return { fileContext: state.fileContext, mainAgentState }
+}
+
+/**
+ * The session state a cancelled or errored turn persists, and the state a
+ * follow-up prompt resumes from.
+ *
+ * This is the LAST thing that edits the history — after the runtime's
+ * end-of-turn recount, not before it. It drops the half-step an interrupted
+ * turn can leave behind and appends the message explaining why the turn ended,
+ * so `contextTokenCount` has to follow: a count taken before these edits
+ * describes a history that was never stored, and the host shows that number to
+ * the user before their next message.
+ *
+ * The adjustment is a difference rather than a recount because the system
+ * prompt and tool schemas — the other half of the count — are not in scope
+ * here; carrying the delta keeps them exactly.
+ */
+export function buildCancelledSessionState(params: {
+  sessionState: SessionState
+  /** The runtime replaced the shared messageHistory, i.e. it got far enough to
+   *  record the user's prompt itself. */
+  runtimeMadeProgress: boolean
+  /** The user's prompt, re-added only when the runtime never recorded it. */
+  promptMessage?: Message
+  /** Why the turn ended. Appended as a system-tagged user message. */
+  message: string
+  logger?: Logger
+}): SessionState {
+  const { sessionState, runtimeMadeProgress, promptMessage, message, logger } =
+    params
+
+  const state = cloneSessionState(sessionState, logger)
+  const previousHistory = state.mainAgentState.messageHistory
+  // A checkpoint can land after an assistant tool call is recorded but before
+  // its result arrives. Drop that half-step at the persistence boundary so a
+  // resumed run starts from structurally valid history.
+  //
+  // Copied unconditionally: dropUnansweredToolCalls returns its input when
+  // there is nothing to drop, and the appends below must not reach the array
+  // `previousHistory` names.
+  const nextHistory = [...dropUnansweredToolCalls(previousHistory)]
+
+  if (!runtimeMadeProgress && promptMessage) {
+    nextHistory.push(promptMessage)
+  }
+  nextHistory.push({
+    role: 'user' as const,
+    content: [{ type: 'text' as const, text: withSystemTags(message) }],
+  })
+
+  state.mainAgentState.messageHistory = nextHistory
+  state.mainAgentState.contextTokenCount = adjustContextTokenCountForHistoryEdit(
+    {
+      contextTokenCount: state.mainAgentState.contextTokenCount,
+      previousHistory,
+      nextHistory,
+      scale: state.mainAgentState.contextTokenBaseline?.scale,
+    },
+  )
+  return state
+}
+
+/** The text of a single-text-part user message, else undefined. */
+function userMessageText(message: Message | undefined): string | undefined {
+  if (!message || message.role !== 'user') return undefined
+  const content = message.content as unknown
+  if (typeof content === 'string') return content
+  if (!Array.isArray(content) || content.length !== 1) return undefined
+  const [part] = content as Array<{ type?: string; text?: unknown }>
+  return part?.type === 'text' && typeof part.text === 'string'
+    ? part.text
+    : undefined
+}
+
+/**
+ * The run state a host resumes from after the USER stopped the turn (Esc).
+ *
+ * A cancelled run state from this SDK ends in the message explaining why the
+ * turn ended, and `output.message` is that same text: the periodic
+ * `onStateSnapshot` says the session ended (true only when the host died
+ * mid-turn), and an early abort says the run was cancelled. After Esc the model
+ * must read that the user interrupted it, as the runtime itself writes on
+ * abort. This swaps the SDK's trailing message for the runtime's, once: a
+ * history that already ends in it (the runtime's own abort state) is returned
+ * as-is, and so is any state that does not end in an SDK cancellation message
+ * (a run that completed as Esc landed).
+ *
+ * Returns undefined when there is no session state to resume from.
+ */
+export function toUserInterruptedRunState(runState: RunState): RunState | undefined {
+  const sessionState = runState.sessionState
+  if (!sessionState) return undefined
+  const previousHistory = sessionState.mainAgentState.messageHistory
+  const interrupted = withSystemTags(USER_INTERRUPTED_MESSAGE)
+  const last = userMessageText(previousHistory.at(-1))
+  if (last === interrupted) return runState
+
+  const appended =
+    runState.output?.type === 'error' && runState.output.message
+      ? withSystemTags(runState.output.message)
+      : undefined
+  if (!appended || last !== appended) return runState
+
+  const nextHistory = previousHistory.slice(0, -1)
+  if (userMessageText(nextHistory.at(-1)) !== interrupted) {
+    nextHistory.push({
+      role: 'user' as const,
+      content: [{ type: 'text' as const, text: interrupted }],
+    })
+  }
+  return {
+    ...runState,
+    sessionState: {
+      ...sessionState,
+      mainAgentState: {
+        ...sessionState.mainAgentState,
+        messageHistory: nextHistory,
+        contextTokenCount: adjustContextTokenCountForHistoryEdit({
+          contextTokenCount: sessionState.mainAgentState.contextTokenCount,
+          previousHistory,
+          nextHistory,
+          scale: sessionState.mainAgentState.contextTokenBaseline?.scale,
+        }),
+      },
+    },
+    output: { type: 'error', message: USER_INTERRUPTED_MESSAGE },
+  }
+}
+
+const createAbortError = (signal?: AbortSignal) => {
+  if (signal?.reason instanceof Error) {
+    return signal.reason
+  }
+  const error = new Error('Aborted')
+  error.name = 'AbortError'
+  return error
+}
+
+type RunExecutionOptions = RunOptions &
+  CodebuffClientOptions & {
+    apiKey: string
+    fingerprintId: string
+  }
+type RunReturnType = RunState
+
+export async function run(options: RunExecutionOptions): Promise<RunState> {
+  const requestedInference = options.byok
+    ? { source: 'byok' as const, connectionId: options.byok.id, revision: options.byok.revision, model: options.byok.model }
+    : { source: 'codebuff' as const }
+  const previousInference = options.previousRun?.inference
+  if (options.previousRun && !previousInference && options.byok && !options.allowInferenceSourceChange) {
+    return {
+      sessionState: options.previousRun.sessionState,
+      traceSessionId: options.previousRun.traceSessionId ??
+        options.traceSessionId ??
+        crypto.randomUUID(),
+      inference: undefined,
+      output: { type: 'error', message: 'This session has no inference source pin; start a new BYOK task.' },
+    }
+  }
+  // Preserve source pinning by default. A host with an explicit user selection
+  // can transfer history; provider failures never authorize a transfer.
+  if (
+    !options.allowInferenceSourceChange &&
+    previousInference &&
+    ((previousInference.source !== requestedInference.source &&
+        !(previousInference.source === 'codebuff' && requestedInference.source === 'byok')) ||
+      (previousInference.source === 'byok' &&
+        requestedInference.source === 'byok' &&
+        (previousInference.connectionId !== requestedInference.connectionId ||
+          previousInference.revision !== requestedInference.revision ||
+          previousInference.model !== requestedInference.model)))
+  ) {
+    return {
+      sessionState: options.previousRun?.sessionState,
+      traceSessionId: options.previousRun?.traceSessionId ??
+        options.traceSessionId ??
+        crypto.randomUUID(),
+      inference: previousInference,
+      output: { type: 'error', message: 'This session is bound to a different inference connection; start a new task.' },
+    }
+  }
+  const { signal } = options
+
+  if (signal?.aborted) {
+    const abortError = createAbortError(signal)
+    return {
+      sessionState: options.previousRun?.sessionState,
+      traceSessionId:
+        options.previousRun?.traceSessionId ??
+        options.traceSessionId ??
+        crypto.randomUUID(),
+      inference: requestedInference,
+      output: {
+        type: 'error',
+        message: abortError.message,
+      },
+    }
+  }
+
+  const result = await runOnce({
+    ...options,
+    onStateSnapshot: options.onStateSnapshot
+      ? (snapshot) =>
+          options.onStateSnapshot?.({
+            ...snapshot,
+            inference: requestedInference,
+          })
+      : undefined,
+  })
+  return { ...result, inference: requestedInference }
+}
+
+async function runOnce({
+  apiKey,
+  fingerprintId,
+  byok,
+  trustedAgentPublishers,
+  disableAgentRegistry,
+  requestHeaders,
+
+  cwd,
+  skillsDir,
+  skillsLoader,
+  includeHomeSkills,
+  projectFiles,
+  projectIndex,
+  skipSymbolIndex,
+  knowledgeFiles,
+  agentDefinitions,
+  agentDirs,
+  maxAgentSteps = MAX_AGENT_STEPS_DEFAULT,
+  env,
+  terminalCommandBroker,
+
+  handleEvent,
+  handleStreamChunk,
+
+  fileFilter,
+  overrideTools,
+  customToolDefinitions,
+
+  fsSource = () => require('fs').promises,
+  spawnSource,
+  logger,
+  traceWriter,
+
+  agent,
+  prompt,
+  userId: requestedUserId,
+  apiKeyUserId,
+  content,
+  params,
+  previousRun,
+  extraToolResults,
+  signal,
+  deadlineAt,
+  drainSteeringMessages,
+  promptIsContinuation,
+  costMode,
+  extraCodebuffMetadata,
+  onStateSnapshot,
+  onUsage,
+  onUsageIncomplete,
+  onCompaction,
+  onCompactionStart,
+  onCompactionEnd,
+  onCompactionSummary,
+  terminalShell,
+  projectKey,
+  traceSessionId: traceSessionIdOption,
+  confineFileToolsToProject,
+  refuseNonTextFileReads,
+}: RunExecutionOptions): Promise<RunState> {
+  const fsSourceValue = typeof fsSource === 'function' ? fsSource() : fsSource
+  const fs = await fsSourceValue
+  let spawn: CodebuffSpawn
+  if (spawnSource) {
+    const spawnSourceValue = await spawnSource
+    spawn = spawnSourceValue as CodebuffSpawn
+  } else {
+    spawn = require('child_process').spawn as CodebuffSpawn
+  }
+  let activeCustomToolDefinitions = customToolDefinitions ?? []
+  // Never hand a provider credential to an agent subprocess. The credential is
+  // only closed over by the model implementation below.
+  const toolEnv = byok ? scrubByokCredentialEnv(env, byok.apiKey) : env
+
+  // Init session state
+  let agentId
+  if (typeof agent !== 'string') {
+    const clonedDefs = agentDefinitions ? cloneDeep(agentDefinitions) : []
+    agentDefinitions = [...clonedDefs, agent]
+    agentId = agent.id
+  } else {
+    agentId = agent
+  }
+  let sessionState: SessionState
+  if (previousRun?.sessionState) {
+    // applyOverridesToSessionState handles deep cloning and applying any provided overrides
+    sessionState = await applyOverridesToSessionState(
+      cwd,
+      previousRun.sessionState,
+      {
+        knowledgeFiles,
+        agentDefinitions,
+        customToolDefinitions,
+        projectFiles,
+        projectIndex,
+        skipSymbolIndex,
+        maxAgentSteps,
+      },
+    )
+  } else {
+    // No previous run, so create a fresh session state
+    sessionState = await initialSessionState({
+      cwd,
+      skillsDir,
+      skillsLoader,
+      includeHomeSkills,
+      knowledgeFiles,
+      agentDefinitions,
+      agentDirs,
+      customToolDefinitions,
+      projectFiles,
+      projectIndex,
+      skipSymbolIndex,
+      maxAgentSteps,
+      fs,
+      spawn,
+      logger,
+    })
+  }
+  const traceSessionId =
+    previousRun?.traceSessionId ?? traceSessionIdOption ?? crypto.randomUUID()
+  applyTerminalShell(sessionState, terminalShell)
+
+  if (byok) {
+    // The selected connection is a run snapshot. Apply its model to every
+    // local helper/subagent template so no helper silently consumes Freebuff
+    // inference or switches to a different provider.
+    const limits = byokModelLimits(byok)
+    for (const template of Object.values(sessionState.fileContext.agentTemplates)) {
+      if (template && typeof template === 'object') {
+        const byokTemplate = template as {
+          model?: string
+          compactContext?: boolean | Record<string, unknown>
+        }
+        byokTemplate.model = byok.model
+        byokTemplate.compactContext = {
+          ...(typeof byokTemplate.compactContext === 'object'
+            ? byokTemplate.compactContext
+            : {}),
+          maxContextLength: limits.maxContextLength,
+          maxOutputTokens: limits.reservedOutputTokens,
+        }
+      }
+    }
+  }
+
+  let resolvePromise: (value: RunReturnType) => any = () => {}
+  let _reject: (error: any) => any = () => {}
+  const promise = new Promise<RunReturnType>((res, rej) => {
+    resolvePromise = res
+    _reject = rej
+  })
+
+  // Snapshot support: stop emitting the moment the run settles so a late
+  // snapshot can never overwrite the final state persisted by the host.
+  let settled = false
+  let snapshotTimer: ReturnType<typeof setInterval> | null = null
+  const resolve = (value: RunReturnType) => {
+    settled = true
+    if (snapshotTimer !== null) {
+      clearInterval(snapshotTimer)
+      snapshotTimer = null
+    }
+    resolvePromise(value)
+  }
+
+  async function onError(error: { message: string }) {
+    if (handleEvent) {
+      await handleEvent({ type: 'error', message: error.message })
+    }
+  }
+
+  // The agent runtime mutates sessionState.mainAgentState as it progresses,
+  // replacing messageHistory with a new array once it adds the user prompt.
+  // Comparing array identity detects progress more robustly than length:
+  // context pruning could shrink history below its starting length without
+  // meaning the runtime never ran.
+  let initialMessageHistory = sessionState.mainAgentState.messageHistory
+
+  /** Calculates the current session state if cancelled.
+   *
+   * This is used when callMainPrompt throws an error. If the agent runtime made
+   * any progress (replaced the shared messageHistory), those messages are
+   * preserved. Otherwise the user's message is added so it isn't lost.
+   */
+  function getCancelledSessionState(message: string): SessionState {
+    const runtimeMadeProgress =
+      sessionState.mainAgentState.messageHistory !== initialMessageHistory
+
+    return buildCancelledSessionState({
+      sessionState,
+      runtimeMadeProgress,
+      // Only add the user's message if the runtime didn't get a chance to.
+      promptMessage:
+        prompt || content
+          ? {
+              role: 'user' as const,
+              content: buildUserMessageContent(prompt, params, content),
+              tags: ['USER_PROMPT'] as string[],
+            }
+          : undefined,
+      message,
+      logger,
+    })
+  }
+  function getCancelledRunState(message?: string): RunState {
+    message = message ?? 'Run cancelled by user.'
+    return {
+      sessionState: getCancelledSessionState(message),
+      traceSessionId,
+      output: {
+        type: 'error',
+        message,
+      },
+    }
+  }
+
+  const onResponseChunk = async (
+    action: ServerAction<'response-chunk'>,
+  ): Promise<void> => {
+    if (signal?.aborted) {
+      return
+    }
+    const { chunk } = action
+
+    if (typeof chunk !== 'string') {
+      if (chunk.type === 'reasoning_delta') {
+        await handleStreamChunk?.({
+          type: 'reasoning_chunk',
+          chunk: chunk.text,
+          // The agent's stable id (matches subagent_start/subagent_chunk), so
+          // subagent reasoning attributes to the right agent. (Previously this
+          // forwarded runId, which no consumer's agent map is keyed by.)
+          agentId: chunk.agentId,
+          ancestorRunIds: chunk.ancestorRunIds,
+        })
+      } else {
+        await handleEvent?.(chunk)
+      }
+      return
+    }
+
+    if (handleStreamChunk) {
+      await handleStreamChunk(chunk)
+    }
+  }
+  const onSubagentResponseChunk = async (
+    action: ServerAction<'subagent-response-chunk'>,
+  ) => {
+    if (signal?.aborted) {
+      return
+    }
+    const { agentId, agentType, chunk } = action
+
+    if (handleStreamChunk && chunk) {
+      await handleStreamChunk({
+        type: 'subagent_chunk',
+        agentId,
+        agentType,
+        chunk,
+      })
+    }
+  }
+
+  // Opt-in (the project-understanding agent): every other run leaves both unset and
+  // its tools behave exactly as before.
+  const projectFence: ProjectFence | undefined =
+    confineFileToolsToProject && cwd
+      ? createProjectFence({ projectRoot: cwd, fs })
+      : undefined
+  const refuseNonText = refuseNonTextFileReads === true
+
+  const agentRuntimeImpl = getAgentRuntimeImpl({
+    logger,
+    traceWriter,
+    apiKey,
+    byok,
+    trustedAgentPublishers,
+    disableAgentRegistry,
+    requestHeaders,
+    handleStepsLogChunk: () => {
+      // Does nothing for now
+    },
+    requestToolCall: async ({ userInputId, toolName, input, mcpConfig, toolCallId }) => {
+      return handleToolCall({
+        action: {
+          type: 'tool-call-request',
+          toolCallId,
+          requestId: crypto.randomUUID(),
+          userInputId,
+          toolName,
+          input,
+          timeout: undefined,
+          mcpConfig,
+        },
+        overrides: overrideTools ?? {},
+        readPage: async ({ url, max_chars, objective, live }) => {
+          // A direct BYOK run has no hosted service allowance. Keep its local,
+          // DNS-pinned reader and never send its provider key to the web API.
+          if (byok) return readUrl({ url, max_chars, signal })
+          const page = await callWebFetchAPI({
+            url,
+            maxChars: max_chars,
+            objective,
+            live,
+            sessionId: promptId,
+            signal,
+            apiKey,
+            fetch: agentRuntimeImpl.fetch,
+            logger: agentRuntimeImpl.logger,
+            env: { clientEnv: agentRuntimeImpl.clientEnv, ciEnv: agentRuntimeImpl.ciEnv },
+          })
+          return [{ type: 'json', value: page }]
+        },
+        customToolDefinitions: activeCustomToolDefinitions
+          ? Object.fromEntries(
+              activeCustomToolDefinitions.map((def) => [def.toolName, def]),
+            )
+          : {},
+        cwd,
+        fs,
+        env: toolEnv,
+        terminalCommandBroker,
+        byok,
+        signal,
+        projectFence,
+      })
+    },
+    requestMcpToolData: async ({ mcpConfig, toolNames }) => {
+      const mcpClientId = await getMCPClient(mcpConfig)
+      const listToolsResult = await listMCPTools(mcpClientId)
+      const tools = listToolsResult.tools
+      const filteredTools: typeof tools = []
+      for (const tool of tools) {
+        if (!toolNames) {
+          filteredTools.push(tool)
+          continue
+        }
+        if (toolNames.includes(tool.name)) {
+          filteredTools.push(tool)
+          continue
+        }
+      }
+
+      return filteredTools
+    },
+    requestFiles: async ({ filePaths, fileWindows }) => {
+      const read = (paths: string[]) =>
+        readFiles({
+          filePaths: paths,
+          fileWindows,
+          override: overrideTools?.read_files,
+          fileFilter,
+          cwd,
+          fs,
+          ...(refuseNonText ? { refuseNonText } : {}),
+        })
+      if (!projectFence || overrideTools?.read_files) return read(filePaths)
+      // confineFileToolsToProject: refuse each outside path, read the rest.
+      const refused = Object.create(null) as Record<string, string | null>
+      const inside: string[] = []
+      for (const filePath of filePaths) {
+        if (!filePath) continue
+        if (await projectFence.resolve(filePath)) {
+          inside.push(filePath)
+        } else {
+          const { relativePath } = resolveFilePath(
+            requireCwd(cwd, 'read_files'),
+            filePath,
+          )
+          refused[relativePath] =
+            `${FILE_READ_STATUS.OUTSIDE_PROJECT} ${PROJECT_UNDERSTANDING_OUTSIDE_PROJECT_MESSAGE}`
+        }
+      }
+      const loaded = inside.length > 0 ? await read(inside) : {}
+      return { ...refused, ...loaded }
+    },
+    // A remote host reads an image through its own read_image hook: its
+    // read_files override is the text-only contract. Without a hook it keeps
+    // images in that text read, and so does refuseNonTextFileReads, which
+    // refuses them.
+    requestImageFile: overrideTools?.read_image ?? (
+      overrideTools?.read_files || refuseNonText
+        ? undefined
+        : async ({ filePath }) => {
+            const imageCwd = requireCwd(cwd, 'read_files')
+            if (projectFence && !(await projectFence.resolve(filePath))) {
+              return {
+                path: resolveFilePath(imageCwd, filePath).relativePath,
+                error: `${FILE_READ_STATUS.OUTSIDE_PROJECT} ${PROJECT_UNDERSTANDING_OUTSIDE_PROJECT_MESSAGE}`,
+              }
+            }
+            return getImageFile({
+              filePath,
+              cwd: imageCwd,
+              fs,
+              fileFilter,
+            })
+          }),
+    requestOptionalFile: async ({ filePath }) => {
+      const files = await readFiles({
+        filePaths: [filePath],
+        override: overrideTools?.read_files,
+        fileFilter,
+        cwd,
+        fs,
+        // str_replace/write_file use this path to compute edits. A truncated
+        // read makes exact matches later in large files impossible.
+        limitContent: false,
+        enforceEnvPolicy: false,
+      })
+      const lookupKeys = cwd
+        ? getProjectPathLookupKeys(cwd, filePath)
+        : [filePath]
+      const fileKey = findFileLookupKey(files, lookupKeys)
+      return toOptionalFile(fileKey === undefined ? null : files[fileKey]!)
+    },
+    sendAction: async ({ action }) => {
+      if (action.type === 'action-error') {
+        onError({ message: action.message })
+        return
+      }
+      if (action.type === 'response-chunk') {
+        await onResponseChunk(action)
+        return
+      }
+      if (action.type === 'subagent-response-chunk') {
+        await onSubagentResponseChunk(action)
+        return
+      }
+      if (action.type === 'prompt-response') {
+        handlePromptResponse({
+          action,
+          resolve,
+          onError,
+          initialSessionState: sessionState,
+          traceSessionId,
+        })
+        return
+      }
+      if (action.type === 'prompt-error') {
+        handlePromptResponse({
+          action,
+          resolve,
+          onError,
+          initialSessionState: sessionState,
+          traceSessionId,
+        })
+        return
+      }
+    },
+    sendSubagentChunk: ({
+      userInputId,
+      agentId,
+      agentType,
+      chunk,
+      prompt,
+      forwardToPrompt = true,
+    }) => {
+      return onSubagentResponseChunk({
+        type: 'subagent-response-chunk',
+        userInputId,
+        agentId,
+        agentType,
+        chunk,
+        prompt,
+        forwardToPrompt,
+      })
+    },
+  })
+
+  const promptId = Math.random().toString(36).substring(2, 15)
+
+  // Send input. The lookup rides the run's signal: a socket that never answers here held the run
+  // for the whole retry budget with the abort unable to reach it.
+  let userId: string | undefined
+  if (byok) {
+    // BYOK is intentionally auth-free: no Codebuff identity, run ledger,
+    // token-count, analytics, or helper request is necessary for inference.
+    userId = requestedUserId ?? BYOK_LOCAL_USER_ID
+  } else if (apiKeyUserId) {
+    userId = requestedUserId ?? apiKeyUserId
+  } else {
+    let userInfo: { id: string } | null
+    try {
+      userInfo = await getUserInfoFromApiKey({
+        ...agentRuntimeImpl,
+        apiKey,
+        fields: ['id'],
+        signal,
+      })
+    } catch (error) {
+      if (signal?.aborted) return getCancelledRunState('Run cancelled by user.')
+      throw error
+    }
+    if (!userInfo) return getCancelledRunState('Invalid API key or user not found')
+    userId = requestedUserId ?? userInfo.id
+  }
+
+  if (signal?.aborted) {
+    return getCancelledRunState('Run cancelled by user.')
+  }
+
+  if (onStateSnapshot) {
+    // The runtime replaces mainAgentState.messageHistory with a new array at
+    // each step boundary, so reference identity is a cheap "has anything
+    // durable changed" check. Skipping unchanged ticks avoids deep-cloning a
+    // potentially multi-MB sessionState every interval while the run is just
+    // waiting on a slow LLM call.
+    let lastSnapshotHistory: unknown = null
+    const emitStateSnapshot = () => {
+      if (settled || signal?.aborted) {
+        return
+      }
+      const history = sessionState.mainAgentState.messageHistory
+      if (history === lastSnapshotHistory) {
+        return
+      }
+      lastSnapshotHistory = history
+      try {
+        onStateSnapshot(
+          getCancelledRunState(STATE_SNAPSHOT_INTERRUPTION_MESSAGE),
+        )
+      } catch (error) {
+        logger?.debug?.(
+          { error: error instanceof Error ? error.message : String(error) },
+          'onStateSnapshot handler threw',
+        )
+      }
+    }
+    // Emit immediately so the user's prompt is checkpointed as soon as the
+    // run starts, then keep checkpointing progress while it is in flight.
+    emitStateSnapshot()
+    snapshotTimer = setInterval(emitStateSnapshot, STATE_SNAPSHOT_INTERVAL_MS)
+    // Don't let the checkpoint timer keep the host process alive.
+    if (typeof (snapshotTimer as any).unref === 'function') {
+      ;(snapshotTimer as any).unref()
+    }
+  }
+
+  const report = <T>(callback: ((value: T) => void) | undefined) =>
+    callback
+      ? (value: T) => {
+          try {
+            callback(value)
+          } catch (error) {
+            agentRuntimeImpl.logger.debug?.(
+              { error: error instanceof Error ? error.message : String(error) },
+              'Run metrics handler threw',
+            )
+          }
+        }
+      : undefined
+  const reportSignal = (callback: (() => void) | undefined) =>
+    callback
+      ? () => {
+          try {
+            callback()
+          } catch (error) {
+            agentRuntimeImpl.logger.debug?.(
+              { error: error instanceof Error ? error.message : String(error) },
+              'Run metrics handler threw',
+            )
+          }
+        }
+      : undefined
+
+  const repoSnapshot = toRepoSnapshot(sessionState.fileContext?.gitChanges)
+
+  const resolvedProjectKey = byok
+    ? undefined
+    : await resolveProjectKey({
+        projectKey,
+        cwd,
+        readFile: (filePath) => fs.readFile(filePath, 'utf8'),
+      })
+
+  callMainPrompt({
+    ...agentRuntimeImpl,
+    ...(resolvedProjectKey
+      ? createProjectProfileClient({
+          apiKey,
+          userId: requestedUserId,
+          projectKey: resolvedProjectKey,
+          surface: projectProfileSurface(extraCodebuffMetadata),
+        })
+      : {}),
+    promptId,
+    action: {
+      type: 'prompt',
+      promptId,
+      prompt,
+      promptParams: params,
+      content,
+      fingerprintId: fingerprintId,
+      costMode: costMode ?? 'normal',
+      sessionState,
+      toolResults: extraToolResults ?? [],
+      agentId,
+    },
+    drainSteeringMessages,
+    promptIsContinuation,
+    deadlineAt,
+    repoUrl: undefined,
+    repoId: undefined,
+    clientSessionId: promptId,
+    userId,
+    extraCodebuffMetadata: {
+      ...(extraCodebuffMetadata ?? {}),
+      trace_session_id: traceSessionId,
+      // Aggregate repository scale, collected once per thread by getGitChanges
+      // (#2138) and reused on later turns. Sent as the allowlisted projection
+      // so the legacy patch-content fields can never ride along.
+      ...(repoSnapshot && { repo_snapshot: JSON.stringify(repoSnapshot) }),
+    },
+    signal: signal ?? new AbortController().signal,
+    onAgentUsageReceived: report(onUsage),
+    onAgentUsageIncomplete: reportSignal(onUsageIncomplete),
+    onCompaction: report(onCompaction),
+    onCompactionStart: report(onCompactionStart),
+    onCompactionEnd: reportSignal(onCompactionEnd),
+    onCompactionSummary: report(onCompactionSummary),
+  }).catch((error) => {
+    // A caller's own deadline (`AbortSignal.timeout`) rejects with a
+    // `TimeoutError`, the same name Bun's 5-minute fetch idle timeout uses, so
+    // the idle copy is only honest when the caller did NOT abort.
+    let errorMessage = signal?.aborted
+      ? createAbortError(signal).message
+      : isFetchIdleTimeoutError(error)
+        ? FETCH_IDLE_TIMEOUT_USER_MESSAGE
+        : isTransientNetworkError(error)
+          ? TRANSIENT_NETWORK_ERROR_USER_MESSAGE
+          : error instanceof Error
+            ? error.message
+            : String(error ?? '')
+    const apiErrorDetails = extractApiErrorDetails(error)
+    const statusCode = apiErrorDetails.statusCode ?? getErrorStatusCode(error)
+    const {
+      countryBlockReason,
+      countryCode,
+      errorCode,
+      ipPrivacySignals,
+      message: parsedMessage,
+    } = apiErrorDetails
+    if (parsedMessage) {
+      errorMessage = parsedMessage
+    }
+
+    resolve({
+      sessionState: getCancelledSessionState(errorMessage),
+      traceSessionId,
+      output: {
+        type: 'error',
+        message: errorMessage,
+        ...(statusCode !== undefined && { statusCode }),
+        ...(errorCode !== undefined && { error: errorCode }),
+        ...(countryCode !== undefined && { countryCode }),
+        ...(countryBlockReason !== undefined && { countryBlockReason }),
+        ...(ipPrivacySignals !== undefined && { ipPrivacySignals }),
+      },
+    })
+  })
+
+  return promise
+}
+
+function requireCwd(cwd: string | undefined, toolName: string): string {
+  if (!cwd) {
+    throw new Error(
+      `cwd is required for the ${toolName} tool. Please provide cwd in CodebuffClientOptions or override the ${toolName} tool.`,
+    )
+  }
+  return cwd
+}
+
+async function readFiles({
+  filePaths,
+  fileWindows,
+  override,
+  fileFilter,
+  cwd,
+  fs,
+  limitContent,
+  enforceEnvPolicy = true,
+  refuseNonText,
+}: {
+  filePaths: string[]
+  fileWindows?: Record<string, FileReadWindow[]>
+  override?: NonNullable<
+    Required<CodebuffClientOptions>['overrideTools']['read_files']
+  >
+  fileFilter?: FileFilter
+  cwd?: string
+  fs: CodebuffFileSystem
+  limitContent?: boolean
+  enforceEnvPolicy?: boolean
+  /** RunOptions.refuseNonTextFileReads; local reads only. */
+  refuseNonText?: boolean
+}) {
+  if (override) {
+    // Windows are forwarded, not applied here: an override reads from a remote
+    // workspace and applies its own output budget, so windowing after it has
+    // already truncated a large file would answer an offset past the cut-off
+    // with "beyond the end of the file". The override windows before its own
+    // limiter, in the same order the local path does.
+    if (!enforceEnvPolicy) {
+      return await override({
+        filePaths,
+        ...(fileWindows ? { fileWindows } : {}),
+        // `limitContent: false` is the edit path's read (requestOptionalFile).
+        // Without forwarding it, the override applied the model-facing read
+        // budget (~20k estimated tokens, roughly 65k characters) and every
+        // str_replace past that offset was "not found".
+        ...(limitContent === false ? { fullContent: true as const } : {}),
+      })
+    }
+
+    const result = Object.create(null) as Record<string, string | null>
+    const readablePaths: string[] = []
+    for (const filePath of filePaths) {
+      if (!filePath) continue
+      if (isSensitiveEnvFilePath(filePath)) {
+        result[filePath] = FILE_READ_STATUS.IGNORED
+      } else {
+        readablePaths.push(filePath)
+      }
+    }
+    if (readablePaths.length > 0) {
+      const loadedFiles = await override({
+        filePaths: readablePaths,
+        ...(fileWindows ? { fileWindows } : {}),
+        ...(limitContent === false ? { fullContent: true as const } : {}),
+      })
+      if (
+        !loadedFiles ||
+        typeof loadedFiles !== 'object' ||
+        Array.isArray(loadedFiles)
+      ) {
+        return { ...result }
+      }
+      for (const [filePath, content] of Object.entries(loadedFiles)) {
+        result[filePath] = isSensitiveEnvFilePath(filePath)
+          ? FILE_READ_STATUS.IGNORED
+          : content
+      }
+    }
+    return { ...result }
+  }
+  return getFiles({
+    filePaths,
+    cwd: requireCwd(cwd, 'read_files'),
+    fs,
+    fileWindows,
+    fileFilter,
+    limitContent,
+    enforceEnvPolicy,
+    ...(refuseNonText ? { refuseNonText } : {}),
+  })
+}
+
+function confinedToolError(errorMessage: string): ToolResultOutput[] {
+  return [{ type: 'json', value: { errorMessage } }]
+}
+
+/** glob under confineFileToolsToProject: a symlinked folder inside the project
+ *  can point anywhere, and the project scan follows it, so a match is kept
+ *  only when its real path is inside the project too. */
+async function dropMatchesOutsideProject(
+  output: ToolResultOutput[],
+  fence: ProjectFence,
+): Promise<ToolResultOutput[]> {
+  return Promise.all(
+    output.map(async (part) => {
+      if (part.type !== 'json') return part
+      const value = part.value as { files?: unknown }
+      if (!value || !Array.isArray(value.files)) return part
+      const kept: string[] = []
+      for (const file of value.files) {
+        if (typeof file === 'string' && (await fence.resolve(file))) {
+          kept.push(file)
+        }
+      }
+      return kept.length === value.files.length
+        ? part
+        : { ...part, value: { ...(part.value as object), files: kept } }
+    }),
+  ) as Promise<ToolResultOutput[]>
+}
+
+async function handleToolCall({
+  action,
+  overrides,
+  readPage,
+  customToolDefinitions,
+  cwd,
+  fs,
+  env,
+  terminalCommandBroker,
+  byok,
+  signal,
+  projectFence,
+}: {
+  action: ServerAction<'tool-call-request'>
+  overrides: NonNullable<CodebuffClientOptions['overrideTools']>
+  readPage: (input: CodebuffToolCall<'read_url'>['input']) => Promise<ToolResultOutput[]>
+  customToolDefinitions: Record<string, CustomToolDefinition>
+  cwd?: string
+  fs: CodebuffFileSystem
+  env?: Record<string, string>
+  terminalCommandBroker?: TerminalCommandBroker
+  byok?: ResolvedByokConnection
+  signal?: AbortSignal
+  /** RunOptions.confineFileToolsToProject: unset for every other run. */
+  projectFence?: ProjectFence
+}): Promise<{ output: ToolResultOutput[] }> {
+  const toolName = action.toolName
+  const input = action.input
+
+  if (
+    byok &&
+    ['web_search', 'read_docs', 'gravity_index', 'render_ui'].includes(toolName)
+  ) {
+    return {
+      output: [{ type: 'json', value: { errorMessage: `${toolName} is unavailable in a direct BYOK run` } }],
+    }
+  }
+
+  if (signal?.aborted) {
+    return {
+      output: [
+        {
+          type: 'json',
+          value: {
+            message: 'Tool call cancelled: the run was aborted by the user.',
+          },
+        },
+      ],
+    }
+  }
+
+  // Handle MCP tool calls when mcpConfig is present
+  if (action.mcpConfig) {
+    try {
+      const mcpClientId = await getMCPClient(action.mcpConfig)
+      const result = await callMCPTool(
+        mcpClientId,
+        {
+          name: toolName,
+          arguments: input,
+        },
+        undefined,
+        signal ? { signal } : undefined,
+      )
+      return { output: result }
+    } catch (error) {
+      return {
+        output: [
+          {
+            type: 'json',
+            value: {
+              errorMessage:
+                error instanceof Error ? error.message : String(error),
+            },
+          },
+        ],
+      }
+    }
+  }
+
+  let result: ToolResultOutput[]
+  if (toolNames.includes(toolName as ToolName)) {
+    clientToolCallSchema.parse(action)
+  } else {
+    const customToolHandler = customToolDefinitions[toolName]
+
+    if (!customToolHandler) {
+      throw new Error(
+        `Custom tool handler not found for user input ID ${action.userInputId}`,
+      )
+    }
+    return {
+      output: await customToolHandler.execute(action.input, { toolCallId: action.toolCallId }),
+    }
+  }
+
+  try {
+    let override = overrides[toolName as PublishedClientToolName]
+    if (
+      !override &&
+      (toolName === 'str_replace' || toolName === 'apply_patch')
+    ) {
+      // Reuse the write_file override for file editing tools.
+      override = overrides['write_file']
+    }
+    if (override) {
+      // Note: This type assertion is necessary because TypeScript cannot narrow
+      // the union type of all possible tool inputs based on the dynamic toolName.
+      // The input has been validated by clientToolCallSchema.parse above.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      result = await override(input as any, { toolCallId: action.toolCallId })
+    } else if (toolName === 'end_turn') {
+      result = [{ type: 'json', value: { message: 'Turn ended.' } }]
+    } else if (toolName === 'write_file' || toolName === 'str_replace') {
+      result = await changeFile({
+        parameters: input,
+        cwd: requireCwd(cwd, toolName),
+        fs,
+      })
+    } else if (toolName === 'apply_patch') {
+      result = await applyPatchTool({
+        parameters: input,
+        cwd: requireCwd(cwd, toolName),
+        fs,
+      })
+    } else if (toolName === 'run_terminal_command') {
+      const resolvedCwd = requireCwd(cwd, 'run_terminal_command')
+      result = await runTerminalCommand({
+        ...input,
+        cwd: path.resolve(resolvedCwd, input.cwd ?? '.'),
+        env,
+        scrubEnvironmentKeys: byok
+          ? [
+              'OPENROUTER_API_KEY', 'OPENAI_API_KEY', 'ANTHROPIC_API_KEY',
+              ...(byok.credentialRef.startsWith('env:')
+                ? [byok.credentialRef.slice(4)]
+                : []),
+            ]
+          : undefined,
+        scrubEnvironmentValues: byok ? [byok.apiKey] : undefined,
+        signal,
+        terminalCommandBroker,
+      } as Parameters<typeof runTerminalCommand>[0])
+    } else if (toolName === 'read_url') {
+      result = await readPage(input as CodebuffToolCall<'read_url'>['input'])
+    } else if (toolName === 'code_search' && projectFence) {
+      result = confinedToolError(
+        'code_search is not available in this run: it cannot be held to the project directory. Use glob and read_files instead.',
+      )
+    } else if (toolName === 'code_search') {
+      result = await codeSearch({
+        projectPath: requireCwd(cwd, 'code_search'),
+        ...input,
+        signal,
+      } as Parameters<typeof codeSearch>[0])
+    } else if (toolName === 'list_directory' && projectFence) {
+      const directoryPath = (input as { path: string }).path
+      const projectPath = requireCwd(cwd, 'list_directory')
+      const fullPath = await projectFence.resolve(directoryPath, {
+        allowRoot: true,
+      })
+      result = fullPath
+        ? (
+            await listDirectory({ directoryPath: fullPath, projectPath, fs })
+          ).map((part) =>
+            part.type === 'json' && 'files' in part.value
+              ? { ...part, value: { ...part.value, path: directoryPath } }
+              : part,
+          )
+        : confinedToolError(
+            `Failed to list directory: ${directoryPath} is outside the project. Only folders inside the project directory can be listed.`,
+          )
+    } else if (toolName === 'list_directory') {
+      result = await listDirectory({
+        directoryPath: (input as { path: string }).path,
+        projectPath: requireCwd(cwd, 'list_directory'),
+        fs,
+      })
+    } else if (toolName === 'glob') {
+      const globInput = input as {
+        pattern: string
+        cwd?: string
+        max_results?: number
+      }
+      if (
+        projectFence &&
+        globInput.cwd !== undefined &&
+        !(await projectFence.resolve(globInput.cwd, { allowRoot: true }))
+      ) {
+        result = confinedToolError(
+          `Failed to search for files: cwd ${globInput.cwd} is outside the project. Only the project directory can be searched.`,
+        )
+      } else {
+        result = await glob({
+          pattern: globInput.pattern,
+          projectPath: requireCwd(cwd, 'glob'),
+          cwd: globInput.cwd,
+          maxResults: globInput.max_results,
+          fs,
+        })
+        if (projectFence) {
+          result = await dropMatchesOutsideProject(result, projectFence)
+        }
+      }
+    } else if (toolName === 'run_file_change_hooks') {
+      // No-op: SDK doesn't run file change hooks
+      result = [
+        {
+          type: 'json',
+          value: {
+            message: 'File change hooks are not supported in SDK mode',
+          },
+        },
+      ]
+    } else {
+      throw new Error(
+        `Tool not implemented in SDK. Please provide an override or modify your agent to not use this tool: ${toolName}`,
+      )
+    }
+  } catch (error) {
+    if (isRunPauseError(error)) {
+      throw error
+    }
+
+    result = [
+      {
+        type: 'json',
+        value: {
+          errorMessage:
+            error &&
+            typeof error === 'object' &&
+            'message' in error &&
+            typeof error.message === 'string'
+              ? error.message
+              : typeof error === 'string'
+                ? error
+                : 'Unknown error',
+        },
+      },
+    ]
+  }
+  return {
+    output: result,
+  }
+}
+
+/**
+ * Extracts an HTTP status code from an error message string.
+ * Parses common error patterns to identify the underlying status code.
+ * Returns the status code if found, undefined otherwise.
+ */
+export const extractStatusCodeFromMessage = (
+  errorMessage: string,
+): number | undefined => {
+  const lowerMessage = errorMessage.toLowerCase()
+
+  // AI SDK's built-in retry error (e.g., "Failed after 4 attempts. Last error: Service Unavailable")
+  // The AI SDK already retried 4 times, but we still want our SDK wrapper to retry 3 more times
+  if (
+    lowerMessage.includes('failed after') &&
+    lowerMessage.includes('attempts')
+  ) {
+    // Extract the underlying error type from the message
+    if (lowerMessage.includes('service unavailable')) {
+      return 503
+    }
+    if (lowerMessage.includes('timeout')) {
+      return 408
+    }
+    if (lowerMessage.includes('connection refused')) {
+      return 503
+    }
+    // Default to 500 for other AI SDK retry failures
+    return 500
+  }
+
+  if (
+    errorMessage.includes('503') ||
+    lowerMessage.includes('service unavailable')
+  ) {
+    return 503
+  }
+  if (errorMessage.includes('504')) {
+    return 504
+  }
+  if (errorMessage.includes('502')) {
+    return 502
+  }
+  if (lowerMessage.includes('timeout') || errorMessage.includes('408')) {
+    return 408
+  }
+  if (
+    lowerMessage.includes('econnrefused') ||
+    lowerMessage.includes('connection refused')
+  ) {
+    return 503
+  }
+  if (lowerMessage.includes('dns') || lowerMessage.includes('enotfound')) {
+    return 503
+  }
+  if (lowerMessage.includes('server error') || errorMessage.includes('500')) {
+    return 500
+  }
+  if (errorMessage.includes('429') || lowerMessage.includes('rate limit')) {
+    return 429
+  }
+  if (
+    lowerMessage.includes('network error') ||
+    lowerMessage.includes('fetch failed')
+  ) {
+    return 503
+  }
+
+  return undefined
+}
+
+async function handlePromptResponse({
+  action,
+  resolve,
+  onError,
+  initialSessionState,
+  traceSessionId,
+}: {
+  action: ServerAction<'prompt-response'> | ServerAction<'prompt-error'>
+  resolve: (value: RunReturnType) => any
+  onError: (error: { message: string }) => void
+  initialSessionState: SessionState
+  traceSessionId: string
+}) {
+  if (action.type === 'prompt-error') {
+    onError({ message: action.message })
+
+    const statusCode = extractStatusCodeFromMessage(action.message)
+    resolve({
+      // A snapshot, not the object the runtime was handed: the host keeps and
+      // resends this state, so it must not alias anything still in flight.
+      sessionState: cloneSessionState(initialSessionState),
+      traceSessionId,
+      output: {
+        type: 'error',
+        message: action.message,
+        ...(statusCode !== undefined && { statusCode }),
+      },
+    })
+  } else if (action.type === 'prompt-response') {
+    // Stop enforcing session state schema! It's a black box we will pass back to the server.
+    // Only check the output schema.
+    const parsedOutput = AgentOutputSchema.safeParse(action.output)
+    if (!parsedOutput.success) {
+      const message = [
+        'Received invalid prompt response from server:',
+        JSON.stringify(parsedOutput.error.issues),
+        'If this issues persists, please contact support@freebuff.com',
+      ].join('\n')
+      onError({ message })
+      resolve({
+        sessionState: initialSessionState,
+        traceSessionId,
+        output: {
+          type: 'error',
+          message,
+        },
+      })
+      return
+    }
+    const { sessionState, output } = action
+
+    const state: RunState = {
+      sessionState,
+      traceSessionId,
+      output: output ?? {
+        type: 'error',
+        message: 'No output from agent',
+      },
+    }
+    resolve(state)
+  } else {
+    action satisfies never
+    onError({
+      message: 'Internal error: prompt response type not handled',
+    })
+    resolve({
+      sessionState: initialSessionState,
+      traceSessionId,
+      output: {
+        type: 'error',
+        message: 'Internal error: prompt response type not handled',
+      },
+    })
+  }
+}
+```
+Where the symbols this change introduces are used elsewhere, at this same revision (the code that reads them; this is evidence for the WHAT and the WHY, and it is the only source for who consumes this change):
+- File `sdk/src/byok.test.ts` (23 matching lines):
+```
+import { afterEach, describe, expect, test } from 'bun:test'
+import { promises as fs } from 'node:fs'
+import { tmpdir } from 'node:os'
+import path from 'node:path'
+import {
+  ByokCredentialError,
+  createByokConnectionStore,
+  createBunByokConnectionStore,
+  createBunByokMetadataStore,
+  normalizeByokBaseUrl,
+  byokModelLimits,
+  byokCompletionUrl,
+  BYOK_DEFAULT_CONTEXT_WINDOW,
+  BYOK_DEFAULT_MAX_OUTPUT_TOKENS,
+  BYOK_DISCOVERED_CONTEXT_WINDOW_CAP,
+  BYOK_UNKNOWN_REMOTE_CONTEXT_WINDOW,
+  clearByokContextWindowCache,
+  contextWindowFromModelList,
+  withEffectiveByokLimits,
+  type ResolvedByokConnection,
+  type ByokConnection,
+  type ByokSecretStore,
+} from './byok'
+import {
+  CHATGPT_CONTEXT_WINDOW,
+  CHATGPT_DEFAULT_MODELS,
+  CHATGPT_MAX_OUTPUT_TOKENS,
+  CHATGPT_SIGN_IN_AGAIN,
+  type ChatGptTokens,
+} from './chatgpt'
+import { fakeChatGptJwt } from './__tests__/fixtures/chatgpt-jwt'
+
+const directories: string[] = []
+afterEach(async () => {
+  for (const dir of directories.splice(0))
+    await fs.rm(dir, { recursive: true, force: true })
+})
+const input = {
+  name: 'Fixture',
+```
+- File `packages/agent-runtime/src/__tests__/compact-read-results.test.ts` (5 matching lines):
+```
+import {
+  createMockDbOperations,
+  setupDbSpies,
+} from '@codebuff/common/testing/mocks/database'
+import { getInitialSessionState } from '@codebuff/common/types/session-state'
+import { promptSuccess } from '@codebuff/common/util/error'
+import {
+  createFileReadLimiter,
+  windowFileRead,
+} from '@codebuff/common/util/file-read-limits'
+import { afterEach, expect, it, mock, spyOn } from 'bun:test'
+
+import { byokModelLimits } from '../../../../sdk/src/byok'
+import { loopAgentSteps } from '../run-agent-step'
+import { countTokens, countTokensMessages } from '../util/token-counter'
+import { createToolCallChunk } from './test-utils'
+
+import type { AgentTemplate } from '../templates/types'
+import type { Message } from '@codebuff/common/types/messages/codebuff-message'
+
+afterEach(() => mock.restore())
+
+// The reporter's failure shape: a ~9k live request plus an SDK-limited batch
+// of file reads exceeds BYOK's default 25,804-token input threshold. Previously
+// each successful read vanished before inference, so the model could only
+// reread. Fresh results are now bounded before entering history; the model must
+// still see findings and progress. The control uses the same files and history.
+for (const contextWindow of [32768, 131072]) {
+  it(`progresses from reading to writing with a ${contextWindow}-token BYOK window`, async () => {
+    const db = setupDbSpies(createMockDbOperations())
+    spyOn(analytics, 'trackEvent').mockImplementation(() => {})
+    const limits = byokModelLimits({ contextWindow })
+    const runtime = createTestAgentRuntimeParams()
+    const template: AgentTemplate = {
+      ...runtime.agentTemplate,
+      spawnerPrompt: 'Read-result preservation probe',
+      outputMode: 'last_message',
+      toolNames: ['read_files', 'write_file', 'end_turn'],
+      instructionsPrompt: '',
+      mcpServers: {},
+      spawnableAgents: [],
+```
+- File `cli/src/components/status-bar.tsx` (3 matching lines):
+```
+// Context occupancy of the main agent only: subagent states never land in
+  // mainAgentState, so their tokens are excluded by construction. The store's
+  // runState is written at end of turn, which is exactly when the idle branch
+  // below renders — no mid-turn staleness is visible.
+  const contextTokenCount = useChatStore(
+    // Fully optional-chained: runState can be restored from a JSON.parse of
+    // run-state.json with no shape validation, and a throwing selector would
+    // crash the whole TUI.
+    (state) =>
+      state.runState?.sessionState?.mainAgentState?.contextTokenCount,
+  )
+  const contextWindow =
+    freebuffSession?.status === 'active'
+      ? modelDirectory.contextWindow(freebuffSession.model)
+      : FREEBUFF_DEFAULT_CONTEXT_WINDOW
+  const contextUsage =
+    contextTokenCount !== undefined
+      ? formatContextUsage(contextTokenCount, contextWindow)
+      : null
+
+  const renderStatusIndicator = () => {
+    switch (statusIndicatorState.kind) {
+      case 'ctrlC':
+        return <span fg={theme.secondary}>Press Ctrl-C again to exit</span>
+
+      case 'clipboard':
+        // Use green color for feedback success messages
+        const isFeedbackSuccess =
+          statusIndicatorState.message.includes('Feedback sent')
+        return (
+```
+- File `agents/base-chat.ts` (2 matching lines):
+```
+*  that was coming anyway. Gap and floor arrive via the runtime's
+     *  `contextPruning` (see common/src/constants/compaction-policy.ts). */
+    const compaction =
+      model === 'deepseek/deepseek-v4-flash' && contextPruning
+        ? {
+            cacheExpiryMs: contextPruning.cacheExpiryMs,
+            cacheExpiryMinTokens: contextPruning.cacheExpiryMinTokens,
+          }
+        : { cacheExpiryMs: CACHE_EXPIRY_MS }
+
+    // `model` is absent only when the generator is driven directly (tests) or
+    // by a runtime predating AgentStepContext.model.
+    const contextWindow = CONTEXT_WINDOWS[model ?? ''] ?? DEFAULT_CONTEXT_WINDOW
+    const maxContextLength = Math.floor(contextWindow * CONTEXT_BUDGET_FRACTION)
+
+    while (true) {
+      // Prune before every step, budgeted to the model this step will actually
+      // use. That ordering is what makes a mid-thread model switch survivable:
+      // a thread grown on a 512k model gets summarized down on the first step
+      // after switching to a 256k one, instead of being rejected forever.
+      yield {
+        toolName: 'spawn_agent_inline',
+        input: {
+          agent_type: 'context-pruner',
+          params: { maxContextLength, ...compaction },
+        },
+```
+- File `cli/src/utils/format-token-count.ts` (2 matching lines):
+```
+* "14.2K (7%)" — context occupancy against the model's context window. The
+ * percentage is rounded but never shown as 0% while tokens are non-zero, so a
+ * fresh session reads "1%" rather than implying an empty context is tracked
+ * at all. Returns null when there is nothing meaningful to show.
+ */
+export function formatContextUsage(
+  tokens: number,
+  contextWindow: number,
+): string | null {
+  if (!Number.isFinite(tokens) || tokens <= 0) {
+    return null
+  }
+  if (!Number.isFinite(contextWindow) || contextWindow <= 0) {
+    return formatTokenCount(tokens)
+  }
+  const percent = clamp(Math.round((tokens / contextWindow) * 100), 1, 100)
+  return `${formatTokenCount(tokens)} (${percent}%)`
+}
+```
+- File `sdk/src/chatgpt.ts` (2 matching lines):
+```
+/**
+ * What a sign-in saves when the plan's own list (listChatGptModels) cannot be
+ * read. Limits are explicit so a run never asks the Codex backend for an
+ * OpenAI-style `/models` listing; the window is the Codex input limit.
+ */
+export const CHATGPT_DEFAULT_MODELS: readonly ChatGptModelChoice[] = [
+  { model: 'gpt-6-sol', name: 'GPT-6-Sol (ChatGPT)' },
+  { model: 'gpt-6-astra', name: 'GPT-6-Astra (ChatGPT)' },
+  { model: 'gpt-6-luna', name: 'GPT-6-Luna (ChatGPT)' },
+]
+export const CHATGPT_CONTEXT_WINDOW = 272_000
+export const CHATGPT_MAX_OUTPUT_TOKENS = 32_000
+
+/**
+ * The client version the model listing is asked for. OpenAI tailors the list
+ * to it, leaving out models newer than the client (0.131.0 is offered two
+ * models, 0.153.3 seven, 1.0.0 the full ten as of 2026-10-08), and the
+ * Responses endpoint does not check it.
+ */
+export const CHATGPT_MODELS_CLIENT_VERSION = '1.0.0'
+
+/** Refresh this long before the access token expires. */
+export const CHATGPT_REFRESH_MARGIN_MS = 5 * 60 * 1000
+const REQUEST_TIMEOUT_MS = 12_000
+…
+)
+    .sort((a, b) => Number(a.priority ?? 1e9) - Number(b.priority ?? 1e9))
+    .map((item) => {
+      const label =
+        typeof item.display_name === 'string' && item.display_name.trim()
+          ? item.display_name.trim().slice(0, 200)
+          : item.slug
+      const window = Number(item.context_window)
+      return {
+        model: item.slug,
+        name: `${label} (ChatGPT)`,
+        ...(Number.isInteger(window) &&
+        window > CHATGPT_MAX_OUTPUT_TOKENS &&
+        window <= 2_000_000
+          ? { contextWindow: window }
+          : {}),
+      }
+    })
+  if (!models.length)
+    throw new ChatGptAuthError('Your ChatGPT plan listed no Codex models.')
+  return models
+}
+
+/** The plan's models, or the defaults when its list cannot be read. */
+export async function chatGptModelsOrDefaults(
+```
+Tests this commit changed (added lines only; the assertions are what the change is expected to do, not a description of the feature):
+- File `sdk/src/__tests__/byok-run.test.ts`: "an output limit of window - 1 still gives the root and a carried helper a valid budget"
+```
+  test('an output limit of window - 1 still gives the root and a carried helper a valid budget', async () => {
+    const bodies: any[] = []
+    globalThis.fetch = (async (_input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+      bodies.push(JSON.parse(String(init?.body)))
+      return sse({ id: 'done', object: 'chat.completion.chunk', created: 1, model: 'm', choices: [{ index: 0, delta: { content: 'Done.' }, finish_reason: 'stop' }] })
+    }) as unknown as typeof fetch
+    // A hosted turn's helper stays in the chat's saved state, and the next
+    // turn on the user's key validates it with the root (Cloud, 2026-11).
+    const helper: AgentDefinition = {
+      id: 'researcher-web', displayName: 'Web Researcher', model: 'openai/gpt-6-luna',
+      toolNames: ['read_url'], systemPrompt: 'Research the question.',
+    }
+    const client = new CodebuffClient({
+      agentDefinitions: [agent, helper],
+      byok: connection({ contextWindow: 131_072, maxOutputTokens: 131_071 }),
+    })
+    const result = await client.run({ agent: agent.id, prompt: 'Summarize.' })
+    expect(result.output.type).not.toBe('error')
+    const templates = result.sessionState!.fileContext.agentTemplates
+    for (const id of [agent.id, helper.id]) {
+      expect(templates[id]!.compactContext).toMatchObject({ maxContextLength: 58_982, maxOutputTokens: 65_536 })
+    }
+    // The request asks for no more output than the window leaves it.
+    expect(bodies).toHaveLength(1)
+    expect(bodies[0].max_tokens ?? bodies[0].max_completion_tokens).toBe(65_536)
+  })
+```
+- File `sdk/src/byok.test.ts`: "an output limit just under the window still leaves a positive compaction budget"; "limits whose output fits in half the window keep their budget and output"
+```
+  BYOK_DEFAULT_MAX_OUTPUT_TOKENS,
+  CHATGPT_MAX_OUTPUT_TOKENS,
+    reservedOutputTokens: 2048,
+test('an output limit just under the window still leaves a positive compaction budget', () => {
+  // window - 1 is what the settings form's `max` offers; it gave a budget of 0,
+  // which the agent schema refuses, so every Cloud run on it failed (2026-11).
+  for (const contextWindow of [4096, 32_768, 131_072, 202_752, 2_000_000]) {
+    const half = Math.floor(contextWindow / 2)
+    for (const maxOutputTokens of [contextWindow - 1, contextWindow - 2, half + 1]) {
+      const limits = byokModelLimits({ contextWindow, maxOutputTokens })
+      expect(limits.maxOutputTokens).toBe(maxOutputTokens)
+      expect(limits.reservedOutputTokens).toBe(half)
+      expect(limits.maxContextLength).toBe(Math.floor((contextWindow - half) * 0.9))
+      expect(Number.isInteger(limits.maxContextLength)).toBe(true)
+      expect(limits.maxContextLength).toBeGreaterThanOrEqual(1843)
+    }
+  }
+  expect(byokModelLimits({ contextWindow: 131_072, maxOutputTokens: 131_071 })).toEqual({
+    contextWindow: 131_072,
+    maxOutputTokens: 131_071,
+    reservedOutputTokens: 65_536,
+    maxContextLength: 58_982,
+  })
+})
+test('limits whose output fits in half the window keep their budget and output', () => {
+  for (const [contextWindow, maxOutputTokens] of [
+    [BYOK_DEFAULT_CONTEXT_WINDOW, BYOK_DEFAULT_MAX_OUTPUT_TOKENS],
+    [BYOK_UNKNOWN_REMOTE_CONTEXT_WINDOW, BYOK_DEFAULT_MAX_OUTPUT_TOKENS],
+    [CHATGPT_CONTEXT_WINDOW, CHATGPT_MAX_OUTPUT_TOKENS],
+    // The Claude Code and Codex key rows (web/src/server/byok/agent-keys.ts).
+    [200_000, 32_000],
+    [272_000, 32_000],
+    [102_400, 8_192],
+    [8_192, 4_096],
+  ] as const) {
+    expect(byokModelLimits({ contextWindow, maxOutputTokens })).toEqual({
+      contextWindow,
+      maxOutputTokens,
+      reservedOutputTokens: maxOutputTokens,
+      maxContextLength: Math.floor((contextWindow - maxOutputTokens) * 0.9),
+    })
+  }
+  // An unset output limit is st
+```
+Diff (source hunks; lockfiles and pure test hunks omitted, except in a lockfile-only commit):
+```diff
+diff --git a/sdk/src/byok.ts b/sdk/src/byok.ts
+index 5280ec95c..ba49ebec6 100644
+--- a/sdk/src/byok.ts
++++ b/sdk/src/byok.ts
+@@ -280,74 +280,90 @@ function parseConnections(value: unknown): ByokConnection[] {
+           !item.credentialRef.startsWith(`connection:${item.id}:`)
+     ) {
+       throw new ByokConnectionStateError(
+         'BYOK credential reference belongs to a different connection',
+       )
+     }
+   }
+   return parsed.data
+ }
+ /**
+  * The limits a connection gets when nobody chose any. The Desktop settings
+  * form pre-fills exactly this pair, and the store persists it, so a stored
+  * 32,768 / 4,096 almost always means "not configured" rather than a decision.
+  */
+ export const BYOK_DEFAULT_CONTEXT_WINDOW = 32_768
+ export const BYOK_DEFAULT_MAX_OUTPUT_TOKENS = 4_096
+ /** A remote endpoint that does not report its model's window. */
+ export const BYOK_UNKNOWN_REMOTE_CONTEXT_WINDOW = 131_072
+ /**
+  * The most an automatically-chosen window may be: the hosted budget's order of
+  * magnitude, since every token of a BYOK request is billed to the user's key.
+  * A user who wants more types it into the connection.
+  */
+ export const BYOK_DISCOVERED_CONTEXT_WINDOW_CAP = 400_000
+ 
++/**
++ * A connection's limits as a run uses them. `maxOutputTokens` is the stored
++ * setting; `reservedOutputTokens` is the most output a request asks for, and
++ * `maxContextLength` (the compaction budget) is 90% of the window left after it.
++ *
++ * The reservation is at most half the window. The settings form's `max`
++ * offers an output limit of window - 1, which left a budget of 0: the agent
++ * schema then refused every agent of the run before any model call (Cloud,
++ * 2026-11). A prompt plus output over the window is also a request a strict
++ * endpoint refuses. Any valid window keeps a budget of at least 1,843.
++ */
+ export function byokModelLimits(connection: {
+   contextWindow?: number
+   maxOutputTokens?: number
+ }) {
+   const contextWindow = connection.contextWindow ?? BYOK_DEFAULT_CONTEXT_WINDOW
+   const maxOutputTokens =
+     connection.maxOutputTokens ??
+     Math.min(BYOK_DEFAULT_MAX_OUTPUT_TOKENS, Math.floor(contextWindow / 4))
+   if (
+     !Number.isInteger(contextWindow) ||
+     contextWindow < 4096 ||
+     contextWindow > 2_000_000 ||
+     !Number.isInteger(maxOutputTokens) ||
+     maxOutputTokens < 1 ||
+     maxOutputTokens >= contextWindow
+   ) {
+     throw new Error(
+       'Choose a context limit of 4096–2000000 tokens and a smaller positive output limit',
+     )
+   }
++  const reservedOutputTokens = Math.min(
++    maxOutputTokens,
++    Math.floor(contextWindow / 2),
++  )
+   return {
+     contextWindow,
+     maxOutputTokens,
+-    maxContextLength: Math.floor((contextWindow - maxOutputTokens) * 0.9),
++    reservedOutputTokens,
++    maxContextLength: Math.floor((contextWindow - reservedOutputTokens) * 0.9),
+   }
+ }
+ 
+ /** True when the connection carries the untouched default limits (see above). */
+ export function hasDefaultByokLimits(connection: {
+   contextWindow?: number
+   maxOutputTokens?: number
+ }): boolean {
+   return (
+     (connection.contextWindow ?? BYOK_DEFAULT_CONTEXT_WINDOW) ===
+       BYOK_DEFAULT_CONTEXT_WINDOW &&
+     (connection.maxOutputTokens ?? BYOK_DEFAULT_MAX_OUTPUT_TOKENS) ===
+       BYOK_DEFAULT_MAX_OUTPUT_TOKENS
+   )
+ }
+ 
+ function isLoopbackByokEndpoint(
+   connection: Pick<ByokConnection, 'provider' | 'baseUrl'>,
+ ): boolean {
+   if (connection.provider !== 'openai-compatible') return false
+   try {
+     const { hostname } = new URL(
+       normalizeByokBaseUrl(connection.provider, connection.baseUrl),
+     )
+     return ['localhost', '127.0.0.1', '[::1]'].includes(hostname)
+diff --git a/sdk/src/impl/llm.ts b/sdk/src/impl/llm.ts
+index 39f59c6f4..f253ed9d9 100644
+--- a/sdk/src/impl/llm.ts
++++ b/sdk/src/impl/llm.ts
+@@ -239,52 +239,52 @@ export async function* promptAiSdkStream(
+ 
+   if (params.signal.aborted) {
+     logger.info(
+       {
+         userId: params.userId,
+         userInputId: params.userInputId,
+       },
+       'Skipping stream due to canceled user input',
+     )
+     return promptAborted('User cancelled input')
+   }
+ 
+   const aiSDKModel = getModelForRequest({
+     apiKey: params.apiKey,
+     model: params.model,
+     costMode: params.costMode,
+     userId: params.userId,
+     byok: params.byok,
+     requestHeaders: params.requestHeaders,
+   })
+ 
+   const response = streamText({
+     ...streamParams,
+     ...(params.byok && {
+       maxOutputTokens: Math.min(
+-        params.maxOutputTokens ?? byokModelLimits(params.byok).maxOutputTokens,
+-        byokModelLimits(params.byok).maxOutputTokens,
++        params.maxOutputTokens ?? byokModelLimits(params.byok).reservedOutputTokens,
++        byokModelLimits(params.byok).reservedOutputTokens,
+       ),
+     }),
+     abortSignal: params.signal,
+     prompt: undefined,
+     model: aiSDKModel,
+     messages: convertCbToModelMessages(params),
+     allowSystemInMessages: true,
+     include: {
+       ...streamParams.include,
+       requestBody: true,
+     },
+     providerOptions: params.byok ? originalProviderOptions : getProviderOptions({
+       ...params,
+       providerOptions: originalProviderOptions,
+       agentProviderOptions: params.agentProviderOptions,
+     }),
+     // Handle tool call errors gracefully by passing them through to our validation layer
+     // instead of throwing (which would halt the agent). The only special case is when
+     // the tool name matches a spawnable agent - transform those to spawn_agents calls.
+     experimental_repairToolCall: async ({ toolCall, tools, error }) => {
+       const { spawnableAgents = [], localAgentTemplates = {} } = params
+       const toolName = toolCall.toolName
+ 
+       // Check if this is a NoSuchToolError for a spawnable agent
+       // If so, transform to spawn_agents call
+@@ -855,52 +855,52 @@ export async function promptAiSdk(
+ 
+   if (params.signal.aborted) {
+     logger.info(
+       {
+         userId: params.userId,
+         userInputId: params.userInputId,
+       },
+       'Skipping prompt due to canceled user input',
+     )
+     return promptAborted('User cancelled input')
+   }
+ 
+   const aiSDKModel = getModelForRequest({
+     apiKey: params.apiKey,
+     model: params.model,
+     costMode: params.costMode,
+     userId: params.userId,
+     byok: params.byok,
+     requestHeaders: params.requestHeaders,
+   })
+ 
+   const response = await generateText({
+     ...params,
+     ...(params.byok && {
+       maxOutputTokens: Math.min(
+-        params.maxOutputTokens ?? byokModelLimits(params.byok).maxOutputTokens,
+-        byokModelLimits(params.byok).maxOutputTokens,
++        params.maxOutputTokens ?? byokModelLimits(params.byok).reservedOutputTokens,
++        byokModelLimits(params.byok).reservedOutputTokens,
+       ),
+     }),
+     prompt: undefined,
+     model: aiSDKModel,
+     messages: convertCbToModelMessages(params),
+     allowSystemInMessages: true,
+     include: {
+       ...params.include,
+       requestBody: true,
+     },
+     providerOptions: params.byok ? undefined : getProviderOptions({
+       ...params,
+       agentProviderOptions: params.agentProviderOptions,
+       cacheDebugCorrelation: params.cacheDebugCorrelation,
+     }),
+   })
+   emitCacheDebugProviderRequest({
+     callback: params.onCacheDebugProviderRequestBuilt,
+     provider: getModelProvider(aiSDKModel),
+     rawBody: response.request?.body,
+   })
+   emitCacheDebugUsage({
+     callback: params.onCacheDebugUsageReceived,
+     usage: response.usage,
+   })
+@@ -938,52 +938,52 @@ export async function promptAiSdkStructured<T>(
+   const { logger } = params
+ 
+   if (params.signal.aborted) {
+     logger.info(
+       {
+         userId: params.userId,
+         userInputId: params.userInputId,
+       },
+       'Skipping structured prompt due to canceled user input',
+     )
+     return promptAborted('User cancelled input')
+   }
+   const aiSDKModel = getModelForRequest({
+     apiKey: params.apiKey,
+     model: params.model,
+     costMode: params.costMode,
+     userId: params.userId,
+     byok: params.byok,
+     requestHeaders: params.requestHeaders,
+   })
+ 
+   const response = await generateText({
+     ...params,
+     ...(params.byok && {
+       maxOutputTokens: Math.min(
+-        params.maxTokens ?? byokModelLimits(params.byok).maxOutputTokens,
+-        byokModelLimits(params.byok).maxOutputTokens,
++        params.maxTokens ?? byokModelLimits(params.byok).reservedOutputTokens,
++        byokModelLimits(params.byok).reservedOutputTokens,
+       ),
+     }),
+     prompt: undefined,
+     model: aiSDKModel,
+     output: Output.object({ schema: params.schema }),
+     messages: convertCbToModelMessages(params),
+     allowSystemInMessages: true,
+     include: { requestBody: true },
+     providerOptions: params.byok ? undefined : getProviderOptions({
+       ...params,
+       agentProviderOptions: params.agentProviderOptions,
+       cacheDebugCorrelation: params.cacheDebugCorrelation,
+     }),
+   })
+ 
+   emitCacheDebugProviderRequest({
+     callback: params.onCacheDebugProviderRequestBuilt,
+     provider: getModelProvider(aiSDKModel),
+     rawBody: response.request?.body,
+   })
+   emitCacheDebugUsage({
+     callback: params.onCacheDebugUsageReceived,
+     usage: response.usage,
+   })
+ 
+diff --git a/sdk/src/run.ts b/sdk/src/run.ts
+index 7fd176915..d36b8cbea 100644
+--- a/sdk/src/run.ts
++++ b/sdk/src/run.ts
+@@ -774,51 +774,51 @@ async function runOnce({
+       spawn,
+       logger,
+     })
+   }
+   const traceSessionId =
+     previousRun?.traceSessionId ?? traceSessionIdOption ?? crypto.randomUUID()
+   applyTerminalShell(sessionState, terminalShell)
+ 
+   if (byok) {
+     // The selected connection is a run snapshot. Apply its model to every
+     // local helper/subagent template so no helper silently consumes Freebuff
+     // inference or switches to a different provider.
+     const limits = byokModelLimits(byok)
+     for (const template of Object.values(sessionState.fileContext.agentTemplates)) {
+       if (template && typeof template === 'object') {
+         const byokTemplate = template as {
+           model?: string
+           compactContext?: boolean | Record<string, unknown>
+         }
+         byokTemplate.model = byok.model
+         byokTemplate.compactContext = {
+           ...(typeof byokTemplate.compactContext === 'object'
+             ? byokTemplate.compactContext
+             : {}),
+           maxContextLength: limits.maxContextLength,
+-          maxOutputTokens: limits.maxOutputTokens,
++          maxOutputTokens: limits.reservedOutputTokens,
+         }
+       }
+     }
+   }
+ 
+   let resolvePromise: (value: RunReturnType) => any = () => {}
+   let _reject: (error: any) => any = () => {}
+   const promise = new Promise<RunReturnType>((res, rej) => {
+     resolvePromise = res
+     _reject = rej
+   })
+ 
+   // Snapshot support: stop emitting the moment the run settles so a late
+   // snapshot can never overwrite the final state persisted by the host.
+   let settled = false
+   let snapshotTimer: ReturnType<typeof setInterval> | null = null
+   const resolve = (value: RunReturnType) => {
+     settled = true
+     if (snapshotTimer !== null) {
+       clearInterval(snapshotTimer)
+       snapshotTimer = null
+     }
+     resolvePromise(value)
+   }
+ 
+
+```
