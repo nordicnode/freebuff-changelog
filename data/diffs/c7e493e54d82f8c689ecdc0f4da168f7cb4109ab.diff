@@ -1,0 +1,909 @@
+diff --git a/cli/src/hooks/__tests__/use-send-message.test.tsx b/cli/src/hooks/__tests__/use-send-message.test.tsx
+index a5a12d38d..a8b0bd0a6 100644
+--- a/cli/src/hooks/__tests__/use-send-message.test.tsx
++++ b/cli/src/hooks/__tests__/use-send-message.test.tsx
+@@ -318,93 +318,103 @@ describe('useSendMessage continuation state', () => {
+         sendMessageFromHost!({ content: 'first', agentMode: 'DEFAULT' }),
+       )
+       await waitFor('first SDK run', () => runCalls.length === 1)
+ 
+       const rejectedSnapshot = makeRunState('failed')
+       runCalls[0].runConfig.onStateSnapshot(rejectedSnapshot)
+       runCalls[0].reject(new Error('network failed'))
+       await runs[0]
+ 
+       runs.push(
+         sendMessageFromHost!({ content: 'after error', agentMode: 'DEFAULT' }),
+       )
+       await waitFor('second SDK run', () => runCalls.length === 2)
+ 
+       expect(runCalls[1].runConfig.previousRun).toBe(rejectedSnapshot)
+ 
+       const abortedSnapshot = makeRunState('interrupted')
+       runCalls[1].runConfig.onStateSnapshot(abortedSnapshot)
+       stopActiveRun('user-interrupt')
+ 
+       runs.push(
+         sendMessageFromHost!({ content: 'after abort', agentMode: 'DEFAULT' }),
+       )
+       await waitFor('third SDK run', () => runCalls.length === 3)
+ 
+-      expect(runCalls[2].runConfig.previousRun).toBe(abortedSnapshot)
++      // The snapshot, with its idle clock started at the stop.
++      expect(runCalls[2].runConfig.previousRun.traceSessionId).toBe(
++        abortedSnapshot.traceSessionId,
++      )
+ 
+       const finalState = makeRunState('final')
+       runCalls[2].resolve(finalState)
+       await runs[2]
+ 
+       runCalls[1].resolve(makeRunState('late'))
+       await runs[1]
+ 
+       runs.push(
+         sendMessageFromHost!({ content: 'after late', agentMode: 'DEFAULT' }),
+       )
+       await waitFor('fourth SDK run', () => runCalls.length === 4)
+ 
+       expect(runCalls[3].runConfig.previousRun).toBe(finalState)
+     } finally {
+       settlePendingRuns()
+       await Promise.all(runs)
+       flushSync(() => root.unmount())
+       setup.renderer.destroy()
+     }
+   })
+   test('Esc then a new prompt resumes from the user-interrupted history, not "session ended"', async () => {
+     const { setup, root } = await mountHost()
+     const runs: Promise<void>[] = []
+     const prompt = { role: 'user', content: [{ type: 'text', text: 'fix it' }] }
+     const step = { role: 'assistant', content: [{ type: 'text', text: 'On it.' }] }
+     const laterStep = {
+       role: 'assistant',
+       content: [{ type: 'text', text: 'Edited cache.ts.' }],
+     }
+ 
+     try {
+       runs.push(sendMessageFromHost!({ content: 'fix it', agentMode: 'DEFAULT' }))
+       await waitFor('first SDK run', () => runCalls.length === 1)
+       runCalls[0].runConfig.onStateSnapshot(
+         makeCancelledRunState('snap', [prompt, step], STATE_SNAPSHOT_INTERRUPTION_MESSAGE),
+       )
++      const stoppedAt = Date.now()
+       stopActiveRun('user-interrupt')
+ 
+       // The next prompt can start before the aborted run returns.
+       runs.push(sendMessageFromHost!({ content: 'go on', agentMode: 'DEFAULT' }))
+       await waitFor('second SDK run', () => runCalls.length === 2)
++      // The snapshot is as old as the step it was taken at; the idle clock
++      // starts at the stop.
++      expect(
++        runCalls[1].runConfig.previousRun.sessionState.mainAgentState
++          .lastActivityAt,
++      ).toBeGreaterThanOrEqual(stoppedAt)
+       const resumed = historyTexts(runCalls[1].runConfig.previousRun)
+       expect(resumed).toEqual([
+         'fix it',
+         'On it.',
+         `<system>${USER_INTERRUPTED_MESSAGE}</system>`,
+       ])
+       expect(resumed.join('\n')).not.toContain('session ended')
+       runCalls[1].resolve(makeRunState('second'))
+       await runs[1]
+ 
+       // The aborted run returning late must not replace the newer turn.
+       runCalls[0].resolve(
+         makeCancelledRunState('late', [prompt, step, laterStep], USER_INTERRUPTED_MESSAGE),
+       )
+       await runs[0]
+       runs.push(sendMessageFromHost!({ content: 'third', agentMode: 'DEFAULT' }))
+       await waitFor('third SDK run', () => runCalls.length === 3)
+       expect(runCalls[2].runConfig.previousRun.traceSessionId).toBe('trace-second')
+     } finally {
+       settlePendingRuns()
+       await Promise.all(runs)
+       flushSync(() => root.unmount())
+       setup.renderer.destroy()
+     }
+   })
+diff --git a/cli/src/hooks/use-send-message.ts b/cli/src/hooks/use-send-message.ts
+index b54112346..885647cbd 100644
+--- a/cli/src/hooks/use-send-message.ts
++++ b/cli/src/hooks/use-send-message.ts
+@@ -149,50 +149,66 @@ const buildPromptWithContext = (
+   promptWithBashContext: string,
+   messageContent: MessageContent[] | undefined,
+ ) => {
+   const trimmedPrompt = promptWithBashContext.trim()
+   if (trimmedPrompt.length > 0) {
+     return promptWithBashContext
+   }
+ 
+   if (messageContent && messageContent.length > 0) {
+     return 'See attached image(s)'
+   }
+ 
+   return ''
+ }
+ 
+ type PinnedByokRunState = RunState & {
+   byokConnection?: { id: string; revision: number }
+ }
+ 
+ function pinnedByokConnection(
+   runState: RunState | null,
+ ): { id: string; revision: number } | undefined {
+   return (runState as PinnedByokRunState | null)?.byokConnection
+ }
+ 
++/** `runState` with its idle clock started now (`AgentState.lastActivityAt`). */
++function stoppedNow(runState: RunState): RunState {
++  const sessionState = runState.sessionState
++  if (!sessionState) return runState
++  return {
++    ...runState,
++    sessionState: {
++      ...sessionState,
++      mainAgentState: {
++        ...sessionState.mainAgentState,
++        lastActivityAt: Date.now(),
++      },
++    },
++  }
++}
++
+ function pinByokConnection(
+   runState: RunState,
+   connection: { id: string; revision: number } | undefined,
+ ): RunState {
+   if (!connection) return runState
+   return { ...runState, byokConnection: connection } as PinnedByokRunState
+ }
+ 
+ export const useSendMessage = ({
+   inputRef,
+   activeSubagentsRef,
+   isChainInProgressRef,
+   setStreamStatus,
+   setCanProcessQueue,
+   agentId,
+   onBeforeMessageSend,
+   mainAgentTimer,
+   scrollToLatest,
+   onTimerEvent = () => {},
+   isQueuePausedRef,
+   isProcessingQueueRef,
+   resumeQueue,
+   requeueMessageAtFront,
+   pauseQueue,
+   continueChat,
+@@ -428,50 +444,54 @@ export const useSendMessage = ({
+         abortController.signal.reason === 'user-interrupt' &&
+         runChatIsCurrent()
+       /** The state Esc adopted, until the run's own returned state replaces it. */
+       let interruptedRunState: RunState | null = runStateBeforeRun
+       let streamingStarted = false
+       /** The state this run saved, once it returned and was adopted. */
+       let adoptedRunState: RunState | undefined
+ 
+       setLiveChatStateProvider(runOwnerId, () => ({
+         runState: latestRunStateSnapshot,
+         messages: useChatStore.getState().messages,
+       }))
+ 
+       const releaseRunOwnership = () => {
+         clearLiveChatStateProvider(runOwnerId)
+         clearActiveRun(runOwnerId)
+       }
+ 
+       registerActiveRun(runOwnerId, (reason) => {
+         if (abortController.signal.aborted) return
+ 
+         // Once streaming starts, setupStreamingContext's abort listener owns
+         // message/timer cleanup. Preflight cancellation still needs to drop
+         // the shared busy UI state synchronously.
+         abortController.abort(reason)
++        // The snapshot dates from the last step boundary. A long response
++        // stopped now must not count its own running time as idle time.
++        if (runSnapshotReceived)
++          latestRunStateSnapshot = stoppedNow(latestRunStateSnapshot)
+         // Esc: the next prompt resumes from this run's progress, told the user
+         // interrupted it. The snapshot alone says the session ended, which
+         // only a real exit (`process-exit`) should leave behind. Adopted here,
+         // synchronously, because the next prompt can start before the aborted
+         // run returns; the run's own state replaces this one when it does.
+         if (runSnapshotReceived && keepsInterruptedTurn()) {
+           const interrupted =
+             toUserInterruptedRunState(latestRunStateSnapshot) ??
+             latestRunStateSnapshot
+           latestRunStateSnapshot = interrupted
+           interruptedRunState = interrupted
+           previousRunStateRef.current = interrupted
+           setRunState(interrupted)
+         }
+         if (!streamingStarted) {
+           setIsRetrying(false)
+           setStreamStatus('idle')
+           setStreamingAgents(() => new Set())
+           updateChainInProgress(false)
+           if (isProcessingQueueRef) isProcessingQueueRef.current = false
+         }
+ 
+         // Capture the old chat's array now. Context-changing callers reset the
+         // store immediately after stopActiveRun returns.
+         scheduleCheckpointSave(
+diff --git a/common/src/types/session-state.ts b/common/src/types/session-state.ts
+index 177917d38..7974f5f69 100644
+--- a/common/src/types/session-state.ts
++++ b/common/src/types/session-state.ts
+@@ -12,50 +12,52 @@ export const toolCallSchema = z.object({
+ })
+ export type ToolCall = z.infer<typeof toolCallSchema>
+ 
+ export const subgoalSchema = z.object({
+   objective: z.string().optional(),
+   status: z
+     .enum(['NOT_STARTED', 'IN_PROGRESS', 'COMPLETE', 'ABORTED'])
+     .optional(),
+   plan: z.string().optional(),
+   logs: z.string().array(),
+ })
+ export type Subgoal = z.infer<typeof subgoalSchema>
+ 
+ export type AgentState = {
+   /**
+    * @deprecated agentId is replaced by runId
+    */
+   agentId: string
+   agentType: AgentTemplateType | null
+   agentContext: Record<string, Subgoal>
+   ancestorRunIds: string[]
+   runId?: string
+   subagents: AgentState[]
+   childRunIds: string[]
+   messageHistory: Message[]
++  /** Last turn end or in-flight checkpoint (Unix ms). Active work is not idle. */
++  lastActivityAt?: number
+   stepsRemaining: number
+   creditsUsed: number
+   directCreditsUsed: number
+   output?: Record<string, any>
+   parentId?: string
+   systemPrompt: string
+   toolDefinitions: Record<
+     string,
+     { description: string | undefined; inputSchema: {} }
+   >
+   /**
+    * Latest model call's reported input + output tokens, adjusted with cheap
+    * length estimates for subsequent tool results and history edits. Before a
+    * receipt (or after compaction/model change), entirely a length estimate.
+    * This is context occupancy, never accumulated/billed usage across calls.
+    */
+   contextTokenCount: number
+   /** Serializable anchor; old saved sessions safely fall back to estimation. */
+   contextTokenBaseline?: {
+     model: string
+     tokens: number
+     estimatedTokens: number
+     /** Provider input tokens per estimated token in that request. Content
+      *  added since is scaled by it; absent on older anchors (scale 1). */
+     scale?: number
+diff --git a/packages/agent-runtime/src/__tests__/compact-context-loop.test.ts b/packages/agent-runtime/src/__tests__/compact-context-loop.test.ts
+index 2f0a2db0d..bf1f86052 100644
+--- a/packages/agent-runtime/src/__tests__/compact-context-loop.test.ts
++++ b/packages/agent-runtime/src/__tests__/compact-context-loop.test.ts
+@@ -432,50 +432,105 @@ describe('compactContext in loopAgentSteps', () => {
+       const history = idleHistory(0)
+       await runLoop(optedIn, history, {
+         state: {
+           compactionSummary: {
+             ...readySummary(history),
+             contextTokens: 20_000,
+           },
+         },
+       })
+       await settle()
+       expect(summaryRequests).toHaveLength(1)
+     })
+ 
+     it('waits for a cold cache to warm before summarizing', async () => {
+       // An idle return with no summary: the full history goes once, and the
+       // summary is made at the turn's end, when the cache is warm again.
+       await runLoop(optedIn, idleHistory(120))
+       expect(joined(seenMessages[0])).toContain('DISTINCTIVE PRIOR ANSWER')
+       await settle()
+       expect(summaryRequests).toHaveLength(1)
+       expect(joined(summaryRequests[0])).toContain('ok')
+     })
+   })
+ 
+   describe('using summaries', () => {
++    it.each(['cancelled', 'failed', 'completed'] as const)(
++      'keeps history on a two-second resume after a long %s turn',
++      async (outcome) => {
++        let now = 1_000_000
++        spyOn(Date, 'now').mockImplementation(() => now)
++        const history = idleHistory(0)
++        const result = await runLoop(optedIn, history, {
++          state: { compactionSummary: readySummary(history) },
++          reportedInput: 1000,
++          step: () => {
++            now += 6 * MINUTE
++            if (outcome === 'cancelled') throw new AbortError()
++            if (outcome === 'failed') throw new Error('stream failed')
++            return [
++              { type: 'text', text: 'done' },
++              createToolCallChunk('end_turn', {}),
++            ]
++          },
++        })
++        expect(result.agentState.lastActivityAt).toBe(now)
++
++        // A restart reads JSON, without the runtime's in-memory summary store.
++        const restored: AgentState = JSON.parse(
++          JSON.stringify(result.agentState),
++        )
++        resetConversationSummariesForTest()
++        now += 2000
++        const logged: unknown[] = []
++        await runLoop(optedIn, restored.messageHistory, {
++          prompt: 'continue',
++          state: restored,
++          reportedInput: 1000,
++          logged,
++        })
++        expect(joined(seenMessages[1])).toContain('DISTINCTIVE PRIOR ANSWER')
++        expect(joined(seenMessages[1])).not.toContain('MODEL SUMMARY')
++        expect(logged).toContainEqual(
++          expect.objectContaining({
++            axiomEvent: 'context_compaction.first_output',
++            idle_return: false,
++          }),
++        )
++
++        // The same saved state must still compact after a genuine idle gap.
++        now += 6 * MINUTE
++        resetConversationSummariesForTest()
++        await runLoop(optedIn, restored.messageHistory, {
++          prompt: 'continue later',
++          state: restored,
++          reportedInput: 1000,
++        })
++        expect(joined(seenMessages[2])).toContain('MODEL SUMMARY')
++      },
++    )
++
+     it('keeps sending the full history while the cache is warm', async () => {
+       const history = idleHistory(4)
+       await runLoop(optedIn, history, {
+         state: { compactionSummary: readySummary(history) },
+       })
+       expect(joined(seenMessages[0])).toContain('DISTINCTIVE PRIOR ANSWER')
+       expect(joined(seenMessages[0])).not.toContain('MODEL SUMMARY')
+     })
+ 
+     it('swaps in the summary when the user returns after the cache expired', async () => {
+       const logged: unknown[] = []
+       const history = idleHistory(6)
+       const result = await runLoop(optedIn, history, {
+         logged,
+         state: { compactionSummary: readySummary(history) },
+       })
+ 
+       expect(summaryRequests).toHaveLength(0)
+       const sent = joined(seenMessages[0])
+       expect(sent).toContain('<conversation_summary>')
+       expect(sent).toContain('MODEL SUMMARY')
+       expect(sent).toContain('the live question')
+       expect(sent).not.toContain('BULKY FILE BODY')
+       expect(sent).not.toContain('DISTINCTIVE PRIOR ANSWER')
+       expect(joined(result.agentState.messageHistory)).toContain(
+diff --git a/packages/agent-runtime/src/__tests__/conversation-summary.test.ts b/packages/agent-runtime/src/__tests__/conversation-summary.test.ts
+index 53ab8b85a..eb4ee5483 100644
+--- a/packages/agent-runtime/src/__tests__/conversation-summary.test.ts
++++ b/packages/agent-runtime/src/__tests__/conversation-summary.test.ts
+@@ -135,50 +135,65 @@ describe('isIdleReturn', () => {
+     expect(isIdleReturn(history(5 * MINUTE))).toBe(false)
+     expect(isIdleReturn(history(5 * MINUTE + 1))).toBe(true)
+   })
+ 
+   it('is false once the assistant answered the prompt', () => {
+     expect(
+       isIdleReturn([...history(60 * MINUTE), assistantMessage('working')]),
+     ).toBe(false)
+   })
+ 
+   it('is never true for a continuation prompt, however long the gap', () => {
+     const resumed = history(60 * MINUTE)
+     resumed[2] = {
+       ...resumed[2],
+       tags: ['USER_PROMPT', CONTINUATION_PROMPT_TAG],
+     }
+     expect(isIdleReturn(resumed)).toBe(false)
+     expect(isIdleReturn(resumed, 15 * MINUTE)).toBe(false)
+   })
+ 
+   it('waits the threshold it is given', () => {
+     expect(isIdleReturn(history(15 * MINUTE), 15 * MINUTE)).toBe(false)
+     expect(isIdleReturn(history(15 * MINUTE + 1), 15 * MINUTE)).toBe(true)
+   })
+ 
++  it('measures from the later of the saved activity time and the last reply', () => {
++    // Stopped six minutes after the last finished reply, resumed at once.
++    expect(
++      isIdleReturn(history(6 * MINUTE), 5 * MINUTE, undefined, 6 * MINUTE),
++    ).toBe(false)
++    // A real break after that stop.
++    expect(isIdleReturn(history(12 * MINUTE), 5 * MINUTE, undefined, 6 * MINUTE)).toBe(
++      true,
++    )
++    // An older runtime ran later turns and left the saved time behind.
++    expect(isIdleReturn(history(2_000), 5 * MINUTE, undefined, -60 * MINUTE)).toBe(
++      false,
++    )
++  })
++
+   // A 20-minute turn that ended seconds ago is not an idle return: the gap
+   // runs from the turn's last assistant message, not its first.
+   it('measures from the end of a long turn, not its start', () => {
+     const turnStart = 0
+     const turnEnd = turnStart + 20 * MINUTE
+     expect(
+       isIdleReturn([
+         prompt('first', turnStart),
+         { ...assistantMessage('started'), sentAt: turnStart + 1_000 },
+         { ...assistantMessage('still going'), sentAt: turnStart + 10 * MINUTE },
+         { ...assistantMessage('done'), sentAt: turnEnd },
+         prompt('next', turnEnd + 10_000),
+       ]),
+     ).toBe(false)
+   })
+ })
+ 
+ describe('summaryIdleMs', () => {
+   it('waits fifteen minutes for DeepSeek V4 Flash, fast mode included', () => {
+     expect(summaryIdleMs('deepseek/deepseek-v4-flash')).toBe(15 * MINUTE)
+     expect(summaryIdleMs('deepseek/deepseek-v4-flash-fast')).toBe(15 * MINUTE)
+   })
+ 
+   it('keeps five minutes for every other model', () => {
+     expect(summaryIdleMs('anthropic/claude-opus-4.8')).toBe(5 * MINUTE)
+diff --git a/packages/agent-runtime/src/conversation-summary.ts b/packages/agent-runtime/src/conversation-summary.ts
+index 69ee554f7..af851ea43 100644
+--- a/packages/agent-runtime/src/conversation-summary.ts
++++ b/packages/agent-runtime/src/conversation-summary.ts
+@@ -189,73 +189,80 @@ export function summaryBandStart(maxContextLength: number): number {
+  * the context reaches the band, and none while the newest is already in it.
+  */
+ export function midTurnSummaryIsDue(params: {
+   contextTokens: number
+   maxContextLength: number
+   /** The newest summary made or in progress, as its context size. */
+   latestContextTokens: number | undefined
+ }): boolean {
+   const bandStart = summaryBandStart(params.maxContextLength)
+   if (params.contextTokens < bandStart) return false
+   return (
+     params.latestContextTokens === undefined ||
+     params.latestContextTokens < bandStart
+   )
+ }
+ 
+ /**
+  * Tags a prompt the host wrote to carry on work the user already asked for
+  * (a Cloud turn resumed after a runner drain, a mission's next pass). It is
+  * not the user returning: the gap before it is a queue, not a user who left.
+  */
+ export const CONTINUATION_PROMPT_TAG = 'CONTINUATION_PROMPT'
+ 
+ /**
+  * Whether the live prompt arrived after the conversation sat idle longer than
+- * `idleMs`, measured from the last assistant message before it. Only true
+- * before the assistant answers it, and never for a continuation prompt.
++ * `idleMs`, measured from the later of the last turn end or checkpoint
++ * (`lastActivityAt`) and the last assistant message. Never true after an
++ * answer or for a continuation prompt.
+  */
+ export function isIdleReturn(
+   messages: Message[],
+   idleMs = SUMMARY_IDLE_MS,
+   now = Date.now(),
++  lastActivityAt?: number,
+ ): boolean {
+   const promptIndex = messages.findLastIndex((m) =>
+     m.tags?.includes('USER_PROMPT'),
+   )
+   if (promptIndex <= 0) return false
+   if (messages.slice(promptIndex + 1).some((m) => m.role === 'assistant'))
+     return false
+   const prompt = messages[promptIndex]
+   if (prompt.tags?.includes(CONTINUATION_PROMPT_TAG)) return false
+   const sentAt = prompt.sentAt ?? now
++  // The later of the two: a runtime that predates `lastActivityAt` keeps the
++  // field but does not move it, so it can be older than the last reply.
++  let last = lastActivityAt
+   for (let i = promptIndex - 1; i >= 0; i--) {
+     const message = messages[i]
+     if (message.role !== 'assistant') continue
+-    return message.sentAt !== undefined && sentAt - message.sentAt > idleMs
++    if (message.sentAt !== undefined)
++      last = Math.max(last ?? message.sentAt, message.sentAt)
++    break
+   }
+-  return false
++  return last !== undefined && sentAt - last > idleMs
+ }
+ 
+ /** The history exactly as the agent's next request sends it. */
+ export function summaryRequestHistory(messages: Message[]): Message[] {
+   return dropUnansweredToolCalls(expireMessages(messages, 'agentStep'))
+ }
+ 
+ function isEphemeral(message: Message): boolean {
+   return (
+     message.timeToLive !== undefined ||
+     message.tags?.includes('STEP_PROMPT') === true
+   )
+ }
+ 
+ /** A short, stable id for a message's content (FNV-1a). */
+ export function messageFingerprint(message: Message): string {
+   const text =
+     message.role +
+     '\u0000' +
+     (message.role === 'tool' ? message.toolCallId : '') +
+     '\u0000' +
+     JSON.stringify(message.content)
+   let hash = 0x811c9dc5
+   for (let i = 0; i < text.length; i++) {
+     hash ^= text.charCodeAt(i)
+diff --git a/packages/agent-runtime/src/run-agent-step.ts b/packages/agent-runtime/src/run-agent-step.ts
+index 275082f7b..ce8a6bb7c 100644
+--- a/packages/agent-runtime/src/run-agent-step.ts
++++ b/packages/agent-runtime/src/run-agent-step.ts
+@@ -1495,51 +1495,56 @@ export async function loopAgentSteps(
+     })
+   }
+ 
+   let shouldEndTurn = false
+   let hasRetriedOutputSchema = false
+   let hasCheckedCompletion = false
+   // Only the first optional check may fall back to a completed answer. Once
+   // it produces text or invokes ANY tool, its findings/effects must be kept.
+   let completionCheckpoint: Message[] | undefined
+   let usedWorkTools = false
+   let deadlineReminderLevel = 0
+   let currentPrompt = prompt
+   let currentParams = spawnParams
+   let totalSteps = 0
+   let llmStepNumber = 0
+   // Root turns only. A subagent keeps its own step ceiling, and most are
+   // read-only by design. A programmatic agent's work happens outside the steps
+   // recorded here, so the count would miss it.
+   const stopsOnNoProgress =
+     !initialAgentState.parentId && !agentTemplate.handleSteps
+   const turnProgress = createTurnProgress()
+   let nResponses: string[] | undefined = undefined
+   let compactionWindow: CompactionWindow | undefined
+   let firstOutputLogged = false
+   const idleMs = summaryIdleMs(agentTemplate.model)
+-  const idleAtStart = isIdleReturn(currentAgentState.messageHistory, idleMs)
++  const idleAtStart = isIdleReturn(
++    currentAgentState.messageHistory,
++    idleMs,
++    undefined,
++    currentAgentState.lastActivityAt,
++  )
+ 
+   const compactionVersion = agentTemplate.compactContext
+     ? SUMMARY_COMPACTION_VERSION
+     : 'not-enabled'
+   const inheritedMetadata = clearCompactionRequestMetadata(
+     params.extraCodebuffMetadata,
+   )
+   const runMetadata = {
+     ...inheritedMetadata,
+     ...(!initialAgentState.parentId &&
+     initialAgentState.contextTokenBaseline?.model === agentTemplate.model
+       ? {
+           compaction_root_start_context_tokens: String(
+             initialAgentState.contextTokenBaseline.tokens,
+           ),
+         }
+       : {}),
+     compaction_version: compactionVersion,
+     compaction_root_model: initialAgentState.parentId
+       ? (inheritedMetadata.compaction_root_model ?? 'unknown')
+       : agentTemplate.model,
+     compaction_root_version: initialAgentState.parentId
+       ? (inheritedMetadata.compaction_root_version ?? 'unknown')
+       : compactionVersion,
+     compaction_root_run_id: initialAgentState.parentId
+@@ -1987,51 +1992,57 @@ export async function loopAgentSteps(
+           ...currentAgentState,
+           messageHistory: messagesWithStepPrompt,
+         },
+         model: agentTemplate.model,
+         systemPrompt: system,
+         toolsForTokenCount,
+       })
+ 
+       if (
+         (agentTemplate.compactContext && !shouldEndTurn) ||
+         manualCompaction
+       ) {
+         const thresholdTokens = compactionThreshold(maxContextLength)
+         const fixedTokenCount =
+           countTokens(system) +
+           countTokensJson(toolsForTokenCount) +
+           (stepPrompt
+             ? countTokensMessages([userMessage({ content: stepPrompt })])
+             : 0)
+         // A summary made before an edit to a message it covers is dropped.
+         currentAgentState.compactionSummary = summaries.latest(
+           currentAgentState.compactionSummary,
+           currentAgentState.messageHistory,
+         )
+         const idle =
+-          !idleChecked && isIdleReturn(currentAgentState.messageHistory, idleMs)
++          !idleChecked &&
++          isIdleReturn(
++            currentAgentState.messageHistory,
++            idleMs,
++            undefined,
++            currentAgentState.lastActivityAt,
++          )
+         idleChecked = true
+         // The provider's count for the latest response (input + output),
+         // from this run or the saved state. What was added since (tool
+         // results, a new message) is not guessed: the limit leaves 20% of
+         // the budget for it. No count yet (a new chat, right after a swap):
+         // no limit decision until the next response.
+         const baseline = currentAgentState.contextTokenBaseline
+         const contextTokens =
+           baseline && sameContextModel(baseline.model, agentTemplate.model)
+             ? baseline.tokens
+             : undefined
+         const overLimit =
+           contextTokens !== undefined &&
+           contextTokens > thresholdTokens &&
+           // The threshold is a convenience, the budget is not. When even a
+           // perfect compaction would land back near the threshold (a small
+           // BYOK window under a large fixed prompt and tool catalog), keep
+           // working until the hard budget instead.
+           (contextTokens > maxContextLength ||
+             automaticCompactionIsWorthwhile({
+               messages: currentAgentState.messageHistory,
+               maxContextLength,
+               thresholdTokens,
+               fixedTokenCount,
+               maxOutputTokens: compactionPolicy.maxOutputTokens,
+@@ -2720,46 +2731,47 @@ export async function loopAgentSteps(
+ 
+     return {
+       agentState: currentAgentState,
+       output: {
+         type: 'error',
+         message:
+           hasServerMessage || isIdleTimeout || isNetworkError || isModelLoop
+             ? errorMessage
+             : 'Agent run error: ' + errorMessage,
+         ...(statusCode !== undefined && { statusCode }),
+         ...(apiErrorDetails.errorCode !== undefined && {
+           error: apiErrorDetails.errorCode,
+         }),
+         ...(apiErrorDetails.countryCode !== undefined && {
+           countryCode: apiErrorDetails.countryCode,
+         }),
+         ...(apiErrorDetails.countryBlockReason !== undefined && {
+           countryBlockReason: apiErrorDetails.countryBlockReason,
+         }),
+         ...(apiErrorDetails.ipPrivacySignals !== undefined && {
+           ipPrivacySignals: apiErrorDetails.ipPrivacySignals,
+         }),
+       },
+     }
+   } finally {
++    currentAgentState.lastActivityAt = Date.now()
+     if (compactionWindow)
+       closeCompactionWindow({
+         window: compactionWindow,
+         messages: currentAgentState.messageHistory,
+         endedBy: 'run_end',
+         logger,
+         runId,
+         model: agentTemplate.model,
+       })
+     // The endTurn path inside runProgrammaticStep handles normal completion,
+     // but abort/error exits (e.g. chat SSE disconnects) would otherwise leak
+     // the run's generator, STEP_ALL flag, and proposed file content forever.
+     clearProgrammaticRunState(runId)
+   }
+ }
+ 
+ const STEP_WARNING_MESSAGE = [
+   "I've made quite a few responses in a row.",
+   "Let me pause here to make sure we're still on the right track.",
+   "Please let me know if you'd like me to continue or if you'd like to guide me in a different direction.",
+ ].join(' ')
+diff --git a/sdk/src/__tests__/cancelled-session-state.test.ts b/sdk/src/__tests__/cancelled-session-state.test.ts
+index 9874cab23..6027f44ac 100644
+--- a/sdk/src/__tests__/cancelled-session-state.test.ts
++++ b/sdk/src/__tests__/cancelled-session-state.test.ts
+@@ -1,25 +1,29 @@
++import {
++  isIdleReturn,
++  SUMMARY_IDLE_MS,
++} from '@codebuff/agent-runtime/conversation-summary'
+ import { countTokensMessages } from '@codebuff/agent-runtime/util/token-counter'
+ import { getInitialSessionState } from '@codebuff/common/types/session-state'
+ import { getStubProjectFileContext } from '@codebuff/common/util/file'
+ import { describe, expect, test } from 'bun:test'
+ 
+ import { buildCancelledSessionState } from '../run'
+ 
+ import type { Message } from '@codebuff/common/types/messages/codebuff-message'
+ import type { SessionState } from '@codebuff/common/types/session-state'
+ 
+ /**
+  * The state a cancelled or errored turn persists is built HERE, after the
+  * runtime's own end-of-turn recount has already run. This function then drops
+  * unanswered tool calls and appends one or two more messages — so whatever it
+  * does to the history, it owes the count the same edit. Otherwise the number
+  * the composer draws describes a history the thread does not have.
+  *
+  * The count covers history + system prompt + tool schemas, and only the first
+  * of those is in scope here, which is why every assertion below is written as
+  * "the count still equals this history plus the same constant".
+  */
+ 
+ /** Tokens the system prompt and tool schemas contribute — untouchable from
+  *  here, and therefore the part that must survive every edit unchanged. */
+ const SYSTEM_AND_TOOLS = 9_000
+@@ -27,50 +31,86 @@ const SYSTEM_AND_TOOLS = 9_000
+ const text = (role: 'user' | 'assistant', body: string) =>
+   ({ role, content: [{ type: 'text', text: body }] }) as unknown as Message
+ 
+ const toolCall = (toolCallId: string) =>
+   ({
+     role: 'assistant',
+     content: [
+       {
+         type: 'tool-call',
+         toolCallId,
+         toolName: 'read_files',
+         input: { paths: ['a.ts', 'b.ts', 'c.ts'] },
+       },
+     ],
+   }) as unknown as Message
+ 
+ function sessionStateWith(messageHistory: Message[]): SessionState {
+   const state = getInitialSessionState(getStubProjectFileContext())
+   state.mainAgentState.messageHistory = messageHistory
+   state.mainAgentState.contextTokenCount =
+     countTokensMessages(messageHistory) + SYSTEM_AND_TOOLS
+   return state
+ }
+ 
+ describe('buildCancelledSessionState', () => {
++  test('a persisted interruption starts idle time at the stop, not the old reply', () => {
++    const before = Date.now()
++    const live = sessionStateWith([
++      { ...text('assistant', 'earlier reply'), sentAt: before - 6 * 60_000 },
++      {
++        ...text('user', 'continue'),
++        tags: ['USER_PROMPT'],
++        sentAt: before - 6 * 60_000,
++      },
++    ])
++    live.mainAgentState.lastActivityAt = before - 6 * 60_000
++    const saved = buildCancelledSessionState({
++      sessionState: live,
++      runtimeMadeProgress: true,
++      message: 'Run cancelled by user.',
++    })
++    const restored: SessionState = JSON.parse(JSON.stringify(saved))
++    const state = restored.mainAgentState
++    const stoppedAt = state.lastActivityAt!
++    expect(stoppedAt).toBeGreaterThanOrEqual(before)
++    expect(stoppedAt).toBeLessThanOrEqual(Date.now())
++    expect(live.mainAgentState.lastActivityAt).toBe(before - 6 * 60_000)
++    state.messageHistory.push({
++      ...text('user', 'continue again'),
++      tags: ['USER_PROMPT'],
++      sentAt: stoppedAt + 2000,
++    })
++    expect(
++      isIdleReturn(state.messageHistory, SUMMARY_IDLE_MS, undefined, stoppedAt),
++    ).toBe(false)
++    state.messageHistory.at(-1)!.sentAt = stoppedAt + SUMMARY_IDLE_MS + 1
++    expect(
++      isIdleReturn(state.messageHistory, SUMMARY_IDLE_MS, undefined, stoppedAt),
++    ).toBe(true)
++  })
++
+   test('the count describes the history it persists', () => {
+     // The turn ended, the runtime recounted, and THEN this appended the
+     // cancellation message. Leaving the count alone persists a number that is
+     // short by exactly the messages the user will resume from.
+     const history = [
+       text('user', 'refactor the run loop'.repeat(40)),
+       text('assistant', 'done'.repeat(400)),
+     ]
+     const state = buildCancelledSessionState({
+       sessionState: sessionStateWith(history),
+       runtimeMadeProgress: true,
+       message: 'Run cancelled by user.',
+     })
+ 
+     expect(state.mainAgentState.messageHistory.length).toBe(history.length + 1)
+     expect(state.mainAgentState.contextTokenCount).toBe(
+       countTokensMessages(state.mainAgentState.messageHistory) +
+         SYSTEM_AND_TOOLS,
+     )
+   })
+ 
+   test('the count follows the user prompt that gets restored', () => {
+     // Nothing ran, so the prompt is added back here rather than by the runtime
+     // — two appends past the last recount instead of one.
+     const history = [text('assistant', 'earlier turn'.repeat(200))]
+diff --git a/sdk/src/run.ts b/sdk/src/run.ts
+index f24740718..8bf32c49e 100644
+--- a/sdk/src/run.ts
++++ b/sdk/src/run.ts
+@@ -461,50 +461,53 @@ export function cloneSessionState(
+  * end-of-turn recount, not before it. It drops the half-step an interrupted
+  * turn can leave behind and appends the message explaining why the turn ended,
+  * so `contextTokenCount` has to follow: a count taken before these edits
+  * describes a history that was never stored, and the host shows that number to
+  * the user before their next message.
+  *
+  * The adjustment is a difference rather than a recount because the system
+  * prompt and tool schemas — the other half of the count — are not in scope
+  * here; carrying the delta keeps them exactly.
+  */
+ export function buildCancelledSessionState(params: {
+   sessionState: SessionState
+   /** The runtime replaced the shared messageHistory, i.e. it got far enough to
+    *  record the user's prompt itself. */
+   runtimeMadeProgress: boolean
+   /** The user's prompt, re-added only when the runtime never recorded it. */
+   promptMessage?: Message
+   /** Why the turn ended. Appended as a system-tagged user message. */
+   message: string
+   logger?: Logger
+ }): SessionState {
+   const { sessionState, runtimeMadeProgress, promptMessage, message, logger } =
+     params
+ 
+   const state = cloneSessionState(sessionState, logger)
++  // Also used for in-flight checkpoints: a host that exits mid-response must
++  // not count the time spent generating that response as user inactivity.
++  state.mainAgentState.lastActivityAt = Date.now()
+   const previousHistory = state.mainAgentState.messageHistory
+   // A checkpoint can land after an assistant tool call is recorded but before
+   // its result arrives. Drop that half-step at the persistence boundary so a
+   // resumed run starts from structurally valid history.
+   //
+   // Copied unconditionally: dropUnansweredToolCalls returns its input when
+   // there is nothing to drop, and the appends below must not reach the array
+   // `previousHistory` names.
+   const nextHistory = [...dropUnansweredToolCalls(previousHistory)]
+ 
+   if (!runtimeMadeProgress && promptMessage) {
+     nextHistory.push(promptMessage)
+   }
+   nextHistory.push({
+     role: 'user' as const,
+     content: [{ type: 'text' as const, text: withSystemTags(message) }],
+   })
+ 
+   state.mainAgentState.messageHistory = nextHistory
+   state.mainAgentState.contextTokenCount = adjustContextTokenCountForHistoryEdit(
+     {
+       contextTokenCount: state.mainAgentState.contextTokenCount,
+       previousHistory,
+       nextHistory,
+       scale: state.mainAgentState.contextTokenBaseline?.scale,
