@@ -1,0 +1,182 @@
+diff --git a/docs/agents-and-tools.md b/docs/agents-and-tools.md
+index 35f02f27ad..a27b50c918 100644
+--- a/docs/agents-and-tools.md
++++ b/docs/agents-and-tools.md
+@@ -3,6 +3,10 @@
+ ## Agents
+ 
+ - Prompt/programmatic agents live in `.agents/` (programmatic agents use `handleSteps` generators).
++- Discovery skips a subdirectory that is an installed package or checkout
++  (`package.json`, `node_modules` or `.git`): vendored skill repos nest their
++  own CLI entrypoints and tests there, and the loader executes a file before it
++  can see whether it is an agent definition.
+ - Generator functions are NOT sandboxed: the runtime `eval`s a `handleSteps` source string in the process that runs the agent (`packages/agent-runtime/src/run-programmatic-step.ts`); agent templates define tool access and subagents.
+ 
+ ### Registry agents with executable `handleSteps` require publisher trust
+diff --git a/sdk/src/__tests__/load-agents.test.ts b/sdk/src/__tests__/load-agents.test.ts
+index 84fc11645a..c6c4078502 100644
+--- a/sdk/src/__tests__/load-agents.test.ts
++++ b/sdk/src/__tests__/load-agents.test.ts
+@@ -1,3 +1,4 @@
++import { spawnSync } from 'child_process'
+ import { existsSync, mkdtempSync, rmSync, writeFileSync, mkdirSync } from 'fs'
+ import os from 'os'
+ import path from 'path'
+@@ -376,6 +377,99 @@ describe('loadLocalAgents', () => {
+       expect(existsSync(markerFile)).toBe(false)
+     })
+ 
++    test('skips installed package directories without importing their files', async () => {
++      mkdirSync(agentsDir, { recursive: true })
++      // An .agents directory can itself be a package; the boundary is the
++      // subdirectories, which is where vendored tooling lives.
++      writeFileSync(path.join(agentsDir, 'package.json'), '{}', 'utf8')
++
++      const markerFile = path.join(tempDir, 'vendored-side-effect')
++      const vendoredDirs = [
++        { dir: path.join(agentsDir, 'vendor', 'pixelfx'), packageJson: true },
++        { dir: path.join(agentsDir, 'checkout', 'superpowers'), git: true },
++        {
++          dir: path.join(agentsDir, 'workspace', 'tool-list'),
++          nodeModules: true,
++        },
++      ]
++      for (const { dir, packageJson, git, nodeModules } of vendoredDirs) {
++        mkdirSync(dir, { recursive: true })
++        if (packageJson)
++          writeFileSync(path.join(dir, 'package.json'), '{}', 'utf8')
++        if (git) mkdirSync(path.join(dir, '.git'))
++        if (nodeModules) mkdirSync(path.join(dir, 'node_modules'))
++        writeAgentFile(
++          dir,
++          'check.mjs',
++          `
++            const { writeFileSync } = require('fs')
++            writeFileSync(${JSON.stringify(markerFile)}, 'imported')
++          `,
++        )
++      }
++      writeAgentFile(
++        agentsDir,
++        'real-agent.ts',
++        `
++          export default {
++            id: 'real-agent',
++            displayName: 'Real Agent',
++            model: '${MODEL_NAME}'
++          }
++        `,
++      )
++
++      const result: LoadedAgents = await loadLocalAgents({
++        agentsPath: agentsDir,
++      })
++
++      expect(Object.keys(result)).toEqual(['real-agent'])
++      expect(existsSync(markerFile)).toBe(false)
++    })
++
++    test('a process.exit() in a package subdirectory cannot terminate the loader', async () => {
++      const pkgDir = path.join(agentsDir, 'vendor', 'exiting')
++      mkdirSync(path.join(pkgDir, 'tools'), { recursive: true })
++      writeFileSync(path.join(pkgDir, 'package.json'), '{}', 'utf8')
++      writeAgentFile(pkgDir, path.join('tools', 'check.mjs'), 'process.exit(7)')
++      writeAgentFile(
++        agentsDir,
++        'real-agent.ts',
++        `
++          export default {
++            id: 'real-agent',
++            displayName: 'Real Agent',
++            model: '${MODEL_NAME}'
++          }
++        `,
++      )
++
++      // Bounded child process: if discovery ever imports the exiting file again
++      // the child exits non-zero instead of taking the test runner with it.
++      const scriptPath = path.join(tempDir, 'run-loader.ts')
++      writeFileSync(
++        scriptPath,
++        `
++          import { loadLocalAgents } from ${JSON.stringify(
++            path.resolve('src/agents/load-agents.ts'),
++          )}
++          const agents = await loadLocalAgents({
++            agentsPath: ${JSON.stringify(agentsDir)},
++          })
++          console.log('LOADED:' + Object.keys(agents).join(','))
++        `,
++        'utf8',
++      )
++
++      const child = spawnSync(process.execPath, [scriptPath], {
++        encoding: 'utf8',
++        timeout: 60_000,
++      })
++
++      expect(child.status).toBe(0)
++      expect(child.stdout).toContain('LOADED:real-agent')
++    })
++
+     test('converts handleSteps function to string', async () => {
+       mkdirSync(agentsDir, { recursive: true })
+       writeAgentFile(
+diff --git a/sdk/src/agents/load-agents.ts b/sdk/src/agents/load-agents.ts
+index 112f2d1e5c..7363caef89 100644
+--- a/sdk/src/agents/load-agents.ts
++++ b/sdk/src/agents/load-agents.ts
+@@ -115,6 +115,25 @@ const shouldSkipAgentDirectory = (name: string): boolean =>
+   name === 'skills' ||
+   name.startsWith('skills-')
+ 
++/**
++ * True for a subdirectory that is an installed package or a checkout rather
++ * than a folder the user keeps agent definitions in.
++ *
++ * Users vendor third-party skill repos, npm packages and git checkouts under
++ * `.agents`. Such a tree ships its own CLI entrypoints and tests, and the
++ * loader imports every candidate before it can look at the export shape, so
++ * the first matching file runs at startup: a pixelfx checker calling
++ * `process.exit()` and a Superpowers bootstrap test exiting on missing argv
++ * both took the CLI down before the prompt appeared. Nothing in such a tree is
++ * an agent definition the user wrote, so prune it during discovery instead of
++ * importing it. The scanned directory itself is never tested: an `.agents`
++ * directory may legitimately be a package too.
++ */
++const isInstalledPackageDirectory = (dir: string): boolean =>
++  fs.existsSync(path.join(dir, 'package.json')) ||
++  fs.existsSync(path.join(dir, 'node_modules')) ||
++  fs.existsSync(path.join(dir, '.git'))
++
+ const isLoadableAgentFileName = (fileName: string): boolean => {
+   const extension = path.extname(fileName).toLowerCase()
+   return (
+@@ -127,7 +146,8 @@ const isLoadableAgentFileName = (fileName: string): boolean => {
+ /**
+  * List every file under `dir` that `loadLocalAgents` would import: `.ts`,
+  * `.tsx`, `.js`, `.mjs` or `.cjs`, minus `.d.ts` and test files, skipping
+- * `skills/`, `scripts/`, `node_modules` and dot-directories. Hosts use this to
++ * `skills/`, `scripts/`, `node_modules`, dot-directories and subdirectories
++ * that are installed packages or checkouts. Hosts use this to
+  * decide whether a repository-scoped `.agents` directory contains anything
+  * executable before importing it.
+  *
+@@ -141,6 +161,7 @@ export const listLocalAgentFiles = (dir: string): string[] => {
+       const fullPath = path.join(dir, entry.name)
+       if (entry.isDirectory()) {
+         if (shouldSkipAgentDirectory(entry.name)) continue
++        if (isInstalledPackageDirectory(fullPath)) continue
+         files.push(...listLocalAgentFiles(fullPath))
+         continue
+       }
+@@ -176,8 +197,7 @@ export const getDefaultAgentDirs = (): string[] => {
+  * A caller that has not made that decision must not reach them through a
+  * default (AB827V0 #070).
+  */
+-export const getUserAgentDir = (): string =>
+-  path.join(os.homedir(), '.agents')
++export const getUserAgentDir = (): string => path.join(os.homedir(), '.agents')
+ 
+ /**
+  * Load agent definitions from `.agents` directories.
