@@ -1,0 +1,631 @@
+diff --git a/sdk/src/impl/__tests__/provider-error-recovery.test.ts b/sdk/src/impl/__tests__/provider-error-recovery.test.ts
+index fd40e7270..297b93933 100644
+--- a/sdk/src/impl/__tests__/provider-error-recovery.test.ts
++++ b/sdk/src/impl/__tests__/provider-error-recovery.test.ts
+@@ -206,50 +206,115 @@ describe('classifyProviderErrorRecovery on real wire shapes', () => {
+       openRouterError(400, 'Provider returned error', 'prompt is too long'),
+     ],
+     [
+       'OpenRouter policy block (403)',
+       openRouterError(403, 'Request refused under the provider usage policy'),
+     ],
+     [
+       'Responses invalid prompt',
+       responsesError('Invalid prompt: flagged.', 'invalid_prompt'),
+     ],
+     [
+       'Responses refusal without a code',
+       responsesError('Responses API error', null),
+     ],
+     [
+       'a bare message with no type or status',
+       { error: { message: 'stream aborted' } },
+     ],
+   ] as const)('keeps %s fatal', async (_label, event) => {
+     const error = await errorPartFor(event)
+     expect(APICallError.isInstance(error)).toBe(true)
+     expect(classifyProviderErrorRecovery({ aborted: false, error })).toBeNull()
+   })
+ })
+ 
++/**
++ * The Vercel AI Gateway's mid-stream failures name their cause in `code` with a
++ * word. As sent, no status reaches the client and the turn ends; the server
++ * now gives each a status (normalizeGatewayStreamError,
++ * web/src/llm-api/vercel-gateway.ts), which this reads as retryable.
++ */
++describe('Vercel AI Gateway mid-stream failures', () => {
++  const gatewayError = (error: Record<string, unknown>) => ({
++    id: 'gen_1',
++    object: 'chat.completion.chunk',
++    created: 1,
++    model: 'fbc/beam-free',
++    choices: [],
++    error,
++  })
++
++  it.each([
++    [
++      'Beam, temporarily unavailable',
++      {
++        message: 'The inference service is temporarily unavailable',
++        code: 503,
++        gateway_code: 'upstream_unavailable_error',
++      },
++      503,
++    ],
++    [
++      'Glyph, stream timeout',
++      {
++        message: 'The stealth model could not complete the request.',
++        type: 'provider_error',
++        code: 504,
++        gateway_code: 'gateway_stream_timeout',
++      },
++      504,
++    ],
++    [
++      'Nemotron, stream error',
++      { message: 'Stream error occurred', code: 502, gateway_code: 'error' },
++      502,
++    ],
++  ] as const)('retries %s as the server now sends it', async (_label, error, statusCode) => {
++    const recovery = classifyProviderErrorRecovery({
++      aborted: false,
++      error: await errorPartFor(gatewayError(error)),
++    })
++    expect(recovery).toEqual(
++      expect.objectContaining({ source: 'provider-error', statusCode }),
++    )
++  })
++
++  it('reads the word codes the gateway itself sends as fatal', async () => {
++    for (const code of [
++      'upstream_unavailable_error',
++      'gateway_stream_timeout',
++      'error',
++    ]) {
++      const error = await errorPartFor(
++        gatewayError({ message: 'The inference service is temporarily unavailable', code }),
++      )
++      expect(classifyProviderErrorRecovery({ aborted: false, error })).toBeNull()
++    }
++  })
++})
++
+ describe('classifyProviderErrorRecovery on constructed errors', () => {
+   const apiError = (
+     fields: Partial<ConstructorParameters<typeof APICallError>[0]>,
+   ) =>
+     new APICallError({
+       message: 'Too Many Requests',
+       url: 'http://x',
+       requestBodyValues: {},
+       ...fields,
+     })
+ 
+   it('respects an explicit non-retryable verdict (the turn spend breaker)', () => {
+     // model-provider.ts FINAL_REFUSALS: a 429 that retrying cannot fix.
+     const error = apiError({
+       statusCode: 429,
+       isRetryable: false,
+       responseBody: JSON.stringify({ error: 'turn_spend_limit' }),
+     })
+     expect(classifyProviderErrorRecovery({ aborted: false, error })).toBeNull()
+   })
+ 
+   it('leaves a failed response the AI SDK already retried alone', () => {
+     const lastError = apiError({ statusCode: 503 })
+     const error = new RetryError({
+       message: 'Failed after 4 attempts',
+diff --git a/sdk/src/impl/__tests__/silent-timeout-retry.test.ts b/sdk/src/impl/__tests__/silent-timeout-retry.test.ts
+index 8b0048dfd..1ebd7da42 100644
+--- a/sdk/src/impl/__tests__/silent-timeout-retry.test.ts
++++ b/sdk/src/impl/__tests__/silent-timeout-retry.test.ts
+@@ -134,59 +134,97 @@ describe('promptAiSdkStream after a silent request timeout', () => {
+     expect(silentTimeoutEvents()).toEqual([
+       expect.objectContaining({ metric: 'stream_silent_timeout_retry' }),
+     ])
+   })
+ 
+   it('fails as before when the repeat times out too', async () => {
+     const attempt = run([
+       () => {
+         throw timeout()
+       },
+     ])
+     await expect(drain(attempt.stream)).rejects.toMatchObject({
+       name: 'TimeoutError',
+     })
+     expect(attempt.calls()).toBe(2)
+     expect(silentTimeoutEvents()).toEqual([
+       expect.objectContaining({ metric: 'stream_silent_timeout_retry' }),
+       expect.objectContaining({
+         metric: 'stream_silent_timeout_failed',
+         repeated: true,
+         receivedModelOutput: false,
+       }),
+     ])
+   })
+ 
+-  it('never repeats a step that already streamed output', async () => {
++  it('never repeats a step that already streamed output: it continues it, as a cut connection is', async () => {
+     const attempt = run([() => answerThenTimeout('Looking at the handler, '), answer])
+-    const outcome = await drain(attempt.stream).catch((error: unknown) => ({ error }))
++    const { chunks, result } = await drain(attempt.stream)
++    // Not sent again: what arrived stays, and the agent loop's forced next
++    // step (capped like every stream recovery) continues from it.
+     expect(attempt.calls()).toBe(1)
++    expect(result.aborted).toBe(false)
++    expect(
++      chunks.filter((c) => c.type === 'text').map((c) => (c as { text: string }).text),
++    ).toEqual(['Looking at the handler, '])
++    expect(chunks.at(-1)).toEqual(
++      expect.objectContaining({
++        type: 'error',
++        source: 'stream-interrupted',
++        detail: expect.stringContaining('5 minutes after the response had started'),
++      }),
++    )
+     expect(silentTimeoutEvents()).toEqual([
+       expect.objectContaining({
+-        metric: 'stream_silent_timeout_failed',
+-        repeated: false,
++        metric: 'stream_silent_timeout_continued',
+         receivedModelOutput: true,
+         hasYieldedContent: true,
+       }),
+     ])
+-    // What the partial step does is unchanged; it is only never sent again.
+-    if ('chunks' in outcome)
+-      expect(outcome.chunks.filter((c) => c.type === 'text').map((c) => (c as { text: string }).text))
+-        .toEqual(['Looking at the handler, '])
++  })
++
++  it('continues a step whose only output was reasoning (a queue notice, or thinking) when it goes silent', async () => {
++    const reasoningThenTimeout = () =>
++      new Response(
++        new ReadableStream<Uint8Array>({
++          start(controller) {
++            controller.enqueue(
++              new TextEncoder().encode(
++                sse(chunk({ reasoning: 'Glyph Cluster is busy: #2 in the queue' })),
++              ),
++            )
++            setTimeout(() => controller.error(timeout()), 5)
++          },
++        }),
++        { headers: { 'Content-Type': 'text/event-stream' } },
++      )
++    const attempt = run([reasoningThenTimeout, answer])
++    const { chunks } = await drain(attempt.stream)
++    expect(attempt.calls()).toBe(1)
++    expect(chunks.at(-1)).toEqual(
++      expect.objectContaining({ type: 'error', source: 'stream-interrupted' }),
++    )
++    expect(silentTimeoutEvents()).toEqual([
++      expect.objectContaining({
++        metric: 'stream_silent_timeout_continued',
++        receivedModelOutput: true,
++        hasYieldedContent: false,
++      }),
++    ])
+   })
+ 
+   it('does not repeat a request the user cancelled', async () => {
+     const abort = new AbortController()
+     const attempt = run(
+       [
+         () => {
+           abort.abort()
+           throw timeout()
+         },
+         answer,
+       ],
+       abort.signal,
+     )
+     await drain(attempt.stream).catch(() => {})
+     expect(attempt.calls()).toBe(1)
+   })
+ })
+diff --git a/sdk/src/impl/llm.ts b/sdk/src/impl/llm.ts
+index f253ed9d9..5114293bd 100644
+--- a/sdk/src/impl/llm.ts
++++ b/sdk/src/impl/llm.ts
+@@ -13,50 +13,51 @@ import {
+   getErrorObject,
+   isFetchIdleTimeoutError,
+   promptAborted,
+   promptSuccess,
+ } from '@codebuff/common/util/error'
+ import { convertCbToModelMessages } from '@codebuff/common/util/messages'
+ import { isExplicitlyDefinedModel } from '@codebuff/common/util/model-utils'
+ import { StopSequenceHandler } from '@codebuff/common/util/stop-sequence'
+ import {
+   streamText,
+   generateText,
+   Output,
+   NoSuchToolError,
+   APICallError,
+   ToolCallRepairError,
+   InvalidToolInputError,
+   TypeValidationError,
+ } from 'ai'
+ 
+ import { getModelForRequest } from './model-provider'
+ import type { CodebuffRequestHeadersProvider } from './model-provider'
+ import { byokModelLimits } from '../byok'
+ import type { ResolvedByokConnection } from '../byok'
+ import {
+   classifyErrorChunkRecovery,
++  classifyIdleTimeoutRecovery,
+   classifyStreamEndRecovery,
+   classifyThrownStreamRecovery,
+   streamFinishInfoOf,
+   type StreamEndRecovery,
+   type StreamFinishInfo,
+ } from './stream-interruption'
+ 
+ import type {
+   OpenRouterProviderOptions,
+   OpenRouterProviderRoutingOptions,
+ } from '@codebuff/common/types/agent-template'
+ import type {
+   PromptAiSdkFn,
+   PromptAiSdkStreamFn,
+   PromptAiSdkStructuredInput,
+   PromptAiSdkStructuredOutput,
+ } from '@codebuff/common/types/contracts/llm'
+ import type { ParamsOf } from '@codebuff/common/types/function-params'
+ import type { ProviderMetadata } from '@codebuff/common/types/messages/provider-metadata'
+ import type { LanguageModel } from 'ai'
+ 
+ /** Resolves after `ms`, or as soon as `signal` aborts. Never rejects. */
+ function sleepUnlessAborted(ms: number, signal: AbortSignal): Promise<void> {
+   if (signal.aborted) return Promise.resolve()
+   return new Promise((resolve) => {
+@@ -483,109 +484,139 @@ export async function* promptAiSdkStream(
+   // silent model stop from a legitimate empty completion.
+   let hasReceivedReasoning = false
+   // Tool calls tracked separately: a step that produced tool calls is
+   // actionable even with no text, so it is never a silent stop.
+   let hasYieldedToolCall = false
+ 
+   // A healthy stream always delivers a finish part with a real finishReason
+   // (and usage) before ending; its absence after the loop can mean a cut
+   // connection or an incompatible provider stream. See stream-interruption.ts.
+   let finishInfo: StreamFinishInfo | undefined
+   // Bun/undici can throw when a response body is severed instead of ending the
+   // iterator cleanly. Feed that through the same capped continuation path as a
+   // clean end without a finish marker. A retryable provider error reported in
+   // band (5xx/429 error chunk) takes the same path: see
+   // classifyErrorChunkRecovery.
+   let thrownStreamRecovery: StreamEndRecovery | undefined
+   // Any model output part, including one still held by the stop-sequence
+   // buffer or a tool call's streamed input: once one arrived, the step is not
+   // repeated (see silentTimeoutRetry).
+   let receivedModelOutput = false
+   let retryAfterSilentTimeout = false
+   /**
+    * The runtime's 5-minute fetch inactivity timeout (isFetchIdleTimeoutError)
+    * before this step received any output: nothing reached the user and no tool
+    * call exists, so the same request is sent once more. No other layer retries
+-   * it: the AI SDK treats a TimeoutError as an abort, and the stream recoveries
+-   * below do not classify it. A BYOK request's timeout is sanitized into a
+-   * transient network error, which the stream-interrupted recovery already
+-   * retries, so it is left to that. A second silent timeout fails as before.
++   * it: the AI SDK treats a TimeoutError as an abort. A BYOK request's timeout
++   * is sanitized into a transient network error, which the stream-interrupted
++   * recovery already retries, so it is left to that. The same timeout after
++   * output had arrived is continued instead (idleTimeoutContinuation). A
++   * second silent timeout with no output fails as before.
+    */
+   const silentTimeoutRetry = (error: unknown) => {
+     if (params.byok || params.signal.aborted || !isFetchIdleTimeoutError(error))
+       return false
+     if (!idleTimeoutRetried && !receivedModelOutput) return true
+-    // Why this one fails instead: output had arrived, or it was the repeat.
++    if (receivedModelOutput) return false
++    // Why this one fails instead: it was the repeat, and nothing arrived.
+     // STREAM_RECOVERY_EVENT, so a host that forwards only allowlisted events
+     // (the hosted Cloud worker's cloudSdkLogger) still ships it.
+     logger.warn(
+       {
+         axiomEvent: STREAM_RECOVERY_EVENT,
+         metric: 'stream_silent_timeout_failed',
+         model: params.model,
+         userInputId: params.userInputId,
+         hasYieldedContent,
+         receivedModelOutput,
+         repeated: idleTimeoutRetried,
+       },
+       'Model request timed out with no data and was not sent again',
+     )
+     return false
+   }
++  /** The idle timeout after output: continued, not sent again
++   *  (classifyIdleTimeoutRecovery). Tried ahead of `classify`, which does not
++   *  know the timeout. */
++  const idleTimeoutContinuation = (
++    classify: typeof classifyThrownStreamRecovery,
++  ): typeof classifyThrownStreamRecovery => (recoveryParams) => {
++    if (params.byok) return classify(recoveryParams)
++    const recovery = classifyIdleTimeoutRecovery({
++      ...recoveryParams,
++      receivedOutput: receivedModelOutput,
++    })
++    if (!recovery) return classify(recoveryParams)
++    logger.warn(
++      {
++        axiomEvent: STREAM_RECOVERY_EVENT,
++        metric: 'stream_silent_timeout_continued',
++        model: params.model,
++        userInputId: params.userInputId,
++        hasYieldedContent,
++        receivedModelOutput,
++      },
++      'Model response went silent after output; continuing the step',
++    )
++    return recovery
++  }
+   const streamIterator = response.stream[Symbol.asyncIterator]()
+   const recoverThrownStream = (
+     error: unknown,
+     classify: typeof classifyThrownStreamRecovery = classifyThrownStreamRecovery,
+   ): StreamEndRecovery | null => {
+     const recovery = classify({
+       aborted: params.signal.aborted,
+       error,
+     })
+     if (!recovery) return null
+     // These final-result promises can reject with the same transport error.
+     // Observe them now so the recovery yield below cannot leave an unhandled
+     // rejection while the consumer starts the continuation step.
+     void Promise.allSettled([
+       response.response,
+       response.request,
+       response.usage,
+       response.providerMetadata,
+     ])
+     return recovery
+   }
+ 
+   while (true) {
+     let iteration: Awaited<ReturnType<typeof streamIterator.next>>
+     try {
+       iteration = await streamIterator.next()
+     } catch (error) {
+       if (params.signal.aborted) reportUsageIncomplete()
+       if (silentTimeoutRetry(error)) {
+         retryAfterSilentTimeout = true
+         break
+       }
+-      const recovery = recoverThrownStream(error)
++      const recovery = recoverThrownStream(
++        error,
++        idleTimeoutContinuation(classifyThrownStreamRecovery),
++      )
+       if (!recovery) throw error
+       thrownStreamRecovery = recovery
+       break
+     }
+     if (iteration.done) break
+     const chunkValue = iteration.value
+     if (/^(text|reasoning|tool)-/.test(chunkValue.type)) receivedModelOutput = true
+     if (chunkValue.type === 'finish-step') {
+       finishProviderMetadata = chunkValue.providerMetadata as
+         | ProviderMetadata
+         | undefined
+     }
+     if (chunkValue.type === 'finish') {
+       finishInfo = streamFinishInfoOf(
+         chunkValue,
+         typeof aiSDKModel !== 'string' &&
+           aiSDKModel.specificationVersion === 'v2',
+       )
+       if (finishInfo.hasUsage) reportUsage(chunkValue.totalUsage)
+       await reportCost(finishProviderMetadata)
+       onFinishReason?.(finishInfo.finishReason)
+     }
+     if (chunkValue.type !== 'text-delta') {
+       const flushed = stopSequenceHandler.flush()
+       if (flushed) {
+@@ -628,51 +659,51 @@ export async function* promptAiSdkStream(
+             error: getErrorObject(chunkValue.error),
+             model: params.model,
+           },
+           'Tool call error in AI SDK stream - passing through to agent to retry',
+         )
+         yield {
+           type: 'error',
+           message: errorMessage,
+         }
+         continue
+       }
+ 
+       if (silentTimeoutRetry(chunkValue.error)) {
+         retryAfterSilentTimeout = true
+         break
+       }
+ 
+       // A transport error can also arrive as an AI SDK error chunk instead of
+       // making iterator.next() reject. Recover both runtime shapes identically.
+       // So does a provider that reported a retryable failure (5xx/429) in
+       // band: the same outage, just announced instead of a cut body — and an
+       // announced failure outranks a guess from the error's wording, which is
+       // why classifyErrorChunkRecovery tries it first.
+       const recovery = recoverThrownStream(
+         chunkValue.error,
+-        classifyErrorChunkRecovery,
++        idleTimeoutContinuation(classifyErrorChunkRecovery),
+       )
+       if (recovery) {
+         thrownStreamRecovery = recovery
+         break
+       }
+ 
+       logger.error(
+         {
+           chunk: { ...chunkValue, error: undefined },
+           error: getErrorObject(chunkValue.error),
+           model: params.model,
+         },
+         'Error in AI SDK stream',
+       )
+ 
+       // For all other errors, throw them -- they are fatal.
+       throw chunkValue.error
+     }
+     if (chunkValue.type === 'reasoning-delta') {
+       if (chunkValue.text) {
+         hasReceivedReasoning = true
+       }
+       const reasoningExcluded = (['openrouter', 'codebuff'] as const).some(
+         (p) =>
+           (params.providerOptions?.[p] as OpenRouterProviderOptions | undefined)
+diff --git a/sdk/src/impl/stream-interruption.ts b/sdk/src/impl/stream-interruption.ts
+index 9e36b3b0f..243699216 100644
+--- a/sdk/src/impl/stream-interruption.ts
++++ b/sdk/src/impl/stream-interruption.ts
+@@ -13,51 +13,54 @@
+  * proof: providers map any unrecognized `finish_reason` string to `'unknown'`
+  * too. Usage disambiguates — it arrives in the stream's final chunk, so
+  * `'unknown'` *with* usage means an odd but complete stream, while `'unknown'`
+  * *without* usage means we cannot confirm completion. This can be a cut
+  * connection OR a provider that omits those fields, even before `[DONE]`.
+  * Missing completion metadata alone must not be described as a network error.
+  *
+  * **'output-limit'** — the model produced no text or tool calls because it
+  * either spent its output budget on reasoning (`length`) or ended the stream
+  * after emitting only native reasoning, under any finish reason the provider
+  * chose to report (a Bedrock-via-OpenRouter reasoning-only end has arrived as
+  * 'unknown' with usage). Both are complete, well-formed streams whose turns
+  * would otherwise end with nothing visible. A `length` stop after real output
+  * is the answer running long, which is not silently recoverable (retrying
+  * would duplicate output).
+  *
+  * **'provider-error'** — the provider (or our server, on its behalf) reported
+  * a retryable failure (5xx, 429) as an in-band error chunk. The same outage as
+  * a cut connection, just announced; see {@link classifyProviderErrorRecovery}.
+  *
+  * Before this existed, the first two classes read as the agent "randomly stopping"
+  * mid-thinking with no error anywhere (2026-07-17 incident).
+  */
+ 
+ import type { StreamRecoverySource } from '@codebuff/common/types/contracts/llm'
+-import { isTransientNetworkError } from '@codebuff/common/util/error'
++import {
++  isFetchIdleTimeoutError,
++  isTransientNetworkError,
++} from '@codebuff/common/util/error'
+ import { APICallError } from 'ai'
+ 
+ export interface StreamFinishInfo {
+   finishReason: string
+   hasUsage: boolean
+ }
+ 
+ /** Distill an AI SDK `stream` finish part into what detection needs. */
+ export function streamFinishInfoOf(
+   part: {
+     finishReason: string
+     rawFinishReason?: string
+     totalUsage: {
+       inputTokens?: number
+       outputTokens?: number
+       totalTokens?: number
+     }
+   },
+   v2Compatibility = false,
+ ): StreamFinishInfo {
+   const { inputTokens, outputTokens, totalTokens } = part.totalUsage
+   return {
+     finishReason:
+       part.finishReason === 'other' &&
+       (part.rawFinishReason === 'unknown' ||
+@@ -149,50 +152,85 @@ export function classifyStreamEndRecovery(params: {
+ 
+   return null
+ }
+ 
+ /**
+  * Classify an exception thrown while consuming a completion stream. Some
+  * runtimes surface a severed response body as an exception (for example Bun's
+  * `ConnectionClosed` / `ECONNRESET`) instead of the graceful-but-incomplete
+  * stream ending handled by {@link classifyStreamEndRecovery}. Both represent
+  * the same recoverable condition to the agent loop.
+  */
+ export function classifyThrownStreamRecovery(params: {
+   aborted: boolean
+   error: unknown
+ }): StreamEndRecovery | null {
+   if (params.aborted || !isTransientNetworkError(params.error)) return null
+   // Fixed observations only: transport errors can echo credentials and URLs.
+   return {
+     source: 'stream-interrupted',
+     message:
+       'A connection-level error interrupted the provider request, so the output above may be incomplete. Continue from where it left off (or start the step over if nothing useful arrived).',
+     detail: 'A connection-level error occurred while requesting or reading the provider response.',
+   }
+ }
+ 
++/**
++ * The runtime's 5-minute fetch inactivity timeout (isFetchIdleTimeoutError)
++ * AFTER the step received output. The request cannot be sent again (that
++ * would repeat what already reached the user), but the step can be continued
++ * from what arrived, exactly as a cut connection is
++ * ({@link classifyThrownStreamRecovery}), under the same cap on back-to-back
++ * recoveries (MAX_CONSECUTIVE_STREAM_RECOVERIES).
++ *
++ * Before (2026-11-11), this ended the turn: 1,225 hosted Cloud runs in three
++ * days stopped on "Connection timed out: no data was received from the server
++ * for 5 minutes", 620 of them in two days after output had arrived (the
++ * timeout before any output was already sent once more). The same timeout
++ * before any output is promptAiSdkStream's to repeat, not this.
++ */
++export function classifyIdleTimeoutRecovery(params: {
++  aborted: boolean
++  error: unknown
++  /** Any model output part arrived before the timeout. */
++  receivedOutput: boolean
++}): StreamEndRecovery | null {
++  if (
++    params.aborted ||
++    !params.receivedOutput ||
++    !isFetchIdleTimeoutError(params.error)
++  )
++    return null
++  return {
++    source: 'stream-interrupted',
++    message:
++      'The response stopped arriving: no data came for 5 minutes, so the output above may be incomplete. Continue from where it left off (or start the step over if nothing useful arrived).',
++    detail:
++      'No data was received from the server for 5 minutes after the response had started.',
++  }
++}
++
+ /**
+  * Classify an `error` part of the completion stream, which can be either a
+  * transport drop surfaced as a chunk or a failure the provider (or our server,
+  * on its behalf) announced in band.
+  *
+  * The announcement wins. Both classifiers take the same capped retry path, but
+  * they differ in what the user is told and whether the retry waits, and an
+  * announced failure carries more information than a guess from the wording:
+  * {@link classifyProviderErrorRecovery} returns null unless the error really is
+  * an APICallError with a retryable status, a known retryable code or our
+  * server's `upstream_error` type, so trying it first can only reclassify an
+  * error that said so itself.
+  *
+  * It has to be first because the wording is not decisive: our server's in-band
+  * report of an upstream failure carries the runtime's text, and undici's
+  * "fetch failed" (a headers timeout against the provider) is one of the phrases
+  * {@link classifyThrownStreamRecovery} reads as a dropped connection. Measured
+  * in the 24h to 2026-10-14T15:57Z: 19 such reports, on 19 runs by 19 distinct
+  * users, each of whom was told a connection-level error had interrupted the
+  * request — i.e. that their own network, or a provider setting they do not
+  * have, was at fault — and whose step was retried with no backoff.
+  */
+ export function classifyErrorChunkRecovery(params: {
+   aborted: boolean
+   error: unknown
