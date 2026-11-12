@@ -1,0 +1,360 @@
+diff --git a/common/src/constants/turn-review.ts b/common/src/constants/turn-review.ts
+index aba9a8795..9603ebea9 100644
+--- a/common/src/constants/turn-review.ts
++++ b/common/src/constants/turn-review.ts
+@@ -107,61 +107,113 @@ const RECENT_PROMPT_CHARS = 300
+ export function turnReviewPrompt(
+   recentPrompts: readonly string[] = [],
+   mode: WorkspaceMode = 'code',
+ ): string {
+   const prompt = mode === 'chat' ? TURN_REVIEW_CHAT_PROMPT : TURN_REVIEW_PROMPT
+   const lines = recentPrompts
+     .map((recent) => clip(recent, RECENT_PROMPT_CHARS))
+     .filter(Boolean)
+     .slice(0, TURN_REVIEW_RECENT_PROMPTS)
+   if (!lines.length) return prompt
+   const habits = mode === 'chat'
+     ? 'how much they ask for at once and their wording'
+     : 'whether they open pull requests or keep changes local, how much they ask for at once, and their wording'
+   return `${prompt}
+ 
+ For reference, the user's recent messages across their chats, newest first. Match how they work, such as ${habits}, but never copy a request they already made:
+ ${lines.map((line) => `- ${line}`).join('\n')}`
+ }
+ 
+ function clip(value: unknown, max: number): string {
+   if (typeof value !== 'string') return ''
+   const text = value.replace(/\s+/g, ' ').trim()
+   return text.length > max ? `${text.slice(0, max - 1).trimEnd()}…` : text
+ }
+ 
+-/** The review in a model's reply, or null when the reply holds none. */
++/** The review in a model's reply, or null when the reply holds none (or an empty one). */
+ export function parseTurnReview(reply: string): TurnReview | null {
++  const read = readTurnReview(reply)
++  return read === 'empty' ? null : read
++}
++
++/**
++ * The review in a model's reply: the first complete JSON object shaped like
++ * one (it names `verdict`, `actions` or `nextPrompt`), ignoring prose and
++ * other braces around it and anything after it, such as a stray `"}`.
++ * `'empty'` is a well-formed review with nothing in it (the model judged there
++ * was nothing to suggest); null is a reply that holds no review at all.
++ */
++export function readTurnReview(reply: string): TurnReview | 'empty' | null {
+   const text = reply.replace(/<think>[\s\S]*?<\/think>/g, '')
++  for (const candidate of jsonObjects(text)) {
++    const review = reviewShaped(candidate)
++    if (review !== undefined) return review
++  }
++  // A model sometimes drops the last string's closing quote ("nextPrompt":"…}).
+   const start = text.indexOf('{')
+   const end = text.lastIndexOf('}')
+   if (start < 0 || end <= start) return null
+-  const body = text.slice(start, end + 1)
+-  // A model sometimes drops the last string's closing quote ("nextPrompt":"…}).
+-  for (const candidate of [body, body.replace(/\}\s*$/, '"}')]) {
+-    try {
+-      return turnReviewFrom(JSON.parse(candidate))
+-    } catch {}
++  return reviewShaped(text.slice(start, end).trimEnd() + '"}') ?? null
++}
++
++/** The review in one JSON object's text, `'empty'`, or undefined when it is not one. */
++function reviewShaped(json: string): TurnReview | 'empty' | undefined {
++  let value: unknown
++  try {
++    value = JSON.parse(json)
++  } catch {
++    return undefined
++  }
++  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
++  if (!['verdict', 'actions', 'nextPrompt'].some((key) => key in value)) return undefined
++  return turnReviewFrom(value) ?? 'empty'
++}
++
++/** At most this many `{` are tried, so a reply full of code costs little. */
++const MAX_JSON_STARTS = 200
++
++/**
++ * Each balanced `{…}` in the text, outermost first, skipping braces inside
++ * JSON strings. An object that fails to parse is followed by the ones inside
++ * it, so a CSS block or a broken wrapper never hides the review after it.
++ */
++function* jsonObjects(text: string): Generator<string> {
++  let tried = 0
++  for (let start = text.indexOf('{'); start >= 0 && tried < MAX_JSON_STARTS; start = text.indexOf('{', start + 1)) {
++    tried++
++    let depth = 0
++    let inString = false
++    for (let i = start; i < text.length; i++) {
++      const char = text[i]
++      if (inString) {
++        if (char === '\\') i++
++        else if (char === '"') inString = false
++      } else if (char === '"') inString = true
++      else if (char === '{') depth++
++      else if (char === '}' && --depth === 0) {
++        yield text.slice(start, i + 1)
++        break
++      }
++    }
+   }
+-  return null
+ }
+ 
+ /** A review from untrusted JSON (a model's reply, a stored event), or null. */
+ export function turnReviewFrom(value: unknown): TurnReview | null {
+   if (!value || typeof value !== 'object') return null
+   const raw = value as Record<string, unknown>
+   const verdict = TURN_REVIEW_VERDICTS.includes(raw.verdict as TurnReviewVerdict)
+     ? (raw.verdict as TurnReviewVerdict)
+     : null
+   const actions: TurnReviewAction[] = []
+   for (const item of Array.isArray(raw.actions) ? raw.actions : []) {
+     const label = clip(item?.label, MAX_LABEL_CHARS)
+     const prompt = clip(item?.prompt, MAX_PROMPT_CHARS)
+     if (label && prompt)
+       actions.push({ label, prompt, kind: item?.kind === 'fix' ? 'fix' : 'next' })
+     if (actions.length === MAX_TURN_REVIEW_ACTIONS) break
+   }
+   const nextPrompt = clip(raw.nextPrompt, MAX_PROMPT_CHARS) || null
+   if (!verdict && !actions.length && !nextPrompt) return null
+   const reason = (verdict && clip(raw.reason, MAX_REASON_CHARS)) || null
+   return { verdict, reason, actions, nextPrompt }
+ }
+diff --git a/packages/agent-runtime/src/__tests__/turn-review.test.ts b/packages/agent-runtime/src/__tests__/turn-review.test.ts
+index 7e8280bcf..2f6afc89b 100644
+--- a/packages/agent-runtime/src/__tests__/turn-review.test.ts
++++ b/packages/agent-runtime/src/__tests__/turn-review.test.ts
+@@ -1,28 +1,29 @@
+ import * as analytics from '@codebuff/common/analytics'
+ import {
+   parseTurnReview,
++  readTurnReview,
+   TURN_REVIEW_CHAT_PROMPT,
+   TURN_REVIEW_PROMPT,
+   turnReviewPrompt,
+ } from '@codebuff/common/constants/turn-review'
+ import { TEST_USER_ID } from '@codebuff/common/old-constants'
+ import { createTestAgentRuntimeParams } from '@codebuff/common/testing/fixtures/agent-runtime'
+ import {
+   createMockDbOperations,
+   setupDbSpies,
+ } from '@codebuff/common/testing/mocks/database'
+ import { getInitialSessionState } from '@codebuff/common/types/session-state'
+ import { promptSuccess } from '@codebuff/common/util/error'
+ import { userMessage } from '@codebuff/common/util/messages'
+ import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from 'bun:test'
+ 
+ import { loopAgentSteps } from '../run-agent-step'
+ import { clearAgentGeneratorCache } from '../run-programmatic-step'
+ import { createToolCallChunk, mockFileContext } from './test-utils'
+ 
+ import type { AgentTemplate } from '../templates/types'
+ import type { TurnReview } from '@codebuff/common/constants/turn-review'
+ import type { DbSpies } from '@codebuff/common/testing/mocks/database'
+ 
+ const REVIEW = {
+   verdict: 'needs_changes',
+@@ -156,74 +157,102 @@ describe('turn review', () => {
+   })
+ 
+   it("asks with the host's prompt when it has the user's recent messages", async () => {
+     const prompt = turnReviewPrompt(['Open a PR, then review and simplify it'])
+     await run({ onTurnReview: () => {}, turnReviewPrompt: prompt })
+     expect(textOf(reviewRequests[0].messages.at(-1))).toContain('- Open a PR, then review and simplify it')
+   })
+ 
+   it('asks nothing without a host callback, or for a subagent', async () => {
+     await run({})
+     await run({ onTurnReview: () => {}, parentId: 'parent-run' })
+     expect(reviewRequests).toHaveLength(0)
+   })
+ 
+   it('reports null for a reply that holds no review, so the host stops waiting', async () => {
+     reviewReply = 'I think it is fine.'
+     const reviews: (TurnReview | null)[] = []
+     const logged: any[] = []
+     await run({ onTurnReview: (review) => reviews.push(review), logged })
+     expect(reviews).toEqual([null])
+     expect(logged.find((row) => row.axiomEvent === 'turn_review')).toMatchObject({
+       outcome: 'unrecognized',
+       action_count: 0,
+     })
+   })
++
++  it("logs a review with nothing to suggest as empty, and reports null", async () => {
++    reviewReply = '{"verdict": null, "reason": null, "actions": [], "nextPrompt": null}'
++    const reviews: (TurnReview | null)[] = []
++    const logged: any[] = []
++    await run({ onTurnReview: (review) => reviews.push(review), logged })
++    expect(reviews).toEqual([null])
++    expect(logged.find((row) => row.axiomEvent === 'turn_review')).toMatchObject({ outcome: 'empty' })
++  })
+ })
+ 
+ describe('parseTurnReview', () => {
+   it('reads the JSON past thinking and prose', () => {
+     expect(
+       parseTurnReview(`<think>{"verdict":"x"}</think>Here: ${JSON.stringify(REVIEW)}`),
+     ).toEqual(REVIEW as TurnReview)
+   })
+ 
+   it('drops unknown verdicts and their reason, empty actions and extras past the limit', () => {
+     const actions = Array.from({ length: 8 }, (_, i) => ({ label: `A${i}`, prompt: `P${i}` }))
+     expect(
+       parseTurnReview(
+         JSON.stringify({ verdict: 'maybe', reason: 'why', actions: [{ label: '', prompt: 'x' }, ...actions] }),
+       ),
+     ).toEqual({
+       verdict: null,
+       reason: null,
+       // An action with no known kind is a next step.
+       actions: actions.slice(0, 5).map((action) => ({ ...action, kind: 'next' })),
+       nextPrompt: null,
+     })
+   })
+ 
++  it('keeps the first complete review and ignores what follows it', () => {
++    expect(parseTurnReview(`${JSON.stringify(REVIEW)}"}`)).toEqual(REVIEW as TurnReview)
++    expect(parseTurnReview(`${JSON.stringify(REVIEW)}\n{"verdict": "not_promising"}`)).toEqual(REVIEW as TurnReview)
++  })
++
++  it('skips braces in prose before the review, such as CSS', () => {
++    const reply = `Checked the page: .card { color: red; } looks right.\n${JSON.stringify(REVIEW)}`
++    expect(parseTurnReview(reply)).toEqual(REVIEW as TurnReview)
++  })
++
++  it('tells an empty review apart from a reply that holds none', () => {
++    const empty = '{"verdict": null, "reason": null, "actions": [], "nextPrompt": null}'
++    expect(readTurnReview(empty)).toBe('empty')
++    expect(parseTurnReview(empty)).toBeNull()
++    // An object that is not a review, such as a lone action, is no review at all.
++    expect(readTurnReview('{"kind": "fix", "label": "Cut it", "prompt": "Cut it."}')).toBeNull()
++    expect(readTurnReview('I think it is fine.')).toBeNull()
++  })
++
+   it("repairs a last string the model left unclosed", () => {
+     expect(
+       parseTurnReview('{"verdict":"ready","reason":"Clean.","actions":[],"nextPrompt":"Simplify, review and merge the PR when green.}'),
+     ).toMatchObject({ verdict: 'ready', nextPrompt: 'Simplify, review and merge the PR when green.' })
+   })
+ 
+   it('is null for no review at all', () => {
+     expect(parseTurnReview('{"verdict": null, "actions": []}')).toBeNull()
+     // A recommended next message alone is still a review.
+     expect(parseTurnReview('{"verdict": null, "actions": [], "nextPrompt": "Add a test."}'))
+       .toEqual({ verdict: null, reason: null, actions: [], nextPrompt: 'Add a test.' })
+     expect(parseTurnReview('not json')).toBeNull()
+   })
+ })
+ 
+ describe('turnReviewPrompt', () => {
+   it('is the bare prompt without recent messages', () => {
+     expect(turnReviewPrompt()).toBe(TURN_REVIEW_PROMPT)
+     expect(turnReviewPrompt(['  ', ''])).toBe(TURN_REVIEW_PROMPT)
+   })
+ 
+   it("asks a Chat-mode turn for follow-ups and a next message, with no verdict", () => {
+     expect(turnReviewPrompt([], 'chat')).toBe(TURN_REVIEW_CHAT_PROMPT)
+     const prompt = turnReviewPrompt(['Plan a trip to Lisbon'], 'chat')
+     expect(prompt).toContain('- Plan a trip to Lisbon')
+diff --git a/packages/agent-runtime/src/turn-review.ts b/packages/agent-runtime/src/turn-review.ts
+index 1671a5342..a277a58b1 100644
+--- a/packages/agent-runtime/src/turn-review.ts
++++ b/packages/agent-runtime/src/turn-review.ts
+@@ -1,34 +1,34 @@
+ /**
+  * The review of a finished turn: one request with the agent's own system
+  * prompt, tools and history plus `TURN_REVIEW_PROMPT`, so the provider reads
+  * the conversation from its warm cache. Its reply becomes one-click next
+  * prompts and a verdict for the host to show; nothing joins the history.
+  */
+ 
+ import {
+-  parseTurnReview,
++  readTurnReview,
+   TURN_REVIEW_METADATA_KEY,
+   TURN_REVIEW_PROMPT,
+ } from '@codebuff/common/constants/turn-review'
+ import { TURN_REVIEW_EVENT } from '@codebuff/common/util/axiom-only-log'
+ import { getErrorObject } from '@codebuff/common/util/error'
+ import { systemMessage, userMessage } from '@codebuff/common/util/messages'
+ 
+ import { withSystemInstructionTags } from './util/messages'
+ 
+ import type { SummaryStream } from './conversation-summary'
+ import type { TurnReview } from '@codebuff/common/constants/turn-review'
+ import type { ModelUsageData } from '@codebuff/common/types/contracts/llm'
+ import type { Logger } from '@codebuff/common/types/contracts/logger'
+ import type { Message } from '@codebuff/common/types/messages/codebuff-message'
+ 
+ /**
+  * A review may think as long as it needs: no output cap beyond the agent's own,
+  * and this generous limit. A 4,000-token cap and 90 s limit failed 5.5% of
+  * reviews (11-12), mostly a model's reasoning spending the whole budget.
+  */
+ export const TURN_REVIEW_TIMEOUT_MS = 10 * 60_000
+ 
+ /** Asks for the review. `history` must be what the agent's next request sends. */
+ export async function reviewTurn(params: {
+   history: Message[]
+@@ -50,52 +50,54 @@ export async function reviewTurn(params: {
+     const stream = params.stream({
+       messages: [
+         systemMessage(params.system),
+         ...params.history,
+         // Tagged so the server's prompt classifier skips it as product text.
+         userMessage({
+           content: withSystemInstructionTags(params.prompt ?? TURN_REVIEW_PROMPT),
+         }),
+       ],
+       signal: AbortSignal.timeout(TURN_REVIEW_TIMEOUT_MS),
+       extraCodebuffMetadata: { [TURN_REVIEW_METADATA_KEY]: '1' },
+       onFinishReason: (reason) => {
+         finishReason = reason
+       },
+       onUsageReceived: (received) => {
+         usage = received
+       },
+     })
+     let text = ''
+     for (;;) {
+       const next = await stream.next()
+       if (next.done) break
+       if (next.value.type === 'error') throw new Error(next.value.message)
+       if (next.value.type === 'text') text += next.value.text
+     }
+-    review = parseTurnReview(text)
+-    outcome = review ? 'completed' : 'unrecognized'
++    const read = readTurnReview(text)
++    // `empty`: a well-formed review with nothing to suggest, not a broken reply.
++    outcome = read === 'empty' ? 'empty' : read ? 'completed' : 'unrecognized'
++    review = read === 'empty' ? null : read
+     return review
+   } catch (error) {
+     params.logger.debug?.({ error: getErrorObject(error) }, 'Turn review failed')
+     return null
+   } finally {
+     try {
+       params.logger.info(
+         {
+           axiomEvent: TURN_REVIEW_EVENT,
+           ...params.telemetry,
+           agent_run_id: params.runId,
+           model: params.model,
+           outcome,
+           finish_reason: finishReason,
+           verdict: review?.verdict ?? undefined,
+           action_count: review?.actions.length ?? 0,
+           duration_ms: Date.now() - started,
+           ...(usage
+             ? {
+                 input_tokens: usage.inputTokens,
+                 cached_input_tokens: usage.cachedInputTokens,
+                 output_tokens: usage.outputTokens,
+               }
+             : {}),
+         },
