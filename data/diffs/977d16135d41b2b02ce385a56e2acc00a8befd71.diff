@@ -1,0 +1,125 @@
+diff --git a/common/src/constants/turn-review.ts b/common/src/constants/turn-review.ts
+index 9603ebea9..45333f2fe 100644
+--- a/common/src/constants/turn-review.ts
++++ b/common/src/constants/turn-review.ts
+@@ -26,50 +26,58 @@ export type TurnReviewAction = {
+ }
+ 
+ export type TurnReview = {
+   /** null when the turn made no change to judge. */
+   verdict: TurnReviewVerdict | null
+   /** Why, in one short line; null without a verdict. */
+   reason: string | null
+   /** The one message the review recommends sending next, offered in the composer (Tab fills it). */
+   nextPrompt: string | null
+   actions: TurnReviewAction[]
+ }
+ 
+ /**
+  * The Cloud A/B (docs/experiments.md): `review` turns get the review in place
+  * of `suggest_prompts` cards; `control` is the agent as it was. Inert until
+  * its `experiment` row is running.
+  */
+ export const TURN_REVIEW_EXPERIMENT_KEY = 'turn_review_2026_11'
+ 
+ /** The run event that carries a review to the workspace. */
+ export const TURN_REVIEW_EVENT_KIND = 'turn_review'
+ 
+ /** `codebuff_metadata` key that marks a review request. */
+ export const TURN_REVIEW_METADATA_KEY = 'turn_review'
+ 
++/**
++ * How long a review may take, on every path (the runtime's request, a
++ * Claude Code or Codex fork on the user's computer). A review may think as
++ * long as it needs: a 4,000-token cap and 90 s limit failed 5.5% of reviews
++ * (11-12), mostly a model's reasoning spending the whole budget.
++ */
++export const TURN_REVIEW_TIMEOUT_MS = 10 * 60_000
++
+ export const MAX_TURN_REVIEW_ACTIONS = 5
+ const MAX_LABEL_CHARS = 60
+ const MAX_PROMPT_CHARS = 1_000
+ const MAX_REASON_CHARS = 160
+ 
+ export const TURN_REVIEW_PROMPT = `Stop working on the task. The turn is over, and the user has not replied yet. Look back at the conversation as a skeptical senior engineer seeing it for the first time, and help the user decide what to do next. The user never sees this message or your reply, only the buttons and the verdict you return. Do not call any tools.
+ 
+ Consider these questions. Not every one makes sense for every turn: for a code change most of them do, for brainstorming or a plan the verdict usually does not, and for a plain question often only the follow-ups do. Skip any that do not fit, and say nothing rather than something weak.
+ 1. Is there an alternative approach that would be clearly better? Usually there is not.
+ 2. If we keep this approach, what could we cut that is not worth its complexity?
+ 3. What else should this change include before it is done?
+ 4. What follow-ups would be most valuable?
+ 5. Is the change on track to merge? "ready": useful and a net positive after the complexity it adds, nothing important left. "needs_changes": a good direction with a few things to fix first. "not_promising": the wrong change, or not worth it. Use null when the turn made no change to judge. The assistant who did the work is biased toward it, so do not rubber-stamp it.
+ 
+ With a verdict, give its "reason": one plain sentence of at most 15 words that a non-expert understands, saying what makes it ready or what is wrong, like "Does what you asked with one small, clean change." or "The retry wrapper isn't needed, and empty input isn't handled." Use null with no verdict.
+ 
+ Turn the answers into at most ${MAX_TURN_REVIEW_ACTIONS} actions, the most valuable first. Each is a button the user can click to send its prompt as their next message:
+ - "kind": "fix" for anything that improves this change itself (a cut, a missing piece, a better approach), or "next" for a follow-up beyond it. A "needs_changes" or "not_promising" verdict should come with the fixes it names.
+ - "label": two to five words that say what the button does, like "Cut the retry wrapper" or "Try a single query".
+ - "prompt": what the user would send, in their voice. It must stand alone, because the agent that receives it never sees this review: name what to change or try and why, in one or two sentences, and leave the how to the agent.
+ Every action, and "nextPrompt", must be something the user could sensibly send as their very next message, right now. Never offer a step that has to wait on something that has not happened yet, such as a merge, a deploy, a release, a review, or data arriving, like "Re-measure after deploy" while the pull request is still open: no one clicks it now. Offer only what the agent can start on as soon as it is sent.
+ Do not offer what was already done or declined, or two buttons that do the same thing.
+ 
+ Last, write "nextPrompt": the single message you would recommend the user send next, taking all of the above into account. It is offered in their empty message box, where one key fills it in for them to send. It may combine several instructions, such as the fixes the change needs and one valuable follow-up, but keep it concise: one to three short sentences in the user's voice that stand alone. Use null when nothing is worth sending.
+ 
+diff --git a/packages/agent-runtime/src/turn-review.ts b/packages/agent-runtime/src/turn-review.ts
+index a277a58b1..e42b94084 100644
+--- a/packages/agent-runtime/src/turn-review.ts
++++ b/packages/agent-runtime/src/turn-review.ts
+@@ -1,56 +1,50 @@
+ /**
+  * The review of a finished turn: one request with the agent's own system
+  * prompt, tools and history plus `TURN_REVIEW_PROMPT`, so the provider reads
+  * the conversation from its warm cache. Its reply becomes one-click next
+  * prompts and a verdict for the host to show; nothing joins the history.
+  */
+ 
+ import {
+   readTurnReview,
+   TURN_REVIEW_METADATA_KEY,
+   TURN_REVIEW_PROMPT,
++  TURN_REVIEW_TIMEOUT_MS,
+ } from '@codebuff/common/constants/turn-review'
+ import { TURN_REVIEW_EVENT } from '@codebuff/common/util/axiom-only-log'
+ import { getErrorObject } from '@codebuff/common/util/error'
+ import { systemMessage, userMessage } from '@codebuff/common/util/messages'
+ 
+ import { withSystemInstructionTags } from './util/messages'
+ 
+ import type { SummaryStream } from './conversation-summary'
+ import type { TurnReview } from '@codebuff/common/constants/turn-review'
+ import type { ModelUsageData } from '@codebuff/common/types/contracts/llm'
+ import type { Logger } from '@codebuff/common/types/contracts/logger'
+ import type { Message } from '@codebuff/common/types/messages/codebuff-message'
+ 
+-/**
+- * A review may think as long as it needs: no output cap beyond the agent's own,
+- * and this generous limit. A 4,000-token cap and 90 s limit failed 5.5% of
+- * reviews (11-12), mostly a model's reasoning spending the whole budget.
+- */
+-export const TURN_REVIEW_TIMEOUT_MS = 10 * 60_000
+-
+ /** Asks for the review. `history` must be what the agent's next request sends. */
+ export async function reviewTurn(params: {
+   history: Message[]
+   system: string
+   /** TURN_REVIEW_PROMPT, or `turnReviewPrompt` with the user's recent messages. */
+   prompt?: string
+   stream: SummaryStream
+   logger: Logger
+   runId: string
+   model: string
+   telemetry?: Record<string, string>
+ }): Promise<TurnReview | null> {
+   const started = Date.now()
+   let usage: ModelUsageData | undefined
+   let finishReason: string | undefined
+   let outcome = 'failed'
+   let review: TurnReview | null = null
+   try {
+     const stream = params.stream({
+       messages: [
+         systemMessage(params.system),
+         ...params.history,
+         // Tagged so the server's prompt classifier skips it as product text.
+         userMessage({
+           content: withSystemInstructionTags(params.prompt ?? TURN_REVIEW_PROMPT),
