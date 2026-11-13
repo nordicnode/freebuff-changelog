@@ -1,0 +1,279 @@
+diff --git a/common/src/desktop-cloud/device-execution.ts b/common/src/desktop-cloud/device-execution.ts
+index 830c2d993..72b390f68 100644
+--- a/common/src/desktop-cloud/device-execution.ts
++++ b/common/src/desktop-cloud/device-execution.ts
+@@ -1,31 +1,34 @@
+ import { z } from 'zod/v4'
+ import {
+   SPONSORED_WINDOWS_CONTAINMENT,
+   SPONSORED_WINDOWS_EXECUTION_SURFACE,
+ } from '../ads/sponsored-windows'
+ import { CLAUDE_TRANSCRIPT_ID } from './claude-turn-marks'
++
++/** A Codex turn id (`turn/started`), as a side chat forks its parent's thread before it. */
++export const CODEX_TURN_ID = /^[a-zA-Z0-9_.:-]{1,128}$/
+ import { devicePanelOperation } from './device-panels'
+ import { deviceGitHubRequest } from './device-github'
+ import { deviceLocalMcpCallRequest } from './local-mcp'
+ 
+ /** V1 stays read-only. V2 execution requires an explicit local opt-in. */
+ export const DEVICE_EXECUTION_VERSION = 1
+ export const DEVICE_READ_BYTES = 64 * 1024
+ export const DEVICE_DIRECTORY_ENTRIES = 100
+ export const DEVICE_OPERATION_MS = 25_000
+ export const DEVICE_HEARTBEAT_MS = 10_000
+ /**
+  * How long a folder's enrollment outlives its last heartbeat (server only: Desktop does not read
+  * it). Until then a turn reads it `reconnecting` and waits 45 s for it, not 15 s, and its stream
+  * reconnects without re-registering. Desktop's bridge gives up after five failed reconnects
+  * (~23 s) and then retries an approved folder every 30 s; at 60 s most of those retries came
+  * back to a `gone` session.
+  */
+ export const DEVICE_SESSION_SECONDS = 180
+ export const DEVICE_FRAME_BYTES = 512 * 1024
+ export const DEVICE_EXEC_OUTPUT_BYTES = 16 * 1024 * 1024
+ export const DEVICE_EXEC_FRAME_BYTES = 24 * 1024 * 1024
+ export const DEVICE_EXEC_MS = 5 * 60_000
+ /** How long Desktop's `request_elevation` card waits for the user to approve it (elevation.ts). */
+ export const DEVICE_ELEVATION_APPROVAL_MS = 10 * 60_000
+ /** How long an approved elevated command may run before Desktop gives up on it (elevation.ts). */
+@@ -301,50 +304,57 @@ export const deviceHarnessRequest = z.discriminatedUnion('method', [
+         .optional(),
+       images: z
+         .array(
+           z.object({
+             data: z.string().max(16_000_000),
+             mediaType: z.string().max(100),
+           }),
+         )
+         .max(10)
+         .optional(),
+       previousState: z.unknown().optional(),
+       /** A completed runtime transfer must not resume a session from another machine. */
+       resetSession: z.boolean().optional(),
+       /**
+        * A forked chat's first turn: `previousState` is its source's session, which this turn
+        * branches into a new one instead of resuming. A Desktop without it refuses the request
+        * (the schema is strict), never resuming the source's session in two chats.
+        */
+       forkSession: z.literal(true).optional(),
+       /**
+        * With `forkSession`, after a Claude Code chat was rolled back (claude-turn-marks.ts): the
+        * branch keeps the session only up to this transcript entry. A Desktop without it refuses the
+        * request (the schema is strict), never resuming the turns the user rolled back.
+        */
+       resumeSessionAt: z.string().regex(CLAUDE_TRANSCRIPT_ID).optional(),
++      /**
++       * With `forkSession`, a Codex side chat opened while its parent's turn ran: the branch keeps
++       * the thread up to before this turn (`thread/fork` `beforeTurnId`), so it holds no half-done
++       * turn. A Desktop without it refuses the request (the schema is strict), never forking the
++       * running turn in.
++       */
++      forkBeforeTurnId: z.string().regex(CODEX_TURN_ID).optional(),
+       /**
+        * A side chat's turn (history-store.ts `openSideChat`): read-only, with no Freebuff tools,
+        * because its parent's agent is working in the same folder. A Desktop without it refuses
+        * the request (the schema is strict), never running a side chat with write access.
+        */
+       readOnly: z.literal(true).optional(),
+       importedHistory: z.string().max(20 * 1024 * 1024).optional(),
+       /** Quoted history used only when neither Cloud nor Desktop has a CLI session. */
+       initialPrompt: z.string().max(2 * 1024 * 1024).optional(),
+       documents: z
+         .array(
+           z
+             .object({
+               name: z.string().max(1024),
+               text: z.string().max(1_000_000),
+             })
+             .strict(),
+         )
+         .max(12)
+         .optional(),
+       injectAgentsMd: z.boolean().optional(),
+     })
+     .strict(),
+   z
+     .object({
+diff --git a/common/src/desktop-cloud/history.ts b/common/src/desktop-cloud/history.ts
+index a59c25769..3e024be13 100644
+--- a/common/src/desktop-cloud/history.ts
++++ b/common/src/desktop-cloud/history.ts
+@@ -122,51 +122,61 @@ export type CloudHistoryAttachment = {
+     expiresAt: string | null
+   } | null
+   /**
+    * This claim bought an hour that is now over by the clock, so its next admission is refused
+    * (`purchase_claim_released`: claims are single-use). The composer starts a new claim before
+    * sending instead of learning it from that refusal. Absent: not ended, or an older server.
+    */
+   claimEnded?: true
+ }
+ export type CloudHistoryChatUpdate = {
+   expectedRevision: number
+   title?: string
+   archived?: boolean
+ }
+ /**
+  * Fork a chat on the computer it runs on: a new chat with its transcript, attachments and agent
+  * session, holding no Freebuff session of its own until it is sent to. `chatId` is the new chat's
+  * id, minted by the client and reused on a retry so the fork is created once.
+  */
+ export type CloudHistoryChatFork = { chatId: string }
+ /**
+  * Open a side chat beside a chat on the computer it runs on: a fork, read-only and hidden from
+  * chat lists, made from the chat's last saved turn even while a turn runs. Deleting it (or its
+  * parent) discards it. `chatId` is minted by the client and reused on a retry.
+  */
+-export type CloudHistorySideChat = { chatId: string }
++/** A harness whose running turn's session a side chat can be cut back from (history-store.ts `sideChatCut`). */
++export type SideChatCutHarness = 'claude-code' | 'codex'
++export type CloudHistorySideChat = {
++  chatId: string
++  /** The harnesses this Desktop can cut a running turn's session for at a finished turn (Claude Code:
++   *  `claudeRollback`; Codex: `codexForkBeforeTurn`), so a side chat of a chat running one opens
++   *  now. Absent or without the chat's harness: it waits for the turn to finish. */
++  cutAtTurn?: SideChatCutHarness[]
++}
++/** `GET chats/:id/side`: why opening a side chat would be refused right now, or null when it opens. */
++export type CloudHistorySideChatAvailability = { unavailable: string | null }
+ /** The ids of the turns a side chat copied from its parent start with this; its own turns' never
+  *  do (they are client-minted UUIDs). Its panel shows only its own. */
+ export const SIDE_CHAT_COPIED_RUN_PREFIX = 'side-'
+ export const isSideChatCopiedRun = (runId: string) => runId.startsWith(SIDE_CHAT_COPIED_RUN_PREFIX)
+ /**
+  * Roll a Freebuff chat back to before one of its messages: that run and every later one leave the
+  * conversation, and the agent forgets them. Files those turns changed are not restored.
+  */
+ export type CloudHistoryChatRollback = { runId: string }
+ export type CloudHistoryChatRolledBack = {
+   chat: CloudHistoryChat
+   /** `cut`: the agent's memory now ends before the message; `note`: it was told to disregard them. */
+   mode: 'cut' | 'note' | 'unchanged'
+ }
+ /**
+  * Last write wins: a project name has no revision to compare. `archived: true` archives the project
+  * and every chat in it; `archived: false` restores it with the chats it archived, while chats
+  * archived on their own stay archived. Nothing is deleted: files and chats are kept. `removed` is
+  * the name older clients send for `archived`.
+  */
+ export type CloudHistoryProjectUpdate = {
+   name?: string
+   archived?: boolean
+   /** @deprecated Older clients' name for `archived`. */
+   removed?: boolean
+@@ -276,50 +286,56 @@ export function createCloudHistoryClient(
+   return {
+     listProjects: (page: CloudHistoryOptions & CloudHistoryArchivedFilter = {}) =>
+       get<CloudHistoryPage<CloudHistoryProject>>('projects', page, undefined, undefined, undefined, 'GET', page.archived),
+     getProject: (projectId: string, signal?: AbortSignal) =>
+       get<CloudHistoryProject>(`projects/${id(projectId)}`, { signal }),
+     updateProject: (
+       projectId: string,
+       update: CloudHistoryProjectUpdate,
+       signal?: AbortSignal,
+     ) =>
+       get<CloudHistoryProject>(
+         `projects/${id(projectId)}`,
+         { signal },
+         undefined,
+         update,
+       ),
+     /** `archived`: the chats Settings > Archived lists, archived alone or with their project. */
+     listChats: (page: CloudHistoryOptions & CloudHistoryArchivedFilter & { projectId?: string; search?: string } = {}) =>
+       get<CloudHistoryPage<CloudHistoryChat>>('chats', page, page.projectId, undefined, page.search, 'GET', page.archived),
+     getChat: (chatId: string, signal?: AbortSignal) =>
+       get<CloudHistoryChat>(`chats/${id(chatId)}`, { signal }),
+     forkChat: (chatId: string, fork: CloudHistoryChatFork, signal?: AbortSignal) =>
+       get<CloudHistoryChat>(`chats/${id(chatId)}/fork`, { signal }, undefined, fork, undefined, 'POST'),
+     openSideChat: (chatId: string, side: CloudHistorySideChat, signal?: AbortSignal) =>
+       get<CloudHistoryChat>(`chats/${id(chatId)}/side`, { signal }, undefined, side, undefined, 'POST'),
++    /** Why opening a side chat of this chat would be refused right now, or null when it would open. */
++    sideChatAvailability: (chatId: string, cutAtTurn: readonly SideChatCutHarness[] | null, signal?: AbortSignal) =>
++      get<CloudHistorySideChatAvailability>(
++        `chats/${id(chatId)}/side${cutAtTurn?.length ? `?cutAtTurn=${cutAtTurn.join(',')}` : ''}`,
++        { signal },
++      ),
+     rollbackChat: (chatId: string, rollback: CloudHistoryChatRollback, signal?: AbortSignal) =>
+       get<CloudHistoryChatRolledBack>(`chats/${id(chatId)}/rollback`, { signal }, undefined, rollback, undefined, 'POST'),
+     getAttachment: (chatId: string, signal?: AbortSignal) =>
+       get<CloudHistoryAttachment>(`chats/${id(chatId)}/attachment`, { signal }),
+     updateChat: (
+       chatId: string,
+       update: CloudHistoryChatUpdate,
+       signal?: AbortSignal,
+     ) =>
+       get<CloudHistoryChat>(
+         `chats/${id(chatId)}`,
+         { signal },
+         undefined,
+         update,
+       ),
+     acknowledgeAttention: (
+       chatId: string,
+       throughRevision: number,
+       signal?: AbortSignal,
+     ) =>
+       get<CloudHistoryChat>(
+         `chats/${id(chatId)}/attention`,
+         { signal },
+         undefined,
+         { throughRevision },
+diff --git a/common/src/desktop-cloud/hosted-workspace.ts b/common/src/desktop-cloud/hosted-workspace.ts
+index 538e8cfc5..acfa5a6f8 100644
+--- a/common/src/desktop-cloud/hosted-workspace.ts
++++ b/common/src/desktop-cloud/hosted-workspace.ts
+@@ -291,50 +291,53 @@ export type HostedWorkspaceHost = {
+   setTheme?(
+     theme: 'dark' | 'light' | 'system',
+     titleBarColors?: { color: string; symbolColor: string },
+   ): Promise<void>
+   appearance?: {
+     snapshot(): Promise<{
+       accountId: string
+       installationId: string
+       preferences: unknown
+     }>
+     wallpaper(source: string): Promise<{ source: string }>
+   }
+ 
+   localConversations?: import('./local-conversations').LocalConversationsHost
+   /** This native build understands source-qualified legacy browser/terminal scopes. */
+   localHistoryPanels?: true
+   /** This native build branches a forked chat's Claude Code or Codex session (`forkSession` on
+    *  `harness_start`), so the sidebar offers Fork on its chats. Older builds omit it. */
+   chatFork?: true
+   /** This native build runs a side chat's turns read-only (`readOnly` on `harness_start`), so the
+    *  chat menu offers Side chat on its chats. Older builds omit it. */
+   sideChat?: true
+   /** This native build resumes a rolled-back Claude Code chat at its kept turn (`resumeSessionAt`
+    *  on `harness_start`), so Roll back and Edit are offered on its messages. Older builds omit it. */
+   claudeRollback?: true
++  /** This native build forks a Codex thread before a turn (`forkBeforeTurnId` on `harness_start`),
++   *  so a Codex chat's side chat opens while its turn runs. Older builds omit it. */
++  codexForkBeforeTurn?: true
+   files?: import('./hosted-files').HostedFilesHost
+   git?: import('./hosted-git').HostedGitHost
+   /** A local Claude Code chat's background tasks and subagents (`hosted-tasks.ts`). Older builds omit it. */
+   tasks?: import('./hosted-tasks').HostedTasksHost
+   /** Open a project's or chat's folder in an app on this computer. Older builds omit it. */
+   openIn?: import('./hosted-open-in').HostedOpenInHost
+   protocolVersion: typeof HOSTED_WORKSPACE_PROTOCOL_VERSION
+   platform: string
+   launchId?: string
+   appVersion: string
+   buildSha?: string
+   nativeProtocolVersion?: number
+   customTitleBar?: boolean
+   /** The native window stays hidden until the authenticated workspace has rendered. */
+   ready?(): Promise<void>
+   /** Discover native run locations or explicitly change a chat’s sandbox. */
+   runtime?(scope: {
+     projectId: string
+     threadId?: string
+     location?: 'local' | 'worktree' | 'cloud'
+     sourceBranch?: string
+     /** A new worktree chat's first message: titled to name the chat and its branch. Sent only
+      * when discovery answered `supportsWorktreeTitle`. */
+     prompt?: string
+   }): Promise<{
