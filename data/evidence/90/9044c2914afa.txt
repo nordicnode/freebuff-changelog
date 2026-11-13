@@ -1,0 +1,2039 @@
+Date: 2026-11-13T04:06:38Z
+Category: Core
+Areas: Shared/Core
+Commit nature: production
+Stats: +30 / -1
+Analysis notes: Shared/Core changes across 3 file(s) (+30/−1).
+Modified files: common/src/desktop-cloud/device-execution.ts, common/src/desktop-cloud/history.ts, common/src/desktop-cloud/hosted-workspace.ts
+Key facts (ground the WHY and DETAIL sentences in these): - A Codex turn id (`turn/started`), as a side chat forks its parent's thread before it. - With `forkSession`, a Codex side chat opened while its parent's turn ran: the branch keeps the thread up to before this turn (`thread/fork` `beforeTurnId`), so it holds no half-done turn. A Desktop without it refuses the request (the schema is strict), never forking the running turn in. - A harness whose running turn's session a side chat can be cut back from (history-store.ts `sideChatCut`). - The harnesses this Desktop can cut a running turn's session for at a finished turn (Claude Code: `claudeRollback`; Codex: `codexForkBeforeTurn`), so a side chat of a chat running one opens now. Absent or without the chat's harness: it waits for the turn to finish. - opening a side chat of this chat would be refused right now, or null when it would open. - This native build forks a Codex thread before a turn (`forkBeforeTurnId` on `harness_start`), so a Codex chat's side chat opens while its turn runs. Older builds omit it.
+Structured facts (extracted mechanically from the diff; copy names and values verbatim, never round or rename):
+- Constants newly defined: CODEX_TURN_ID = /^[a-zA-Z0-9_.:-]{1,128}$/ (a definition alone changes nothing at runtime; if the diff shows no reader, say it is in place and does nothing yet)
+- Exports added: CODEX_TURN_ID, SideChatCutHarness, CloudHistorySideChatAvailability
+Module & File Purpose (ground-truth documentation from touched files):
+- File `common/src/desktop-cloud/device-execution.ts`:
+```
+/** A Codex turn id (`turn/started`), as a side chat forks its parent's thread before it. */
+```
+- File `common/src/desktop-cloud/history.ts`:
+```
+/** Shared history and attachment contract for the Postgres-backed Cloud service. */
+```
+- File `common/src/desktop-cloud/hosted-workspace.ts`:
+```
+/** The hosted renderer receives selectors and capabilities, never native credentials. */
+```
+Complete Source of Modified Files (for complete module context):
+- File `common/src/desktop-cloud/device-execution.ts` (619 lines):
+```
+import { z } from 'zod/v4'
+import {
+  SPONSORED_WINDOWS_CONTAINMENT,
+  SPONSORED_WINDOWS_EXECUTION_SURFACE,
+} from '../ads/sponsored-windows'
+import { CLAUDE_TRANSCRIPT_ID } from './claude-turn-marks'
+
+/** A Codex turn id (`turn/started`), as a side chat forks its parent's thread before it. */
+export const CODEX_TURN_ID = /^[a-zA-Z0-9_.:-]{1,128}$/
+import { devicePanelOperation } from './device-panels'
+import { deviceGitHubRequest } from './device-github'
+import { deviceLocalMcpCallRequest } from './local-mcp'
+
+/** V1 stays read-only. V2 execution requires an explicit local opt-in. */
+export const DEVICE_EXECUTION_VERSION = 1
+export const DEVICE_READ_BYTES = 64 * 1024
+export const DEVICE_DIRECTORY_ENTRIES = 100
+export const DEVICE_OPERATION_MS = 25_000
+export const DEVICE_HEARTBEAT_MS = 10_000
+/**
+ * How long a folder's enrollment outlives its last heartbeat (server only: Desktop does not read
+ * it). Until then a turn reads it `reconnecting` and waits 45 s for it, not 15 s, and its stream
+ * reconnects without re-registering. Desktop's bridge gives up after five failed reconnects
+ * (~23 s) and then retries an approved folder every 30 s; at 60 s most of those retries came
+ * back to a `gone` session.
+ */
+export const DEVICE_SESSION_SECONDS = 180
+export const DEVICE_FRAME_BYTES = 512 * 1024
+export const DEVICE_EXEC_OUTPUT_BYTES = 16 * 1024 * 1024
+export const DEVICE_EXEC_FRAME_BYTES = 24 * 1024 * 1024
+export const DEVICE_EXEC_MS = 5 * 60_000
+/** How long Desktop's `request_elevation` card waits for the user to approve it (elevation.ts). */
+export const DEVICE_ELEVATION_APPROVAL_MS = 10 * 60_000
+/** How long an approved elevated command may run before Desktop gives up on it (elevation.ts). */
+export const DEVICE_ELEVATION_COMMAND_MS = 5 * 60_000
+/**
+ * A `request_elevation` operation's deadline: the approval window, then the command, plus a
+ * minute for delivery and the answer. Under DEVICE_EXEC_MS a user who took a few minutes to
+ * approve, or a command that ran a while, outlived the operation and Cloud refused Desktop's
+ * answer (`bridge` 504). Cloud applies a change at once and Desktop only with a release, so
+ * shortening either window leaves Cloud waiting less than installed builds take.
+ */
+export const DEVICE_ELEVATION_MS =
+  DEVICE_ELEVATION_APPROVAL_MS + DEVICE_ELEVATION_COMMAND_MS + 60_000
+export const deviceExecutionTarget = z
+  .object({
+    sessionId: z.string().uuid(),
+    bindingId: z.string().uuid(),
+  })
+  .strict()
+export type DeviceExecutionTarget = z.infer<typeof deviceExecutionTarget>
+export const deviceExecutionContext = z
+  .object({
+    platform: z.enum(['darwin', 'linux', 'win32']),
+    displayName: z.string().trim().min(1).max(200).optional(),
+    nativeTools: z.boolean().optional(),
+    panelProtocolVersion: z.literal(1).optional(),
+    nativeHarnesses: z.boolean().optional(),
+    concurrentHarnesses: z.literal(true).optional(),
+    /** Answers `move_export`: another of the account's computers can take over this folder's chats. */
+    deviceMove: z.literal(true).optional(),
+    /** Answers `agentic_offer_facts`: Cloud may ask the agentic offer route after this folder's turns. */
+    agenticOffers: z.literal(true).optional(),
+    /** Answers `sponsored_exec`: Cloud's sponsored agent may run its commands here, contained. */
+    sponsoredExec: z.literal(true).optional(),
+    /** Honours `scope.warmup`: a new Cloud chat's first turn runs here read-only while it moves (warmup.ts). */
+    readOnlyOpener: z.literal(true).optional(),
+    githubConnect: z.literal(true).optional(),
+    /** Answers `local_mcp_call` and publishes its local MCP servers (local-mcp.ts). Desktop's
+     * account-wide local MCP connection registers with only this; it is no folder's binding. */
+    localMcp: z.literal(true).optional(),
+    /** This install's earlier ids, from its own profile after Desktop restored an id a reset had
+     * replaced. A chat bound with one may move to this folder (web device-execution/rebind.ts). */
+    previousDeviceIds: z.array(z.string().uuid()).min(1).max(8).optional(),
+    cwd: z.string().min(1).max(4096),
+    rg: z.string().max(4096),
+  })
+  .strict()
+export const deviceExecRequest = z
+  .object({
+    method: z.literal('exec'),
+    command: z.string().min(1).max(200_000),
+    outputLimit: z.number().int().min(1).max(DEVICE_EXEC_OUTPUT_BYTES),
+  })
+  .strict()
+export const deviceExecResult = z
+  .object({
+    kind: z.literal('exec'),
+    stdout: z.string().max(DEVICE_EXEC_OUTPUT_BYTES),
+    stderr: z.string().max(DEVICE_EXEC_OUTPUT_BYTES),
+    statusCode: z.number().int(),
+  })
+  .strict()
+export const deviceIdSchema = z.string().uuid()
+export const deviceRelativePath = z
+  .string()
+  .min(1)
+  .max(1024)
+  .refine(
+    (path) =>
+      !path.startsWith('/') &&
+      !path.includes('\\') &&
+      !path.includes(':') &&
+      !path.includes('\0') &&
+      !path.split('/').some((part) => part === '..' || part.startsWith('.')),
+    'Use a workspace-relative path without hidden files or traversal',
+  )
+export const deviceReadRequest = z.discriminatedUnion('method', [
+  z
+    .object({ method: z.literal('read_file'), path: deviceRelativePath })
+    .strict(),
+  z
+    .object({
+      method: z.literal('list_directory'),
+      path: deviceRelativePath.optional(),
+    })
+    .strict(),
+])
+export type DeviceReadRequest = z.infer<typeof deviceReadRequest>
+export const deviceReadResult = z.discriminatedUnion('kind', [
+  z
+    .object({
+      kind: z.literal('file'),
+      text: z.string().max(DEVICE_READ_BYTES),
+      truncated: z.boolean(),
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal('directory'),
+      entries: z
+        .array(
+          z
+            .object({
+              name: z.string().max(1024),
+              kind: z.enum(['file', 'directory']),
+            })
+            .strict(),
+        )
+        .max(DEVICE_DIRECTORY_ENTRIES),
+      truncated: z.boolean(),
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal('error'),
+      code: z.enum(['unavailable', 'refused']),
+    })
+    .strict(),
+])
+export type DeviceReadResult = z.infer<typeof deviceReadResult>
+/**
+ * A turn review's native run (web `startDeviceTurnReview`): its own scope beside
+ * the turn it reviews, so the forked session never joins that turn's journal.
+ */
+export function deviceReviewRunId(runId: string) {
+  return `${runId}:review`
+}
+export const deviceToolScope = z
+  .object({
+    workspaceId: z.string().min(1).max(200),
+    runId: z.string().min(1).max(200),
+    mode: z.enum(['plan', 'build']),
+    referencedThreadIds: z
+      .array(z.string().min(1).max(120))
+      .max(100)
+      .optional(),
+    /**
+     * A Cloud chat's warm-up (warmup.ts): only tools that change nothing run, and the rest answer
+     * WARMUP_REFUSAL. Sent only to a device whose context has `readOnlyOpener`.
+     */
+    warmup: z.literal(true).optional(),
+  })
+  .strict()
+export const deviceToolRequest = z
+  .object({
+    method: z.literal('tool'),
+    scope: deviceToolScope,
+    name: z.string().min(1).max(200),
+    callId: z.string().min(1).max(200).optional(),
+    input: z.unknown(),
+  })
+  .strict()
+export const deviceManifestRequest = z
+  .object({
+    method: z.literal('manifest'),
+    scope: deviceToolScope,
+  })
+  .strict()
+/** A chat's Git state for another of the account's computers (docs/desktop/device-execution.md, "Moving a chat to another computer"). */
+export const deviceMoveExportRequest = z
+  .object({
+    method: z.literal('move_export'),
+    workspaceId: z.string().min(1).max(200),
+    /** Commits the receiving computer has; the bundle leaves out what they reach. */
+    have: z.array(z.string().regex(/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/)).max(256),
+  })
+  .strict()
+/** `move_export`'s value: the uploaded archive (a source upload), never the bytes. */
+export const deviceMoveExport = z
+  .object({
+    uploadId: z.string().uuid(),
+    sha256: z.string().regex(/^[a-f0-9]{64}$/),
+    bytes: z.number().int().positive(),
+  })
+  .strict()
+export type DeviceMoveExport = z.infer<typeof deviceMoveExport>
+export type DeviceMoveExportRequest = z.infer<typeof deviceMoveExportRequest>
+/**
+ * The folder's agentic offer facts, as Desktop sent them with its own offer request (capability,
+ * fit facts, OS); its value is read with `deviceAgenticOfferFactsSchema`. Read-only, never journaled.
+ */
+export const deviceAgenticOfferFactsRequest = z
+  .object({ method: z.literal('agentic_offer_facts') })
+  .strict()
+/**
+ * The funded Accept's Windows floor grant (COD-1335), relayed by Cloud: the
+ * only grant that selects the floor broker on a Windows computer
+ * (`sponsoredBrokerArm`). Absent on every macOS and Linux run.
+ */
+export const deviceSponsoredExecGrant = z
+  .object({
+    executionSurface: z.literal(SPONSORED_WINDOWS_EXECUTION_SURFACE),
+    containment: z.literal(SPONSORED_WINDOWS_CONTAINMENT),
+  })
+  .strict()
+export type DeviceSponsoredExecGrant = z.infer<typeof deviceSponsoredExecGrant>
+/**
+ * One command of an accepted sponsored run, run CONTAINED in the folder: the
+ * sponsored sandbox (sandbox-exec on macOS, bwrap on Linux), a private runtime
+ * directory for `runId` and read-only Git, never the plain `exec` shell. It has
+ * side effects, so it is journaled; its result is `deviceExecResult`'s shape.
+ *
+ * On Windows (COD-1335) there is no sandbox: the run's commands get the floor
+ * (PowerShell 5.1, a scrubbed environment, the private runtime directory)
+ * only with `grant`, and `timeoutSeconds` bounds the command's whole process
+ * tree on the computer (exit 124), since PowerShell has no `timeout`. Both
+ * ride only a floor run's request: an older Desktop parses this strictly.
+ */
+/**
+ * A Windows floor command's time limit when Cloud names none (COD-1335), and
+ * the one `cloud_sandbox_exec` names: under the device's own operation cap
+ * ({@link DEVICE_EXEC_MS}), so the computer ends the command's whole job and
+ * answers 124 before the operation itself times out. Without it, a command
+ * that backgrounds a process (a dev server, a watcher, `Start-Process`)
+ * would hold the Job Object owner, which waits for the whole job, until the cap.
+ */
+export const DEVICE_SPONSORED_FLOOR_TIMEOUT_SECONDS = 290
+export const deviceSponsoredExecRequest = z
+  .object({
+    method: z.literal('sponsored_exec'),
+    scope: deviceToolScope,
+    runId: z.string().uuid(),
+    command: z.string().min(1).max(200_000),
+    outputLimit: z.number().int().min(1).max(DEVICE_EXEC_OUTPUT_BYTES),
+    grant: deviceSponsoredExecGrant.optional(),
+    timeoutSeconds: z
+      .number()
+      .int()
+      .min(1)
+      .max(DEVICE_EXEC_MS / 1000)
+      .optional(),
+  })
+  .strict()
+export type DeviceSponsoredExecRequest = z.infer<typeof deviceSponsoredExecRequest>
+export const deviceToolFailure = z
+  .object({ kind: z.literal('tool_error'), message: z.string().max(4000) })
+  .strict()
+export const deviceProgress = z
+  .object({
+    id: deviceIdSchema,
+    sequence: z.number().int().positive(),
+    value: z.unknown(),
+  })
+  .strict()
+export const deviceReceiptRequest = z
+  .object({
+    method: z.literal('receipt'),
+    scope: deviceToolScope,
+    operationId: deviceIdSchema,
+    digest: z.string().regex(/^[a-f0-9]{64}$/),
+  })
+  .strict()
+export const deviceSteeringMessage = z
+  .object({ id: deviceIdSchema, prompt: z.string().min(1).max(200_000) })
+  .strict()
+export const deviceHarnessRequest = z.discriminatedUnion('method', [
+  z
+    .object({
+      method: z.literal('harness_steer'),
+      scope: deviceToolScope,
+      message: deviceSteeringMessage,
+    })
+    .strict(),
+  z
+    .object({
+      method: z.literal('harness_start'),
+      scope: deviceToolScope,
+      harness: z.enum(['codex', 'claude-code']),
+      prompt: z.string().min(1).max(200_000),
+      model: z.string().max(200),
+      effort: z
+        .enum(['minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'])
+        .optional(),
+      images: z
+        .array(
+          z.object({
+            data: z.string().max(16_000_000),
+            mediaType: z.string().max(100),
+          }),
+        )
+        .max(10)
+        .optional(),
+      previousState: z.unknown().optional(),
+      /** A completed runtime transfer must not resume a session from another machine. */
+      resetSession: z.boolean().optional(),
+      /**
+       * A forked chat's first turn: `previousState` is its source's session, which this turn
+       * branches into a new one instead of resuming. A Desktop without it refuses the request
+       * (the schema is strict), never resuming the source's session in two chats.
+       */
+      forkSession: z.literal(true).optional(),
+      /**
+       * With `forkSession`, after a Claude Code chat was rolled back (claude-turn-marks.ts): the
+       * branch keeps the session only up to this transcript entry. A Desktop without it refuses the
+       * request (the schema is strict), never resuming the turns the user rolled back.
+       */
+      resumeSessionAt: z.string().regex(CLAUDE_TRANSCRIPT_ID).optional(),
+      /**
+       * With `forkSession`, a Codex side chat opened while its parent's turn ran: the branch keeps
+       * the thread up to before this turn (`thread/fork` `beforeTurnId`), so it holds no half-done
+       * turn. A Desktop without it refuses the request (the schema is strict), never forking the
+       * running turn in.
+       */
+      forkBeforeTurnId: z.string().regex(CODEX_TURN_ID).optional(),
+      /**
+       * A side chat's turn (history-store.ts `openSideChat`): read-only, with no Freebuff tools,
+       * because its parent's agent is working in the same folder. A Desktop without it refuses
+       * the request (the schema is strict), never running a side chat with write access.
+       */
+      readOnly: z.literal(true).optional(),
+      importedHistory: z.string().max(20 * 1024 * 1024).optional(),
+      /** Quoted history used only when neither Cloud nor Desktop has a CLI session. */
+      initialPrompt: z.string().max(2 * 1024 * 1024).optional(),
+      documents: z
+        .array(
+          z
+            .object({
+              name: z.string().max(1024),
+              text: z.string().max(1_000_000),
+            })
+            .strict(),
+        )
+        .max(12)
+        .optional(),
+      injectAgentsMd: z.boolean().optional(),
+    })
+    .strict(),
+  z
+    .object({
+      method: z.literal('harness_answer'),
+      scope: deviceToolScope,
+      questionId: deviceIdSchema,
+      answer: z.unknown(),
+    })
+    .strict(),
+  z
+    .object({ method: z.literal('harness_status'), scope: deviceToolScope })
+    .strict(),
+  z
+    .object({
+      method: z.literal('harness_read'),
+      scope: deviceToolScope,
+      cursor: z.number().int().nonnegative(),
+    })
+    .strict(),
+  z
+    .object({ method: z.literal('harness_stop'), scope: deviceToolScope })
+    .strict(),
+])
+export const deviceHarnessPage = z
+  .object({
+    events: z.array(
+      z.object({
+        kind: z.string(),
+        payload: z.unknown(),
+        cursor: z.number().int().positive(),
+      }),
+    ),
+    cursor: z.number().int().nonnegative(),
+    done: z.boolean(),
+  })
+  .strict()
+
+/**
+ * The error a Freebuff turn on a computer fails with at its cap (web turn-limit.ts).
+ * A native Claude Code or Codex turn has no cap since 2026-11-08.
+ */
+export const DEVICE_HARNESS_TIME_LIMIT_MESSAGE =
+  'This turn reached the 120-minute limit for a turn running on your computer. Completed steps are saved; send a message to continue.'
+/** Journal `error` text Desktop builds from before 2026-11-08 write when a native turn reaches their 60-minute cap. */
+const LEGACY_DEVICE_HARNESS_TIME_LIMIT_MESSAGE =
+  'This turn reached the 60-minute limit for a turn running on your computer. Completed steps are saved; send a message to continue.'
+/** Journal `error` text when the native turn was stopped (`harness_stop`) before it finished. */
+export const DEVICE_HARNESS_STOPPED_MESSAGE =
+  'The turn running on your computer was stopped before it finished. Completed steps are saved; send a message to continue.'
+
+export type DeviceHarness = 'codex' | 'claude-code'
+const HARNESS_LABEL: Record<DeviceHarness, string> = {
+  codex: 'Codex',
+  'claude-code': 'Claude Code',
+}
+const HARNESS_ACCOUNT: Record<DeviceHarness, string> = {
+  codex: 'ChatGPT',
+  'claude-code': 'Claude',
+}
+const PICK_FREEBUFF = 'choose a Freebuff model from the model picker to keep going'
+
+/** Desktop's own copy for a turn it could not run, already worded for the
+ *  user (harness/claude-code.ts, codex-errors.ts, codex.ts). */
+const DESKTOP_WORDED = [
+  /^This agent runs your local (Claude Code|Codex CLI), which is signed out\./,
+  /^Your organization’s Claude Code policy disables autonomous permission mode\b/,
+  /^Freebuff stopped this turn after its Claude Code elevation guard failed\./,
+  /\. Update it to keep using this agent, or switch to another from the selector\.$/,
+]
+
+/** When the CLI says its plan's limit resets, as it printed it (the computer's own clock). */
+function limitReset(message: string): string | null {
+  const at =
+    /\btry again at ([^()\n]{1,60}?)\.?\s*$/i.exec(message) ??
+    /\bresets (?:at )?([^()\n·∙|]{1,40}?(?: \([^)\n]{1,40}\))?)\.?\s*(?:$|[·∙|])/i.exec(message)
+  return at?.[1]?.trim() || null
+}
+
+/**
+ * What to do when Desktop refuses a chat because its folder's identity no longer matches the chat's
+ * binding and no known input says why (Desktop's `bindingChangeAdvice` 'unknown'). The notice that
+ * shows it has Reconnect folder. Builds before this pointed at Settings > General > Diagnose, which
+ * the page no longer shows (#10015); the hosted page rewrites that sentence from them.
+ */
+export const CHECKOUT_RECONNECT_FIX =
+  'Choose Reconnect folder to connect it again, or start a new chat in this folder. This chat’s history is kept.'
+
+/** Added to a failed turn that started without its computer (web `cloudRunErrorMessage`): otherwise
+ * the user saw only the generic failure and could not tell the turn never had their files or
+ * terminal. The hosted Desktop page finds it in a failed turn's error to offer Reconnect and retry. */
+export const DEVICE_UNREACHABLE_RUN_NOTE =
+  'Your computer did not respond when this message started, so Freebuff had no access to its files or terminal. Check that Freebuff Desktop is open, then send the message again.'
+
+/**
+ * The user-facing message for a native turn's journal `error`, or null when it
+ * is not one we can name. Desktop builds before these messages existed wrote the
+ * SDK's own text for every abort ("Claude Code process aborted by user").
+ *
+ * The CLI runs on the user's computer with their own sign-in, so most failures
+ * are theirs to fix there: signed out, plan limit used up, a model their plan
+ * cannot use. Only fixed classes are named; the CLI's raw text never is (it can
+ * quote the request).
+ */
+export function deviceHarnessFailureMessage(
+  message: string,
+  harness?: DeviceHarness,
+): string | null {
+  if (
+    message === DEVICE_HARNESS_TIME_LIMIT_MESSAGE ||
+    message === LEGACY_DEVICE_HARNESS_TIME_LIMIT_MESSAGE ||
+    message === DEVICE_HARNESS_STOPPED_MESSAGE
+  )
+    return message
+  if (/process aborted by user/i.test(message))
+    return DEVICE_HARNESS_STOPPED_MESSAGE
+  if (message.length <= 1000 && DESKTOP_WORDED.some((pattern) => pattern.test(message)))
+    return message
+  if (!harness) return null
+  const label = HARNESS_LABEL[harness]
+  const account = HARNESS_ACCOUNT[harness]
+  if (
+    /\b(hit your (usage )?limit|usage limit reached|(5-hour|weekly|session) limit reached)\b/i.test(
+      message,
+    )
+  ) {
+    const reset = limitReset(message)
+    return `Your ${account} plan’s ${label} usage limit is used up${reset ? ` until ${reset}` : ''}. Wait for it to reset, or ${PICK_FREEBUFF}.`
+  }
+  const unsupported =
+    /The '([\w.:/-]{1,80})' model is not supported when using Codex with a ChatGPT account/.exec(
+      message,
+    )
+  if (unsupported)
+    return `Your ChatGPT plan can’t use ${unsupported[1]} in Codex. Choose another model from the model picker.`
+  if (/spend cap set by the owner of your workspace/i.test(message))
+    return `Your ${account} workspace’s spend cap for ${label} is used up. Ask a workspace owner to raise it, or ${PICK_FREEBUFF}.`
+  if (/\bworkspace is out of credits\b/i.test(message))
+    return `Your ${account} workspace is out of ${label} credits. Add credits there, or ${PICK_FREEBUFF}.`
+  if (/^Quota exceeded\. Check your plan and billing details|credit balance is too low/i.test(message))
+    return `The account ${label} signs in with on your computer is out of quota or credit. Check its plan and billing, or ${PICK_FREEBUFF}.`
+  if (new RegExp(`^Could not install ${label}\\b`).test(message))
+    return `Freebuff couldn’t install ${label} on your computer. Check that computer’s internet connection, then send your message again.`
+  return null
+}
+
+/** A native turn's failure that no class names: which CLI failed and where, never its raw text. */
+export function deviceHarnessUnnamedFailure(harness: DeviceHarness): string {
+  const label = HARNESS_LABEL[harness]
+  return `${label} stopped on your computer with an error. Completed steps are saved; send a message to try again. If it keeps happening, run \`${harness === 'codex' ? 'codex' : 'claude'}\` in a terminal on that computer to see why, or ${PICK_FREEBUFF}.`
+}
+export const deviceValueResult = z
+  .object({
+    kind: z.literal('value'),
+    value: z.unknown(),
+    changes: z.array(z.unknown()).max(2000).optional(),
+  })
+  .strict()
+export const deviceRequest = z.union([
+  deviceReadRequest,
+  deviceExecRequest,
+  deviceToolRequest,
+  deviceManifestRequest,
+  deviceHarnessRequest,
+  deviceReceiptRequest,
+  deviceMoveExportRequest,
+  deviceAgenticOfferFactsRequest,
+  deviceSponsoredExecRequest,
+  deviceGitHubRequest,
+  deviceLocalMcpCallRequest,
+])
+export const deviceResult = z.union([
+  deviceReadResult,
+  deviceExecResult,
+  deviceValueResult,
+  deviceToolFailure,
+])
+export type DeviceToolScope = z.infer<typeof deviceToolScope>
+export type DeviceRequest = z.infer<typeof deviceRequest>
+export type DeviceResult = z.infer<typeof deviceResult>
+/**
+ * How long a device operation may take: the server's deadline for a mutating one, from when it
+ * is posted, and Desktop's cap on its own work, from when it arrives. A read's server deadline
+ * is shorter (DEVICE_OPERATION_MS or the caller's `answerMs`).
+ */
+export function deviceOperationMs(request: DeviceRequest): number {
+  return request.method === 'tool' && request.name === 'request_elevation'
+    ? DEVICE_ELEVATION_MS
+    : DEVICE_EXEC_MS
+}
+export const deviceRegistration = z
+  .object({
+    protocolVersion: z.literal(DEVICE_EXECUTION_VERSION),
+    deviceId: deviceIdSchema,
+    bindingId: deviceIdSchema,
+  })
+  .strict()
+export const deviceExecutionRegistration = z
+  .object({
+    protocolVersion: z.literal(2),
+    deviceId: deviceIdSchema,
+    bindingId: deviceIdSchema,
+    context: deviceExecutionContext,
+  })
+  .strict()
+export const deviceNativeRegistration = deviceExecutionRegistration.extend({
+  protocolVersion: z.literal(3),
+  context: deviceExecutionContext.extend({ nativeTools: z.literal(true) }),
+})
+export const deviceSession = z
+  .object({
+    sessionId: deviceIdSchema,
+    token: z.string().min(32).max(128),
+  })
+  .strict()
+export type DeviceSession = z.infer<typeof deviceSession>
+export const deviceOperation = z
+  .object({
+    id: deviceIdSchema,
+    sessionId: deviceIdSchema,
+    bindingId: deviceIdSchema,
+    expiresAt: z.number().int(),
+    request: deviceRequest,
+  })
+  .strict()
+export type DeviceOperation = z.infer<typeof deviceOperation>
+export const deviceReply = z
+  .object({ id: deviceIdSchema, result: deviceResult })
+  .strict()
+export const deviceFrame = z.discriminatedUnion('type', [
+  z.object({ type: z.literal('panel'), operation: devicePanelOperation }).strict(),
+  z.object({ type: z.literal('cancel'), id: deviceIdSchema }).strict(),
+  z.object({ type: z.literal('ready') }).strict(),
+  z.object({ type: z.literal('heartbeat') }).strict(),
+  z
+    .object({ type: z.literal('operation'), operation: deviceOperation })
+    .strict(),
+])
+export const deviceCapabilities = z
+  .object({
+    deviceNames: z.literal(true).optional(),
+    enabled: z.boolean(),
+    protocolVersion: z.literal(DEVICE_EXECUTION_VERSION),
+    methods: z.array(z.enum(['read_file', 'list_directory'])),
+    executionProtocolVersion: z.literal(2).optional(),
+    nativeProtocolVersion: z.literal(3).optional(),
+    panelProtocolVersion: z.literal(1).optional(),
+    concurrentHarnesses: z.literal(true).optional(),
+    deviceMove: z.literal(true).optional(),
+    agenticOffers: z.literal(true).optional(),
+    sponsoredExec: z.literal(true).optional(),
+    readOnlyOpener: z.literal(true).optional(),
+    githubConnect: z.literal(true).optional(),
+    localMcp: z.literal(true).optional(),
+    previousDevices: z.literal(true).optional(),
+  })
+  .strict()
+
+/** Deterministic UUID-shaped identity from a SHA-256 digest; never a credential. */
+export function deviceIdentity(hex: string): string {
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-4${hex.slice(13, 16)}-a${hex.slice(17, 20)}-${hex.slice(20, 32)}`
+}
+```
+- File `common/src/desktop-cloud/history.ts` (356 lines):
+```
+/** Shared history and attachment contract for the Postgres-backed Cloud service. */
+export type CloudHistoryPage<T> = { items: T[]; nextCursor: string | null }
+export type CloudHistoryProject = {
+  /** A durable local target; absence means a hosted project. Never inferred from presence. */
+  deviceExecution?: import('./device-execution').DeviceExecutionTarget | null
+  id: string
+  name: string
+  createdAt: string
+  github?: import('./github').GitHubRepository | null
+  /** The starter selected at project creation; absent from older servers. */
+  template?: import('../templates/selected').SelectedTemplate | null
+  /**
+   * Created with files: its folder source carries an upload (a chosen folder, a template, a legacy
+   * copy). False for an empty or GitHub project; absent from older servers.
+   */
+  seeded?: boolean
+  /**
+   * When the user archived it, or null. Archiving archives its chats too; an archived project is
+   * left out of `listProjects` (Settings > Archived lists it) until it is restored or someone
+   * prompts in it again. Absent from older servers, which send only `removedAt`.
+   */
+  archivedAt?: string | null
+  /** @deprecated The same as `archivedAt`, under the name older clients read. */
+  removedAt?: string | null
+  /** Its chats, archived or not. Only `listProjects({ archived: true })` counts them. */
+  chatCount?: number
+  /**
+   * Which workspace the project belongs to (workspace-mode.ts). Set at creation; absent or null
+   * from older servers and for every project created before modes existed, both meaning Code.
+   */
+  mode?: import('./workspace-mode').WorkspaceMode | null
+}
+export type CloudHistoryRun = {
+  id: string
+  chatId: string
+  status: string
+  model: string | null
+  /** Claude Code or Codex ran this turn (`./agents`); absent for the Freebuff agent and older servers. */
+  agent?: import('./agents').CloudCliAgent | null
+  agentMode: 'plan' | 'build'
+  effort: string | null
+  promptPreview: string
+  createdAt: string
+  finishedAt: string | null
+  error: string | null
+  /** Since when this turn has been waiting for the computer it runs on to wake or reconnect;
+   * null when it is not. Absent from older servers. */
+  waitingForDeviceSince?: string | null
+  /** A queued turn's sibling chat running in the same folder, which it usually waits for;
+   * null when there is none. `title` is null for an untitled chat. Absent from older servers. */
+  waitingForChat?: { id: string; title: string | null } | null
+}
+/** A chat's `title` while it has neither a title nor a first run to name it (history-store.ts). */
+export const UNTITLED_CLOUD_CHAT_TITLE = 'Cloud chat'
+/** The same for a chat that runs on a computer (`deviceExecution`): created before its first send. */
+const UNTITLED_DEVICE_CHAT_TITLE = 'New chat'
+/** A listed chat named only by one of those placeholders: no title and no run yet. */
+export function isUntitledCloudChat(chat: Pick<CloudHistoryChat, 'title' | 'latestRun'>) {
+  return !chat.latestRun &&
+    (chat.title === UNTITLED_CLOUD_CHAT_TITLE || chat.title === UNTITLED_DEVICE_CHAT_TITLE)
+}
+export type CloudHistoryChat = {
+  deviceExecution?: import('./device-execution').DeviceExecutionTarget | null
+  mission?: import('./mission').CloudMission | null
+  /** The chat this one was forked from (the sidebar nests it there), or null. Absent from older servers. */
+  forkedFrom?: string | null
+  /**
+   * A side chat (`openSideChat`): the chat it was opened beside, or null for an ordinary chat.
+   * Side chats are left out of `listChats`. Absent from older servers.
+   */
+  sideOf?: string | null
+  id: string
+  projectId: string | null
+  title: string
+  archivedAt: string | null
+  /** Continue locally (COD-878): when the chat moved to a computer, or null. Absent from older servers. */
+  handedBackAt?: string | null
+  /** Cloud cannot bring this archived chat's files back, but Desktop can land their export. */
+  localRestoreRequired?: boolean
+  /**
+   * Cloud stopped this chat at a resource limit and refuses its every Cloud turn (`createRun`),
+   * so a client must not buy a session for one. Absent from older servers.
+   */
+  resourceLimited?: boolean
+  /**
+   * The project's latest checkpoint failed for being over the 4 GiB limit, so Cloud can neither
+   * archive it nor back up its newest changes; null once one succeeds. Every chat in the project
+   * carries it. Absent from older servers.
+   */
+  checkpointTooLarge?: import('./checkpoint-limit').CheckpointTooLarge | null
+  metadataRevision: number
+  phase: string
+  updatedAt: string
+  lastActiveAt: string
+  latestRun: CloudHistoryRun | null
+  /** The sidebar "finished" dot, shared by every device. Absent from older servers. */
+  attention?: CloudHistoryAttention
+  /**
+   * The chat's session claim, the attachment's `instanceId`: a Desktop purchase this chat
+   * holds names it as `holderInstanceId`. Empty when it has none. Absent from older servers.
+   */
+  instanceId?: string
+}
+/**
+ * Each settled run raises `revision`; opening the chat on any device acknowledges through it.
+ * Both only increase, so a stale read or a retried acknowledgement never undoes a newer one.
+ */
+export type CloudHistoryAttention = {
+  revision: number
+  acknowledgedRevision: number
+  reason: 'finished' | 'failed' | 'stopped' | null
+  at: string | null
+}
+export type CloudHistoryAttentionAck = { throughRevision: number }
+/** Attaching observes the existing session; it never admits or purchases one. */
+export type CloudHistoryAttachment = {
+  chat: CloudHistoryChat
+  instanceId: string
+  session: {
+    model: string
+    admittedAt: string
+    expiresAt: string | null
+  } | null
+  /**
+   * This claim bought an hour that is now over by the clock, so its next admission is refused
+   * (`purchase_claim_released`: claims are single-use). The composer starts a new claim before
+   * sending instead of learning it from that refusal. Absent: not ended, or an older server.
+   */
+  claimEnded?: true
+}
+export type CloudHistoryChatUpdate = {
+  expectedRevision: number
+  title?: string
+  archived?: boolean
+}
+/**
+ * Fork a chat on the computer it runs on: a new chat with its transcript, attachments and agent
+ * session, holding no Freebuff session of its own until it is sent to. `chatId` is the new chat's
+ * id, minted by the client and reused on a retry so the fork is created once.
+ */
+export type CloudHistoryChatFork = { chatId: string }
+/**
+ * Open a side chat beside a chat on the computer it runs on: a fork, read-only and hidden from
+ * chat lists, made from the chat's last saved turn even while a turn runs. Deleting it (or its
+ * parent) discards it. `chatId` is minted by the client and reused on a retry.
+ */
+/** A harness whose running turn's session a side chat can be cut back from (history-store.ts `sideChatCut`). */
+export type SideChatCutHarness = 'claude-code' | 'codex'
+export type CloudHistorySideChat = {
+  chatId: string
+  /** The harnesses this Desktop can cut a running turn's session for at a finished turn (Claude Code:
+   *  `claudeRollback`; Codex: `codexForkBeforeTurn`), so a side chat of a chat running one opens
+   *  now. Absent or without the chat's harness: it waits for the turn to finish. */
+  cutAtTurn?: SideChatCutHarness[]
+}
+/** `GET chats/:id/side`: why opening a side chat would be refused right now, or null when it opens. */
+export type CloudHistorySideChatAvailability = { unavailable: string | null }
+/** The ids of the turns a side chat copied from its parent start with this; its own turns' never
+ *  do (they are client-minted UUIDs). Its panel shows only its own. */
+export const SIDE_CHAT_COPIED_RUN_PREFIX = 'side-'
+export const isSideChatCopiedRun = (runId: string) => runId.startsWith(SIDE_CHAT_COPIED_RUN_PREFIX)
+/**
+ * Roll a Freebuff chat back to before one of its messages: that run and every later one leave the
+ * conversation, and the agent forgets them. Files those turns changed are not restored.
+ */
+export type CloudHistoryChatRollback = { runId: string }
+export type CloudHistoryChatRolledBack = {
+  chat: CloudHistoryChat
+  /** `cut`: the agent's memory now ends before the message; `note`: it was told to disregard them. */
+  mode: 'cut' | 'note' | 'unchanged'
+}
+/**
+ * Last write wins: a project name has no revision to compare. `archived: true` archives the project
+ * and every chat in it; `archived: false` restores it with the chats it archived, while chats
+ * archived on their own stay archived. Nothing is deleted: files and chats are kept. `removed` is
+ * the name older clients send for `archived`.
+ */
+export type CloudHistoryProjectUpdate = {
+  name?: string
+  archived?: boolean
+  /** @deprecated Older clients' name for `archived`. */
+  removed?: boolean
+}
+/** Archived listings: Settings > Archived. */
+export type CloudHistoryArchivedFilter = { archived?: boolean }
+/**
+ * A server-internal run event marking that the run's SDK traces are stored in
+ * R2 rather than as `trace` events. Never returned by the history API or the
+ * live poll.
+ */
+export const TRACES_IN_R2_KIND = 'traces_r2'
+export type CloudHistoryEvent = {
+  /** Decimal string: Postgres bigint IDs can exceed JavaScript's safe integer. */
+  id: string
+  runId: string
+  kind: string
+  payload: unknown
+  createdAt: string
+}
+export type CloudHistoryEvents = CloudHistoryPage<CloudHistoryEvent> & {
+  /** Resume after the last returned event, even when nextCursor is null. */
+  endCursor: string | null
+}
+export type CloudHistoryOptions = {
+  cursor?: string | null
+  limit?: number
+  signal?: AbortSignal
+}
+
+export class CloudHistoryError extends Error {
+  constructor(
+    readonly status: number,
+    message: string,
+  ) {
+    super(message)
+    this.name = 'CloudHistoryError'
+  }
+}
+
+/**
+ * Sent by every bearer client that can open a chat running on a computer
+ * (`deviceExecution`). Desktop 0.0.192 and older sent no such header and can
+ * only open hosted chats, so the chat list omits device chats for a direct
+ * bearer request without it (`web/src/server/desktop-cloud/history-api.ts`).
+ */
+export const CLOUD_HISTORY_DEVICE_CHATS_HEADER = 'x-freebuff-device-chats'
+
+const bearer = (token: string) => ({
+  Authorization: `Bearer ${token}`,
+  [CLOUD_HISTORY_DEVICE_CHATS_HEADER]: '1',
+})
+
+/** Cookie auth on the same origin, or the existing Desktop session bearer. */
+export function createCloudHistoryClient(
+  options: {
+    baseUrl?: string
+    getToken?: () => string | null | Promise<string | null>
+    fetch?: (url: string, init?: RequestInit) => Promise<Response>
+  } = {},
+) {
+  const base = (options.baseUrl ?? '/api/v1/cloud/history').replace(/\/$/, '')
+  async function get<T>(
+    path: string,
+    page: CloudHistoryOptions = {},
+    projectId?: string,
+    update?: CloudHistoryChatUpdate | CloudHistoryProjectUpdate | CloudHistoryChatFork | CloudHistoryChatRollback | CloudHistoryAttentionAck,
+    search?: string,
+    method: 'GET' | 'PATCH' | 'POST' = update ? 'PATCH' : 'GET',
+    archived?: boolean,
+  ): Promise<T> {
+    const query = new URLSearchParams()
+    if (search) query.set('search', search)
+    if (archived) query.set('archived', 'true')
+    if (page.cursor != null) query.set('cursor', page.cursor)
+    if (page.limit !== undefined) query.set('limit', String(page.limit))
+    if (projectId !== undefined) query.set('projectId', projectId)
+    const token = await options.getToken?.()
+    const res = await (options.fetch ?? fetch)(
+      `${base}/${path}${query.size ? `?${query}` : ''}`,
+      {
+        credentials: 'same-origin',
+        cache: 'no-store',
+        signal: page.signal,
+        method,
+        body: update ? JSON.stringify(update) : undefined,
+        headers: update
+          ? {
+              'Content-Type': 'application/json',
+              ...(token ? bearer(token) : {}),
+            }
+          : token
+            ? bearer(token)
+            : undefined,
+      },
+    )
+    if (!res.ok) {
+      const body = await res.json().catch(() => null)
+      throw new CloudHistoryError(
+        res.status,
+        body?.error ?? 'Cloud history unavailable',
+      )
+    }
+    return res.json() as Promise<T>
+  }
+  const id = encodeURIComponent
+  return {
+    listProjects: (page: CloudHistoryOptions & CloudHistoryArchivedFilter = {}) =>
+      get<CloudHistoryPage<CloudHistoryProject>>('projects', page, undefined, undefined, undefined, 'GET', page.archived),
+    getProject: (projectId: string, signal?: AbortSignal) =>
+      get<CloudHistoryProject>(`projects/${id(projectId)}`, { signal }),
+    updateProject: (
+      projectId: string,
+      update: CloudHistoryProjectUpdate,
+      signal?: AbortSignal,
+    ) =>
+      get<CloudHistoryProject>(
+        `projects/${id(projectId)}`,
+        { signal },
+        undefined,
+        update,
+      ),
+    /** `archived`: the chats Settings > Archived lists, archived alone or with their project. */
+    listChats: (page: CloudHistoryOptions & CloudHistoryArchivedFilter & { projectId?: string; search?: string } = {}) =>
+      get<CloudHistoryPage<CloudHistoryChat>>('chats', page, page.projectId, undefined, page.search, 'GET', page.archived),
+    getChat: (chatId: string, signal?: AbortSignal) =>
+      get<CloudHistoryChat>(`chats/${id(chatId)}`, { signal }),
+    forkChat: (chatId: string, fork: CloudHistoryChatFork, signal?: AbortSignal) =>
+      get<CloudHistoryChat>(`chats/${id(chatId)}/fork`, { signal }, undefined, fork, undefined, 'POST'),
+    openSideChat: (chatId: string, side: CloudHistorySideChat, signal?: AbortSignal) =>
+      get<CloudHistoryChat>(`chats/${id(chatId)}/side`, { signal }, undefined, side, undefined, 'POST'),
+    /** Why opening a side chat of this chat would be refused right now, or null when it would open. */
+    sideChatAvailability: (chatId: string, cutAtTurn: readonly SideChatCutHarness[] | null, signal?: AbortSignal) =>
+      get<CloudHistorySideChatAvailability>(
+        `chats/${id(chatId)}/side${cutAtTurn?.length ? `?cutAtTurn=${cutAtTurn.join(',')}` : ''}`,
+        { signal },
+      ),
+    rollbackChat: (chatId: string, rollback: CloudHistoryChatRollback, signal?: AbortSignal) =>
+      get<CloudHistoryChatRolledBack>(`chats/${id(chatId)}/rollback`, { signal }, undefined, rollback, undefined, 'POST'),
+    getAttachment: (chatId: string, signal?: AbortSignal) =>
+      get<CloudHistoryAttachment>(`chats/${id(chatId)}/attachment`, { signal }),
+    updateChat: (
+      chatId: string,
+      update: CloudHistoryChatUpdate,
+      signal?: AbortSignal,
+    ) =>
+      get<CloudHistoryChat>(
+        `chats/${id(chatId)}`,
+        { signal },
+        undefined,
+        update,
+      ),
+    acknowledgeAttention: (
+      chatId: string,
+      throughRevision: number,
+      signal?: AbortSignal,
+    ) =>
+      get<CloudHistoryChat>(
+        `chats/${id(chatId)}/attention`,
+        { signal },
+        undefined,
+        { throughRevision },
+      ),
+    listRuns: (chatId: string, page?: CloudHistoryOptions) =>
+      get<CloudHistoryPage<CloudHistoryRun>>(`chats/${id(chatId)}/runs`, page),
+    getRun: (runId: string, signal?: AbortSignal) =>
+      get<CloudHistoryRun>(`runs/${id(runId)}`, { signal }),
+    listEvents: (runId: string, page?: CloudHistoryOptions) =>
+      get<CloudHistoryEvents>(`runs/${id(runId)}/events`, page),
+    listTraces: (runId: string, page?: CloudHistoryOptions) =>
+      get<CloudHistoryEvents>(`runs/${id(runId)}/traces`, page),
+    /** Whether this account may use Freebuff Projects (admins and an allowlist). */
+    getProjectsAccess: (signal?: AbortSignal) =>
+      get<{ allowed: boolean }>('projects-access', { signal }),
+  }
+}
+```
+- File `common/src/desktop-cloud/hosted-workspace.ts` (464 lines):
+```
+import type {
+  HostedBrowserDataRequest,
+  HostedBrowserDataResponses,
+} from './browser-data'
+
+/** The hosted renderer receives selectors and capabilities, never native credentials. */
+export const HOSTED_WORKSPACE_PROTOCOL_VERSION = 1 as const
+export const HOSTED_WORKSPACE_API_ORIGIN =
+  'https://staging-2-api.freebuffweb.site'
+export const HOSTED_WORKSPACE_ORIGIN = 'https://staging-2-auth.freebuffweb.site'
+/** Exact reviewed pairs: a staging session must never cross into another environment. */
+export const HOSTED_WORKSPACE_ENVIRONMENTS = [
+  { apiOrigin: HOSTED_WORKSPACE_API_ORIGIN, authOrigin: HOSTED_WORKSPACE_ORIGIN },
+  { apiOrigin: 'https://staging-api.freebuff.com', authOrigin: 'https://staging-auth.freebuff.com' },
+  { apiOrigin: 'https://www.codebuff.com', authOrigin: 'https://freebuff.com' },
+] as const
+
+
+export type HostedRuntimeProgress = {
+  /** Absent from Desktops that only reported downloads: read it as `to-local`. */
+  direction?: 'to-local' | 'to-cloud'
+  phase: 'preparing' | 'downloading' | 'landing' | 'uploading' | 'starting'
+  /** Bytes moved so far, in either direction. */
+  receivedBytes: number
+  /** Null while unknown; an upload streams, so it never knows its total. */
+  totalBytes: number | null
+}
+
+/**
+ * What a `runtime` request asked for, as Desktop's `desktop.workspace_native` and the hosted
+ * page's `desktop.workspace_ipc` rows name it: `runtime:project` (a new chat's choices),
+ * `runtime:status` (a chat's), or `runtime:<location>` (a move).
+ */
+export function hostedRuntimeIpcOperation(input: unknown): string {
+  const scope = input && typeof input === 'object' ? (input as { threadId?: unknown; location?: unknown }) : {}
+  if (typeof scope.location === 'string' && ['local', 'worktree', 'cloud', 'remote'].includes(scope.location))
+    return `runtime:${scope.location}`
+  return scope.threadId ? 'runtime:status' : 'runtime:project'
+}
+
+export type HostedWorkspaceConnection = {
+  /** A per-chat checkout does not change the project’s default runtime. */
+  threadId?: string
+  projectId: string
+  projectName: string
+  sessionId: string
+  bindingId: string
+  phase: 'connecting' | 'connected' | 'reconnecting' | 'stopped'
+  executionEnabled: boolean
+}
+
+export type HostedWorkspaceStatus = {
+  deviceId?: string
+  /** Local installation receipt, not an account or browser preference. */
+  projectSetupCompleted?: boolean
+  accountId: string | null
+  enabled: boolean
+  connections: HostedWorkspaceConnection[]
+  /** Previously enrolled projects remain local while their computer is disconnected. */
+  localProjects?: Array<{
+    projectId: string
+    projectName: string
+    reconnectStatus?: 'connecting' | 'retrying' | 'needs-approval'
+    reconnectMessage?: string
+    /** Why Desktop's last automatic connect of this folder failed, while it keeps retrying (newer Desktop only). */
+    reconnectReason?: string
+    /** When Desktop next retries this folder on its own (epoch ms), while `retrying` (newer Desktop only). */
+    reconnectRetryAt?: number
+  }>
+}
+
+export type HostedWindowState = {
+  fullScreen: boolean
+  maximized: boolean
+  canGoBack: boolean
+  canGoForward: boolean
+}
+
+export type HostedBrowserScope = {
+  projectId: string
+  threadId: string
+  /** Legacy chats use native-issued selectors and never enter Cloud history. */
+  source?: 'local-history'
+}
+export type HostedBrowserViewSettings = {
+  zoom: number
+  colorScheme: 'system' | 'light' | 'dark'
+  viewport: { width: number; height: number } | null
+}
+export type HostedBrowserTab = {
+  id: string
+  url: string
+  title: string
+  loading: boolean
+  canGoBack: boolean
+  canGoForward: boolean
+  error?: string
+  profileId?: string
+  incognito?: boolean
+  zoom?: number
+  colorScheme?: HostedBrowserViewSettings['colorScheme']
+  viewport?: HostedBrowserViewSettings['viewport']
+  recording?: boolean
+  /** Agent requests to reveal its tab; monotonic within this native browser lifetime. */
+  reveal?: number
+}
+export type HostedBrowserSnapshot = {
+  tabs: HostedBrowserTab[]
+  activeTabId: string | null
+  profiles?: Array<{ id: string; name: string }>
+  defaults?: HostedBrowserViewSettings & { profileId: string }
+  history?: Array<{ url: string; title: string }>
+}
+export type HostedBrowserAction =
+  | { action: 'open'; url?: string; profileId?: string; incognito?: boolean }
+  | { action: 'close'; tabId: string }
+  | { action: 'select'; tabId: string }
+  | { action: 'navigate'; tabId: string; to: string }
+  | ({
+      action: 'configure'
+      tabId: string
+    } & Partial<HostedBrowserViewSettings>)
+  | { action: 'save-defaults'; tabId: string }
+  | { action: 'profile-add'; name: string }
+  | { action: 'profile-delete'; profileId: string }
+  | {
+      action: 'native'
+      tabId: string
+      command:
+        | 'stop'
+        | 'hardReload'
+        | 'devtools'
+        | 'clearCookies'
+        | 'clearCache'
+        | 'popout'
+        | 'recordingStart'
+        | 'recordingStop'
+        | 'recordingStatus'
+    }
+
+export type HostedBrowserLayout = HostedBrowserScope & {
+  tabId: string
+  /** CSS pixels in the hosted page; null detaches the view without stopping its agent. */
+  bounds: { x: number; y: number; width: number; height: number } | null
+  /** Scroll position within a fixed-size preview (CSS pixels). */
+  scroll?: { x: number; y: number }
+  /** Keep a still image under a web menu while the native view is detached. */
+  occluded?: boolean
+}
+
+export type HostedTerminalFrame =
+  | { type: 'ready'; generation: string; resumeSupported?: true }
+  | { type: 'data'; data: string }
+  | { type: 'replay-end' }
+  | { type: 'exit'; exitCode: number }
+  | { type: 'error'; message: string }
+
+/** Selectors only: the native broker supplies the account, directory and PTY scope. */
+export type HostedTerminalRequest = HostedBrowserScope & {
+  sessionId: string
+} & (
+    | { operation: 'attach'; cols?: number; rows?: number; resumeGeneration?: string }
+    | { operation: 'read'; viewerId: string }
+    | { operation: 'detach'; viewerId: string }
+    | { operation: 'input'; viewerId: string; generation: string; data: string }
+    | {
+        operation: 'resize'
+        viewerId: string
+        generation: string
+        cols: number
+        rows: number
+      }
+    | { operation: 'close' }
+  )
+export type HostedTerminalResponse = {
+  viewerId?: string
+  frames?: HostedTerminalFrame[]
+  closed?: boolean
+}
+
+export type HostedWorkspaceMenuCommand = 'new-tab' | 'close-tab' | 'reopen-tab' | 'open-project' | 'settings' | 'zoom-in' | 'zoom-out' | 'zoom-reset'
+
+export type HostedNativeAgent = {
+  harness: 'claude-code' | 'codex'
+  installed: boolean
+  signedIn?: boolean
+  pending?: boolean
+  needsUpdate?: boolean
+  canInstall: boolean
+  models: Array<{ id: string; label: string; tagline: string; efforts?: readonly ('minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra')[] }>
+}
+export type HostedNativeAgentsRequest = {
+  operation: 'status' | 'recheck' | 'install'
+  harness?: 'claude-code' | 'codex'
+}
+
+/** A folder Claude Code, Codex or Cursor worked in on this computer, as the page may see it: names
+ * and a window-scoped id, never a path. */
+export type HostedRecentProjectFolder = {
+  id: string
+  name: string
+  /** The containing folder's name, to tell two `web` folders apart. */
+  parentName: string
+  sources: Array<'claude-code' | 'codex' | 'cursor'>
+  lastActiveAt: string | null
+}
+
+/** Folder paths stay in Electron; the hosted form receives only a scoped selection receipt. */
+export type HostedLocalProjectInput = {
+  id: string
+  name: string
+  folderId?: string
+  templateId?: string
+}
+
+/** This computer's install id (as Cloud lists its devices) and its servers. */
+export type LocalMcpHostList = {
+  deviceId: string | null
+  servers: import('./local-mcp').LocalMcpServerView[]
+  /** Whether those servers reached the account's chats. Builds before 11-12 omit it. */
+  cloud?: import('./local-mcp').LocalMcpCloudStatus
+}
+
+export type HostedWorkspaceHost = {
+  /** Local branch names only; native resolves the enrolled folder and refuses unsafe switches. */
+  projectBranches?(input: { projectId: string; branch?: string }): Promise<{
+    current: string | null
+    branches: string[]
+    /** What a worktree with no starting branch fetches (`origin/main`); older builds omit it. */
+    defaultBranch?: string
+  } | null>
+  nativeAgents?(input: HostedNativeAgentsRequest): Promise<{ agents: HostedNativeAgent[] }>
+  /** Answers only a native-issued quit request; never grants a generic IPC capability. */
+  quit?: {
+    onRequest(listener: (id: number) => void): () => void
+    answer(id: number, accepted: boolean): void
+  }
+  /** Native owns the full approval prompt; commands and directories never enter hosted IPC. */
+  elevations?: {
+    review(): Promise<void>
+  }
+  /**
+   * Settings > General > Diagnose (freebuff-desktop/src/server/services/diagnose). Builds without
+   * it omit the key, and the page hides Diagnose. Repairs take only a handle a scan minted.
+   */
+  diagnostics?: {
+    run(options?: { deep?: boolean; includePaths?: boolean; includeChatTitles?: boolean }): Promise<import('../doctor/types').DoctorReport>
+    repair(input: { kind: import('../doctor/types').DoctorRepairKind; ref?: string }): Promise<import('../doctor/types').DoctorRepairResult>
+    undo(undoRef: string): Promise<import('../doctor/types').DoctorRepairResult>
+  }
+  /**
+   * Integrations > Custom: MCP servers on this computer (local-mcp.ts). Builds without it omit the
+   * key, and Integrations lists only the account's other computers' servers.
+   */
+  localMcp?: {
+    list(): Promise<LocalMcpHostList>
+    add(server: import('./local-mcp').LocalMcpAddInput): Promise<LocalMcpHostList>
+    remove(id: string): Promise<LocalMcpHostList>
+    setEnabled(id: string, enabled: boolean): Promise<LocalMcpHostList>
+  }
+  /** Mirrors cloud-managed local work for the native quit confirmation. */
+  activity?: {
+    report(busy: boolean): Promise<void>
+  }
+  /**
+   * The native updater (freebuff-desktop/electron/updater.cjs). While this
+   * window is the workspace, the local window that used to show update cards is
+   * hidden, so the page renders them. Subscribing tells native the page does;
+   * without a subscriber, native answers a menu check with its own dialogs.
+   */
+  updates?: {
+    pending(): Promise<import('./desktop-update').UpdateCard | null>
+    action(action: import('./desktop-update').UpdateAction): Promise<string>
+    check(): Promise<import('./desktop-update').UpdateCheckResult>
+    onCard(listener: (card: import('./desktop-update').UpdateCard | null) => void): () => void
+  }
+  /** Open a reviewed HTTP(S) authorization link in the system browser. */
+  openExternal?(url: string): Promise<void>
+  /** Text editing is restricted to this window and native's allowlisted commands. */
+  onTextContextMenu?: import('../types/text-menu').TextMenuBridge['onTextContextMenu']
+  textEdit?: import('../types/text-menu').TextMenuBridge['textEdit']
+  shortcuts?: {
+    setBindings(bindings: Record<string, string | null>): Promise<void>
+    setRecording(recording: boolean): Promise<void>
+    onCommand(listener: (command: HostedWorkspaceMenuCommand) => void): () => void
+  }
+  /**
+   * The window frame follows the account appearance this page paints: the preference, and on
+   * dark/light the title bar's palette colours (#rrggbb). Older Desktop builds omit it.
+   */
+  setTheme?(
+    theme: 'dark' | 'light' | 'system',
+    titleBarColors?: { color: string; symbolColor: string },
+  ): Promise<void>
+  appearance?: {
+    snapshot(): Promise<{
+      accountId: string
+      installationId: string
+      preferences: unknown
+    }>
+    wallpaper(source: string): Promise<{ source: string }>
+  }
+
+  localConversations?: import('./local-conversations').LocalConversationsHost
+  /** This native build understands source-qualified legacy browser/terminal scopes. */
+  localHistoryPanels?: true
+  /** This native build branches a forked chat's Claude Code or Codex session (`forkSession` on
+   *  `harness_start`), so the sidebar offers Fork on its chats. Older builds omit it. */
+  chatFork?: true
+  /** This native build runs a side chat's turns read-only (`readOnly` on `harness_start`), so the
+   *  chat menu offers Side chat on its chats. Older builds omit it. */
+  sideChat?: true
+  /** This native build resumes a rolled-back Claude Code chat at its kept turn (`resumeSessionAt`
+   *  on `harness_start`), so Roll back and Edit are offered on its messages. Older builds omit it. */
+  claudeRollback?: true
+  /** This native build forks a Codex thread before a turn (`forkBeforeTurnId` on `harness_start`),
+   *  so a Codex chat's side chat opens while its turn runs. Older builds omit it. */
+  codexForkBeforeTurn?: true
+  files?: import('./hosted-files').HostedFilesHost
+  git?: import('./hosted-git').HostedGitHost
+  /** A local Claude Code chat's background tasks and subagents (`hosted-tasks.ts`). Older builds omit it. */
+  tasks?: import('./hosted-tasks').HostedTasksHost
+  /** Open a project's or chat's folder in an app on this computer. Older builds omit it. */
+  openIn?: import('./hosted-open-in').HostedOpenInHost
+  protocolVersion: typeof HOSTED_WORKSPACE_PROTOCOL_VERSION
+  platform: string
+  launchId?: string
+  appVersion: string
+  buildSha?: string
+  nativeProtocolVersion?: number
+  customTitleBar?: boolean
+  /** The native window stays hidden until the authenticated workspace has rendered. */
+  ready?(): Promise<void>
+  /** Discover native run locations or explicitly change a chat’s sandbox. */
+  runtime?(scope: {
+    projectId: string
+    threadId?: string
+    location?: 'local' | 'worktree' | 'cloud'
+    sourceBranch?: string
+    /** A new worktree chat's first message: titled to name the chat and its branch. Sent only
+     * when discovery answered `supportsWorktreeTitle`. */
+    prompt?: string
+  }): Promise<{
+    /** `remote`: the chat runs on another of the account's computers, which is awake. */
+    location: 'local' | 'worktree' | 'cloud' | 'remote'
+    choices: Array<'local' | 'worktree' | 'cloud' | 'remote'>
+    /** After a move from another computer: the composer model to continue with, when the chat's
+     * harness is not on this one. */
+    model?: string
+    /** Shown grayed out, with why: `no-checkout`, this computer has no clone of the project's
+     * repository; `origin-unavailable`, the computer its folder is on does not answer; `origin-only`,
+     * only that computer can start it (Cloud, which it uploads); `cloud-only`, a new chat in a Cloud
+     * project with no folder on this computer (the page sets it: Local downloads an existing chat). */
+    unavailable?: Array<{
+      location: 'local' | 'worktree' | 'cloud' | 'remote'
+      reason: 'no-checkout' | 'origin-unavailable' | 'origin-only' | 'cloud-only'
+    }>
+    supportsWorktreeSourceBranch?: boolean
+    supportsWorktreeTitle?: boolean
+    /**
+     * A new chat's first turn may run read-only on this computer while the chat moves to Cloud
+     * (warmup.ts): the move tolerates that turn. Older builds omit it and need the move first.
+     */
+    supportsOpener?: boolean
+    worktreeSourceBranch?: string | null
+    progress?: HostedRuntimeProgress
+    /** Display-only metadata resolved by native code for the authenticated chat. */
+    workspace?: {
+      projectName: string
+      projectPath: string
+      directory: string
+      branch: string | null
+      worktree: boolean
+    }
+  }>
+  /** Sites for a chat running on this computer, read from its own checkout. Older builds omit it. */
+  sitesContext?(scope: { projectId: string; threadId: string }): Promise<
+    import('../sites/project-context').SiteCompatibility & {
+      /** Desktop's `Site` rows (freebuff-desktop/src/shared/sites.ts). */
+      sites: unknown[]
+    }
+  >
+  /** The Publish button for a chat running on this computer: builds its checkout, streams stages. */
+  sitesPublish?(
+    input: {
+      projectId: string
+      threadId: string
+      environment: 'preview' | 'production'
+      siteId?: string
+      name?: string
+    },
+    onEvent: (event: import('../sites/publish-events').SitePublishEvent) => void,
+  ): Promise<import('../sites/publish-events').SitePublishResult>
+  /** Persist a device-backed cloud chat before native panels or first-send placement. */
+  prepareLocalChat?(scope: HostedBrowserScope): Promise<HostedBrowserScope>
+  /** An archived device chat gives back its Desktop connection unless something still runs in it. */
+  releaseLocalChat?(scope: HostedBrowserScope): Promise<void>
+  terminal?: {
+    request(input: HostedTerminalRequest): Promise<HostedTerminalResponse>
+  }
+  window?: {
+    state(): Promise<HostedWindowState>
+    action(
+      action: 'minimize' | 'maximize' | 'close' | 'back' | 'forward',
+    ): Promise<void>
+    onState(listener: (state: HostedWindowState) => void): () => void
+  }
+  browser?: {
+    data?<T extends HostedBrowserDataRequest>(
+      input: HostedBrowserScope & { tabId: string; request: T },
+    ): Promise<HostedBrowserDataResponses[T['action']]>
+    snapshot(scope: HostedBrowserScope): Promise<HostedBrowserSnapshot>
+    action(
+      request: HostedBrowserScope & { action: HostedBrowserAction },
+    ): Promise<HostedBrowserSnapshot>
+    layout(request: HostedBrowserLayout): Promise<void | { image: string }>
+    onPan?(callback: (scope: HostedBrowserScope, tabId: string, delta: { x: number; y: number }) => void): () => void
+    onChanged?(
+      listener: (
+        scope: HostedBrowserScope,
+        snapshot: HostedBrowserSnapshot,
+      ) => void,
+    ): () => void
+    onFocusAddress?(
+      listener: (scope: HostedBrowserScope, tabId: string) => void,
+    ): () => void
+  }
+  /** Save first-project completion on this Desktop installation only. */
+  completeProjectSetup?(): Promise<void>
+  /** A selected project may connect its known local folder; no other folder is enrolled. */
+  status(projectId?: string, trigger?: 'startup' | 'project-selection' | 'automatic-retry' | 'manual-retry'): Promise<HostedWorkspaceStatus>
+  localProjects?: {
+    pickFolder(): Promise<{ id: string; name: string } | null>
+    create(input: HostedLocalProjectInput): Promise<HostedWorkspaceConnection>
+    /** Removing a project: this computer lets go of its folder for it, if it has one. `shared`:
+     * the folder had joined another computer's project, which stays (older builds omit it). */
+    forget?(input: { projectId: string }): Promise<{ shared: boolean } | null>
+    /** Newest first, at most eight; older builds omit both. Opening one enrolls it like the picker. */
+    recentFolders?(): Promise<HostedRecentProjectFolder[]>
+    openRecentFolder?(id: string): Promise<HostedWorkspaceConnection | null>
+  }
+  openLocalProject(): Promise<HostedWorkspaceConnection | null>
+  disconnect(sessionId: string): Promise<void>
+  /** Clears native credentials and the hosted browser session together. */
+  signOut?(): Promise<void>
+  returnToDesktop(): Promise<void>
+}
+
+/** Capability detection is presentation only; native IPC checks its sender/account. */
+export function hostedWorkspaceHost(
+  value: unknown,
+): HostedWorkspaceHost | null {
+  if (!value || typeof value !== 'object') return null
+  const host = value as Partial<HostedWorkspaceHost>
+  return host.protocolVersion === HOSTED_WORKSPACE_PROTOCOL_VERSION &&
+    typeof host.platform === 'string' &&
+    typeof host.appVersion === 'string' &&
+    ['status', 'openLocalProject', 'disconnect', 'returnToDesktop'].every(
+      (name) => typeof host[name as keyof HostedWorkspaceHost] === 'function',
+    )
+    ? (host as HostedWorkspaceHost)
+    : null
+}
+```
+Where the symbols this change introduces are used elsewhere, at this same revision (the code that reads them; this is evidence for the WHAT and the WHY, and it is the only source for who consumes this change):
+- File `cli/src/utils/chat-history.ts` (8 matching lines):
+```
+): ChatHistoryEntry[] {
+  try {
+    const chatsDir = getChatsDir(dataDir)
+
+    if (!fs.existsSync(chatsDir)) {
+      return []
+    }
+
+    const chatDirs = fs.readdirSync(chatsDir)
+
+    // First pass: get mtime for all chat directories (fast, no file reading)
+    const chatDirInfos: ChatDirInfo[] = []
+    for (const chatId of chatDirs) {
+      const chatPath = path.join(chatsDir, chatId)
+      try {
+        const stat = fs.statSync(chatPath)
+        if (!stat.isDirectory()) continue
+
+        chatDirInfos.push({
+          chatId,
+          chatPath,
+          messagesPath: path.join(chatPath, CHAT_MESSAGES_FILENAME),
+          mtime: stat.mtime,
+        })
+      } catch {
+        // Skip directories we can't stat
+      }
+    }
+
+    // Sort by mtime first (most recent first)
+    chatDirInfos.sort((a, b) => b.mtime.getTime() - a.mtime.getTime())
+```
+- File `cli/src/components/chat-history-screen.tsx` (5 matching lines):
+```
+const [statusMessage, setStatusMessage] = useState<string | null>(null)
+
+  // Load more chats in the background after initial render
+  useEffect(() => {
+    // Use setTimeout to defer the expensive loading to after first paint
+    const timer = setTimeout(() => {
+      setChats(getAllChats(LAYOUT.INITIAL_CHATS + LAYOUT.BACKGROUND_CHATS))
+    }, 0)
+    return () => clearTimeout(timer)
+  }, [])
+
+  const handleDeleteChat = useCallback((chatId: string) => {
+    const deleted = deleteChatSession(chatId)
+    if (deleted) {
+      setChats((prev) => prev.filter((chat) => chat.chatId !== chatId))
+      setStatusMessage('Chat deleted')
+      return
+    }
+
+    setStatusMessage('Could not delete chat')
+  }, [])
+
+  // Calculate available width for the prompt text (last column, variable width)
+  // Format: "[time]   [msgs]   [prompt...] [×]"
+  // reservedWidth accounts for: time col, msgs col, delete button area,
+  // 2 gaps between columns, list border (2), scrollbar (1), and button padding (2)
+  const reservedWidth =
+…
+} = useSearchableList({
+    items: chatItems,
+    filterFn: filterByPrompt,
+  })
+
+  const isCompactMode = terminalHeight < LAYOUT.COMPACT_MODE_THRESHOLD
+  const isNarrowWidth = terminalWidth < LAYOUT.NARROW_WIDTH_THRESHOLD
+
+  // No need to calculate listHeight - let flexbox handle it naturally
+
+  // Unreadable chats (corrupt chat-messages.json) can be deleted but not resumed
+  const unreadableChatIds = useMemo(
+    () => new Set(chats.filter((chat) => chat.unreadable).map((c) => c.chatId)),
+    [chats],
+  )
+
+  // Handle chat selection
+  const selectChat = useCallback(
+    (chatId: string) => {
+      if (unreadableChatIds.has(chatId)) {
+        setStatusMessage("Chat file is corrupted and can't be opened")
+        return
+      }
+      onSelectChat(chatId)
+    },
+```
+- File `cli/src/utils/__tests__/chat-history.test.ts` (5 matching lines):
+```
+info: () => {},
+    warn: () => {},
+    error: () => {},
+    fatal: () => {},
+  },
+}))
+
+import { deleteChatSession, getAllChats } from '../chat-history'
+
+let tempDataDir = ''
+
+function writeChat(chatId: string, prompt: string) {
+  const chatDir = path.join(tempDataDir, 'chats', chatId)
+  fs.mkdirSync(chatDir, { recursive: true })
+  fs.writeFileSync(
+    path.join(chatDir, 'chat-messages.json'),
+    JSON.stringify([
+      {
+        id: `${chatId}-message`,
+        variant: 'user',
+        content: prompt,
+        timestamp: new Date().toISOString(),
+        blocks: [],
+      },
+    ]),
+…
+fs.rmSync(tempDataDir, { recursive: true, force: true })
+  })
+
+  test('deleteChatSession removes a saved chat directory', () => {
+    writeChat('chat-a', 'hello from chat a')
+    writeChat('chat-b', 'hello from chat b')
+
+    expect(deleteChatSession('chat-a', tempDataDir)).toBe(true)
+
+    expect(fs.existsSync(path.join(tempDataDir, 'chats', 'chat-a'))).toBe(false)
+    expect(fs.existsSync(path.join(tempDataDir, 'chats', 'chat-b'))).toBe(true)
+    expect(
+      getAllChats(500, tempDataDir).map((chat) => chat.chatId),
+    ).toEqual(['chat-b'])
+  })
+
+  test('deleteChatSession rejects invalid chat ids', () => {
+    const outsideDir = path.join(tempDataDir, 'outside')
+    fs.mkdirSync(outsideDir, { recursive: true })
+
+    expect(deleteChatSession('../outside', tempDataDir)).toBe(false)
+    expect(deleteChatSession('..', tempDataDir)).toBe(false)
+
+    expect(fs.existsSync(outsideDir)).toBe(true)
+  })
+…
+writeChat('chat-good', 'hello from a healthy chat')
+
+    // Simulate a chat-messages.json truncated by a crash mid-write
+    const corruptDir = path.join(tempDataDir, 'chats', 'chat-corrupt')
+    fs.mkdirSync(corruptDir, { recursive: true })
+    fs.writeFileSync(
+      path.join(corruptDir, 'chat-messages.json'),
+      '[{"id":"msg-1","variant":"user","content":"truncat',
+    )
+
+    const chats = getAllChats(500, tempDataDir)
+
+    const good = chats.find((chat) => chat.chatId === 'chat-good')
+    expect(good).toBeDefined()
+    expect(good?.unreadable).toBeUndefined()
+    expect(good?.lastPrompt).toBe('hello from a healthy chat')
+
+    const corrupt = chats.find((chat) => chat.chatId === 'chat-corrupt')
+    expect(corrupt).toBeDefined()
+    expect(corrupt?.unreadable).toBe(true)
+    expect(corrupt?.lastPrompt).toBe('(unreadable chat)')
+  })
+
+  test('getAllChats lists non-array chat-messages.json as unreadable', () => {
+    const badDir = path.join(tempDataDir, 'chats', 'chat-not-array')
+```
+- File `cli/src/utils/run-state-storage.ts` (5 matching lines):
+```
+}
+  // Kept, not deleted: the user's transcript is in there, and a later fix or a
+  // support request can still get it back.
+  logger.warn(
+    { filePath, part, quarantine, ...detail },
+    'Damaged chat state moved aside; restoring what is left',
+  )
+  return { value: null, outcome: 'damaged' }
+}
+
+/**
+ * Load both RunState and ChatMessage[] from a specific chat directory or the most recent one.
+ * When chatId is provided, it is used to locate the chat directory; otherwise the most
+ * recently modified chat directory is used.
+ * Returns null if no previous chat exists or files can't be parsed.
+ */
+export function loadMostRecentChatState(
+  chatId?: string,
+): SavedChatState | null {
+  try {
+    let chatDir: string | null = chatDirOverride ?? null
+
+    if (!chatDir && chatId && chatId.trim().length > 0) {
+      const baseDir = path.join(getProjectDataDir(), 'chats')
+      const candidateDir = path.join(baseDir, chatId.trim())
+      if (
+        fs.existsSync(candidateDir) &&
+        fs.statSync(candidateDir).isDirectory()
+      ) {
+        chatDir = candidateDir
+      } else {
+        logger.debug(
+          { candidateDir, chatId },
+          'Requested chatId directory not found, falling back to most recent chat directory',
+        )
+      }
+    }
+```
+- File `cli/src/project-files.ts` (3 matching lines):
+```
+export function tryGetProjectRoot() {
+  return projectRoot
+}
+
+export function getCurrentChatId() {
+  if (!currentChatId) {
+    currentChatId = new Date().toISOString().replace(/:/g, '-')
+  }
+  return currentChatId
+}
+
+export function setCurrentChatId(chatId: string) {
+  currentChatId = chatId
+  return currentChatId
+}
+
+export function startNewChat() {
+  currentChatId = new Date().toISOString().replace(/:/g, '-')
+  return currentChatId
+}
+
+// Get the project-specific data directory
+export function getProjectDataDir(): string {
+  const root = getProjectRoot()
+  if (!root) {
+…
+return null
+    }
+
+    // Sort by modification time, most recent first
+    chatDirs.sort((a, b) => b.mtime.getTime() - a.mtime.getTime())
+    return chatDirs[0].fullPath
+  } catch {
+    return null
+  }
+}
+
+export function getCurrentChatDir(): string {
+  const chatId = getCurrentChatId()
+  const dir = path.join(getProjectDataDir(), 'chats', chatId)
+  ensureChatDirectory(dir)
+  return dir
+}
+```
+- File `cli/src/hooks/use-exit-handler.ts` (2 matching lines):
+```
+inputValue: string
+  setInputValue: (value: InputValue) => void
+}
+
+let exitHandlerRegistered = false
+
+function setupExitMessageHandler() {
+  if (exitHandlerRegistered) return
+  exitHandlerRegistered = true
+
+  process.on('exit', () => {
+    try {
+      const chatId = getCurrentChatId()
+      if (chatId) {
+        // This runs synchronously during the exit phase
+        // OpenTUI has already cleaned up by this point
+        const cliName = IS_FREEBUFF ? 'freebuff' : 'codebuff'
+        process.stdout.write(
+          `\nTo continue this session later, run:\n${cliName} --continue ${chatId}\n`,
+        )
+      }
+    } catch {
+      // Silent fail - don't block exit
+    }
+  })
+}
+```
+Diff (source hunks; lockfiles and pure test hunks omitted, except in a lockfile-only commit):
+```diff
+diff --git a/common/src/desktop-cloud/device-execution.ts b/common/src/desktop-cloud/device-execution.ts
+index 830c2d993..72b390f68 100644
+--- a/common/src/desktop-cloud/device-execution.ts
++++ b/common/src/desktop-cloud/device-execution.ts
+@@ -1,31 +1,34 @@
+ import { z } from 'zod/v4'
+ import {
+   SPONSORED_WINDOWS_CONTAINMENT,
+   SPONSORED_WINDOWS_EXECUTION_SURFACE,
+ } from '../ads/sponsored-windows'
+ import { CLAUDE_TRANSCRIPT_ID } from './claude-turn-marks'
++
++/** A Codex turn id (`turn/started`), as a side chat forks its parent's thread before it. */
++export const CODEX_TURN_ID = /^[a-zA-Z0-9_.:-]{1,128}$/
+ import { devicePanelOperation } from './device-panels'
+ import { deviceGitHubRequest } from './device-github'
+ import { deviceLocalMcpCallRequest } from './local-mcp'
+ 
+ /** V1 stays read-only. V2 execution requires an explicit local opt-in. */
+ export const DEVICE_EXECUTION_VERSION = 1
+ export const DEVICE_READ_BYTES = 64 * 1024
+ export const DEVICE_DIRECTORY_ENTRIES = 100
+ export const DEVICE_OPERATION_MS = 25_000
+ export const DEVICE_HEARTBEAT_MS = 10_000
+ /**
+  * How long a folder's enrollment outlives its last heartbeat (server only: Desktop does not read
+  * it). Until then a turn reads it `reconnecting` and waits 45 s for it, not 15 s, and its stream
+  * reconnects without re-registering. Desktop's bridge gives up after five failed reconnects
+  * (~23 s) and then retries an approved folder every 30 s; at 60 s most of those retries came
+  * back to a `gone` session.
+  */
+ export const DEVICE_SESSION_SECONDS = 180
+ export const DEVICE_FRAME_BYTES = 512 * 1024
+ export const DEVICE_EXEC_OUTPUT_BYTES = 16 * 1024 * 1024
+ export const DEVICE_EXEC_FRAME_BYTES = 24 * 1024 * 1024
+ export const DEVICE_EXEC_MS = 5 * 60_000
+ /** How long Desktop's `request_elevation` card waits for the user to approve it (elevation.ts). */
+ export const DEVICE_ELEVATION_APPROVAL_MS = 10 * 60_000
+ /** How long an approved elevated command may run before Desktop gives up on it (elevation.ts). */
+@@ -301,50 +304,57 @@ export const deviceHarnessRequest = z.discriminatedUnion('method', [
+         .optional(),
+       images: z
+         .array(
+           z.object({
+             data: z.string().max(16_000_000),
+             mediaType: z.string().max(100),
+           }),
+         )
+         .max(10)
+         .optional(),
+       previousState: z.unknown().optional(),
+       /** A completed runtime transfer must not resume a session from another machine. */
+       resetSession: z.boolean().optional(),
+       /**
+        * A forked chat's first turn: `previousState` is its source's session, which this turn
+        * branches into a new one instead of resuming. A Desktop without it refuses the request
+        * (the schema is strict), never resuming the source's session in two chats.
+        */
+       forkSession: z.literal(true).optional(),
+       /**
+        * With `forkSession`, after a Claude Code chat was rolled back (claude-turn-marks.ts): the
+        * branch keeps the session only up to this transcript entry. A Desktop without it refuses the
+        * request (the schema is strict), never resuming the turns the user rolled back.
+        */
+       resumeSessionAt: z.string().regex(CLAUDE_TRANSCRIPT_ID).optional(),
++      /**
++       * With `forkSession`, a Codex side chat opened while its parent's turn ran: the branch keeps
++       * the thread up to before this turn (`thread/fork` `beforeTurnId`), so it holds no half-done
++       * turn. A Desktop without it refuses the request (the schema is strict), never forking the
++       * running turn in.
++       */
++      forkBeforeTurnId: z.string().regex(CODEX_TURN_ID).optional(),
+       /**
+        * A side chat's turn (history-store.ts `openSideChat`): read-only, with no Freebuff tools,
+        * because its parent's agent is working in the same folder. A Desktop without it refuses
+        * the request (the schema is strict), never running a side chat with write access.
+        */
+       readOnly: z.literal(true).optional(),
+       importedHistory: z.string().max(20 * 1024 * 1024).optional(),
+       /** Quoted history used only when neither Cloud nor Desktop has a CLI session. */
+       initialPrompt: z.string().max(2 * 1024 * 1024).optional(),
+       documents: z
+         .array(
+           z
+             .object({
+               name: z.string().max(1024),
+               text: z.string().max(1_000_000),
+             })
+             .strict(),
+         )
+         .max(12)
+         .optional(),
+       injectAgentsMd: z.boolean().optional(),
+     })
+     .strict(),
+   z
+     .object({
+diff --git a/common/src/desktop-cloud/history.ts b/common/src/desktop-cloud/history.ts
+index a59c25769..3e024be13 100644
+--- a/common/src/desktop-cloud/history.ts
++++ b/common/src/desktop-cloud/history.ts
+@@ -122,51 +122,61 @@ export type CloudHistoryAttachment = {
+     expiresAt: string | null
+   } | null
+   /**
+    * This claim bought an hour that is now over by the clock, so its next admission is refused
+    * (`purchase_claim_released`: claims are single-use). The composer starts a new claim before
+    * sending instead of learning it from that refusal. Absent: not ended, or an older server.
+    */
+   claimEnded?: true
+ }
+ export type CloudHistoryChatUpdate = {
+   expectedRevision: number
+   title?: string
+   archived?: boolean
+ }
+ /**
+  * Fork a chat on the computer it runs on: a new chat with its transcript, attachments and agent
+  * session, holding no Freebuff session of its own until it is sent to. `chatId` is the new chat's
+  * id, minted by the client and reused on a retry so the fork is created once.
+  */
+ export type CloudHistoryChatFork = { chatId: string }
+ /**
+  * Open a side chat beside a chat on the computer it runs on: a fork, read-only and hidden from
+  * chat lists, made from the chat's last saved turn even while a turn runs. Deleting it (or its
+  * parent) discards it. `chatId` is minted by the client and reused on a retry.
+  */
+-export type CloudHistorySideChat = { chatId: string }
++/** A harness whose running turn's session a side chat can be cut back from (history-store.ts `sideChatCut`). */
++export type SideChatCutHarness = 'claude-code' | 'codex'
++export type CloudHistorySideChat = {
++  chatId: string
++  /** The harnesses this Desktop can cut a running turn's session for at a finished turn (Claude Code:
++   *  `claudeRollback`; Codex: `codexForkBeforeTurn`), so a side chat of a chat running one opens
++   *  now. Absent or without the chat's harness: it waits for the turn to finish. */
++  cutAtTurn?: SideChatCutHarness[]
++}
++/** `GET chats/:id/side`: why opening a side chat would be refused right now, or null when it opens. */
++export type CloudHistorySideChatAvailability = { unavailable: string | null }
+ /** The ids of the turns a side chat copied from its parent start with this; its own turns' never
+  *  do (they are client-minted UUIDs). Its panel shows only its own. */
+ export const SIDE_CHAT_COPIED_RUN_PREFIX = 'side-'
+ export const isSideChatCopiedRun = (runId: string) => runId.startsWith(SIDE_CHAT_COPIED_RUN_PREFIX)
+ /**
+  * Roll a Freebuff chat back to before one of its messages: that run and every later one leave the
+  * conversation, and the agent forgets them. Files those turns changed are not restored.
+  */
+ export type CloudHistoryChatRollback = { runId: string }
+ export type CloudHistoryChatRolledBack = {
+   chat: CloudHistoryChat
+   /** `cut`: the agent's memory now ends before the message; `note`: it was told to disregard them. */
+   mode: 'cut' | 'note' | 'unchanged'
+ }
+ /**
+  * Last write wins: a project name has no revision to compare. `archived: true` archives the project
+  * and every chat in it; `archived: false` restores it with the chats it archived, while chats
+  * archived on their own stay archived. Nothing is deleted: files and chats are kept. `removed` is
+  * the name older clients send for `archived`.
+  */
+ export type CloudHistoryProjectUpdate = {
+   name?: string
+   archived?: boolean
+   /** @deprecated Older clients' name for `archived`. */
+   removed?: boolean
+@@ -276,50 +286,56 @@ export function createCloudHistoryClient(
+   return {
+     listProjects: (page: CloudHistoryOptions & CloudHistoryArchivedFilter = {}) =>
+       get<CloudHistoryPage<CloudHistoryProject>>('projects', page, undefined, undefined, undefined, 'GET', page.archived),
+     getProject: (projectId: string, signal?: AbortSignal) =>
+       get<CloudHistoryProject>(`projects/${id(projectId)}`, { signal }),
+     updateProject: (
+       projectId: string,
+       update: CloudHistoryProjectUpdate,
+       signal?: AbortSignal,
+     ) =>
+       get<CloudHistoryProject>(
+         `projects/${id(projectId)}`,
+         { signal },
+         undefined,
+         update,
+       ),
+     /** `archived`: the chats Settings > Archived lists, archived alone or with their project. */
+     listChats: (page: CloudHistoryOptions & CloudHistoryArchivedFilter & { projectId?: string; search?: string } = {}) =>
+       get<CloudHistoryPage<CloudHistoryChat>>('chats', page, page.projectId, undefined, page.search, 'GET', page.archived),
+     getChat: (chatId: string, signal?: AbortSignal) =>
+       get<CloudHistoryChat>(`chats/${id(chatId)}`, { signal }),
+     forkChat: (chatId: string, fork: CloudHistoryChatFork, signal?: AbortSignal) =>
+       get<CloudHistoryChat>(`chats/${id(chatId)}/fork`, { signal }, undefined, fork, undefined, 'POST'),
+     openSideChat: (chatId: string, side: CloudHistorySideChat, signal?: AbortSignal) =>
+       get<CloudHistoryChat>(`chats/${id(chatId)}/side`, { signal }, undefined, side, undefined, 'POST'),
++    /** Why opening a side chat of this chat would be refused right now, or null when it would open. */
++    sideChatAvailability: (chatId: string, cutAtTurn: readonly SideChatCutHarness[] | null, signal?: AbortSignal) =>
++      get<CloudHistorySideChatAvailability>(
++        `chats/${id(chatId)}/side${cutAtTurn?.length ? `?cutAtTurn=${cutAtTurn.join(',')}` : ''}`,
++        { signal },
++      ),
+     rollbackChat: (chatId: string, rollback: CloudHistoryChatRollback, signal?: AbortSignal) =>
+       get<CloudHistoryChatRolledBack>(`chats/${id(chatId)}/rollback`, { signal }, undefined, rollback, undefined, 'POST'),
+     getAttachment: (chatId: string, signal?: AbortSignal) =>
+       get<CloudHistoryAttachment>(`chats/${id(chatId)}/attachment`, { signal }),
+     updateChat: (
+       chatId: string,
+       update: CloudHistoryChatUpdate,
+       signal?: AbortSignal,
+     ) =>
+       get<CloudHistoryChat>(
+         `chats/${id(chatId)}`,
+         { signal },
+         undefined,
+         update,
+       ),
+     acknowledgeAttention: (
+       chatId: string,
+       throughRevision: number,
+       signal?: AbortSignal,
+     ) =>
+       get<CloudHistoryChat>(
+         `chats/${id(chatId)}/attention`,
+         { signal },
+         undefined,
+         { throughRevision },
+diff --git a/common/src/desktop-cloud/hosted-workspace.ts b/common/src/desktop-cloud/hosted-workspace.ts
+index 538e8cfc5..acfa5a6f8 100644
+--- a/common/src/desktop-cloud/hosted-workspace.ts
++++ b/common/src/desktop-cloud/hosted-workspace.ts
+@@ -291,50 +291,53 @@ export type HostedWorkspaceHost = {
+   setTheme?(
+     theme: 'dark' | 'light' | 'system',
+     titleBarColors?: { color: string; symbolColor: string },
+   ): Promise<void>
+   appearance?: {
+     snapshot(): Promise<{
+       accountId: string
+       installationId: string
+       preferences: unknown
+     }>
+     wallpaper(source: string): Promise<{ source: string }>
+   }
+ 
+   localConversations?: import('./local-conversations').LocalConversationsHost
+   /** This native build understands source-qualified legacy browser/terminal scopes. */
+   localHistoryPanels?: true
+   /** This native build branches a forked chat's Claude Code or Codex session (`forkSession` on
+    *  `harness_start`), so the sidebar offers Fork on its chats. Older builds omit it. */
+   chatFork?: true
+   /** This native build runs a side chat's turns read-only (`readOnly` on `harness_start`), so the
+    *  chat menu offers Side chat on its chats. Older builds omit it. */
+   sideChat?: true
+   /** This native build resumes a rolled-back Claude Code chat at its kept turn (`resumeSessionAt`
+    *  on `harness_start`), so Roll back and Edit are offered on its messages. Older builds omit it. */
+   claudeRollback?: true
++  /** This native build forks a Codex thread before a turn (`forkBeforeTurnId` on `harness_start`),
++   *  so a Codex chat's side chat opens while its turn runs. Older builds omit it. */
++  codexForkBeforeTurn?: true
+   files?: import('./hosted-files').HostedFilesHost
+   git?: import('./hosted-git').HostedGitHost
+   /** A local Claude Code chat's background tasks and subagents (`hosted-tasks.ts`). Older builds omit it. */
+   tasks?: import('./hosted-tasks').HostedTasksHost
+   /** Open a project's or chat's folder in an app on this computer. Older builds omit it. */
+   openIn?: import('./hosted-open-in').HostedOpenInHost
+   protocolVersion: typeof HOSTED_WORKSPACE_PROTOCOL_VERSION
+   platform: string
+   launchId?: string
+   appVersion: string
+   buildSha?: string
+   nativeProtocolVersion?: number
+   customTitleBar?: boolean
+   /** The native window stays hidden until the authenticated workspace has rendered. */
+   ready?(): Promise<void>
+   /** Discover native run locations or explicitly change a chat’s sandbox. */
+   runtime?(scope: {
+     projectId: string
+     threadId?: string
+     location?: 'local' | 'worktree' | 'cloud'
+     sourceBranch?: string
+     /** A new worktree chat's first message: titled to name the chat and its branch. Sent only
+      * when discovery answered `supportsWorktreeTitle`. */
+     prompt?: string
+   }): Promise<{
+
+```
