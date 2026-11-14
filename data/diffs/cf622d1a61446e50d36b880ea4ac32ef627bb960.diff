@@ -1,0 +1,125 @@
+diff --git a/common/src/desktop-bundle-feed.test.ts b/common/src/desktop-bundle-feed.test.ts
+new file mode 100644
+index 000000000..a918e8c99
+--- /dev/null
++++ b/common/src/desktop-bundle-feed.test.ts
+@@ -0,0 +1,55 @@
++import { describe, expect, test } from 'bun:test'
++
++import {
++  DESKTOP_BUNDLE_VERSION_PATTERN,
++  desktopBundleFeedSchema,
++  desktopBundleRolloutBucket,
++} from './desktop-bundle-feed'
++
++describe('desktopBundleRolloutBucket', () => {
++  test('is fixed per install and version, in [0, 100), and spread evenly', () => {
++    expect(desktopBundleRolloutBucket('anon_abc', '0.0.205-b1')).toBe(desktopBundleRolloutBucket('anon_abc', '0.0.205-b1'))
++    const buckets = Array.from({ length: 10_000 }, (_, i) => desktopBundleRolloutBucket(`anon_${i}`, '0.0.205-b1'))
++    expect(buckets.every((b) => b >= 0 && b < 100)).toBe(true)
++    const underTen = buckets.filter((b) => b < 10).length
++    expect(underTen).toBeGreaterThan(850)
++    expect(underTen).toBeLessThan(1150)
++  })
++
++  test('each version draws its own first installs', () => {
++    const ids = Array.from({ length: 2_000 }, (_, i) => `anon_${i}`)
++    const first = new Set(ids.filter((id) => desktopBundleRolloutBucket(id, '0.0.205-b1') < 5))
++    const next = ids.filter((id) => desktopBundleRolloutBucket(id, '0.0.205-b2') < 5)
++    expect(next.filter((id) => first.has(id)).length).toBeLessThan(next.length / 2)
++  })
++})
++
++describe('desktopBundleFeedSchema', () => {
++  const current = { version: '0.0.205-b1', shellAbi: 1, rolloutPercent: 10, manifest: 'bQ==', signature: 'cw==' }
++
++  test('fills the optional lists and accepts a feed with nothing current', () => {
++    expect(desktopBundleFeedSchema.parse({ format: 1, current })).toEqual({
++      format: 1,
++      current: { ...current, installIds: [] },
++      revoked: [],
++    })
++    expect(desktopBundleFeedSchema.parse({ format: 1, current: null, revoked: ['0.0.204-b3'] }).revoked).toEqual(['0.0.204-b3'])
++  })
++
++  test('refuses what a client would refuse or could not use', () => {
++    const bad = [
++      { format: 2, current: null },
++      { format: 1, current: { ...current, version: '../x' } },
++      { format: 1, current: { ...current, rolloutPercent: 101 } },
++      { format: 1, current: { ...current, shellAbi: 1.5 } },
++      { format: 1, current: { ...current, manifest: '' } },
++      { format: 1, current: null, revoked: ['not a version!'] },
++    ]
++    for (const feed of bad) expect(desktopBundleFeedSchema.safeParse(feed).success).toBe(false)
++  })
++
++  test('the version pattern is the client one', () => {
++    // freebuff-desktop/electron/orchestrator-bundle.cjs VERSION_PATTERN
++    expect(DESKTOP_BUNDLE_VERSION_PATTERN.source).toBe('^[0-9A-Za-z][0-9A-Za-z.+_-]{0,63}$')
++  })
++})
+diff --git a/common/src/desktop-bundle-feed.ts b/common/src/desktop-bundle-feed.ts
+new file mode 100644
+index 000000000..0f016e179
+--- /dev/null
++++ b/common/src/desktop-bundle-feed.ts
+@@ -0,0 +1,58 @@
++import { createHash } from 'node:crypto'
++
++import { z } from 'zod/v4'
++
++/**
++ * `latest.json` in an environment's Desktop bundle bucket (infra/aws-storage cdn.tf): what the
++ * bundle publish workflow writes and the feed route (web/src/app/api/desktop/orchestrator-bundles)
++ * reads through CloudFront. docs/desktop/hot-bundles.md describes the whole flow.
++ *
++ * The feed only routes: it never verifies `manifest` or `signature`. Desktop does, against the keys
++ * it ships with, so a wrong file here can at worst offer a bundle every client refuses.
++ */
++
++/** Same shape as orchestrator-bundle.cjs VERSION_PATTERN, so the feed never offers a version a client rejects. */
++export const DESKTOP_BUNDLE_VERSION_PATTERN = /^[0-9A-Za-z][0-9A-Za-z.+_-]{0,63}$/
++
++const version = z.string().regex(DESKTOP_BUNDLE_VERSION_PATTERN)
++
++export const desktopBundleFeedSchema = z.object({
++  format: z.literal(1),
++  /** The bundle on offer, or null to offer nothing (the revoked list still reaches clients). */
++  current: z
++    .object({
++      version,
++      /** ORCHESTRATOR_SHELL_ABI it was built for: only a shell asking with the same value is offered it. */
++      shellAbi: z.number().int().nonnegative(),
++      /** 0-100. Installs are bucketed by `desktopBundleRolloutBucket`, so a ramp only adds installs. */
++      rolloutPercent: z.number().min(0).max(100),
++      /** Installs offered it whatever the percentage: internal machines first, the staging test. */
++      installIds: z.array(z.string().min(1).max(128)).max(200).default([]),
++      /** manifest.json, base64: the exact bytes the signature covers. */
++      manifest: z.string().min(1),
++      /** manifest.sig, base64. */
++      signature: z.string().min(1),
++    })
++    .nullable(),
++  /** Versions every client drops and never installs again, offered or not (the kill switch). */
++  revoked: z.array(version).max(500).default([]),
++})
++
++export type DesktopBundleFeed = z.infer<typeof desktopBundleFeedSchema>
++
++/**
++ * An install's place in [0, 100) for one version. Salted with the version, so each bundle's first
++ * 1% is a different 1%, and fixed for that version, so raising the percentage only ever adds
++ * installs: one inside at 10% is still inside at 20%.
++ */
++export function desktopBundleRolloutBucket(installId: string, bundleVersion: string): number {
++  const digest = createHash('sha256').update(`${bundleVersion}\n${installId}`).digest()
++  return (digest.readUInt32BE(0) / 0x1_0000_0000) * 100
++}
++
++/** The S3 key, under the bucket or its CloudFront origin, of a version's files. */
++export function desktopBundleFilesPrefix(bundleVersion: string): string {
++  return `bundles/${bundleVersion}/`
++}
++
++export const DESKTOP_BUNDLE_FEED_KEY = 'latest.json'
