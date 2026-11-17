@@ -1,0 +1,248 @@
+diff --git a/sdk/src/impl/__tests__/free-mode-rate-limit-no-retry.test.ts b/sdk/src/impl/__tests__/free-mode-rate-limit-no-retry.test.ts
+index 81eaacb68..a70e93b79 100644
+--- a/sdk/src/impl/__tests__/free-mode-rate-limit-no-retry.test.ts
++++ b/sdk/src/impl/__tests__/free-mode-rate-limit-no-retry.test.ts
+@@ -1,33 +1,34 @@
+ /**
+  * The free-mode request limiter answers 429 `free_mode_rate_limited` with a
+  * Retry-After. When that wait is longer than any retry (a day-long window),
+  * the AI SDK used to retry after 2-8 s anyway. On a Desktop or Cloud model
+  * start the first refusal refunds the purchase, so the retry met a 409
+  * `session_superseded` and the user read "This model purchase was refunded …
+  * Start a new session" instead of the limit (Discord #787). The SDK must
+- * refuse the long wait once and keep the limiter's own copy.
++ * refuse the long wait once and keep the limiter's own copy. The tab ceiling
++ * (409 `session_limit_reached`) refunds a start the same way (11-14..17).
+  */
+ import { extractApiErrorDetails } from '@codebuff/common/util/error'
+ import { APICallError, streamText } from 'ai'
+ import { afterEach, describe, expect, test } from 'bun:test'
+ 
+ import { getModelForRequest } from '../model-provider'
+ 
+ const originalFetch = globalThis.fetch
+ 
+ afterEach(() => {
+   globalThis.fetch = originalFetch
+ })
+ 
+ const DAILY_LIMIT = {
+   error: 'free_mode_rate_limited',
+   message:
+     "You've reached the daily limit on free-model requests. It resets in about 5 hours.",
+ }
+ 
+ const REFUNDED = {
+   error: 'session_superseded',
+   message:
+     'This model purchase was refunded to the daily pool or wallet that paid for it. Start a new session to try again.',
+ }
+ 
+@@ -118,25 +119,49 @@ describe('a free-mode rate-limit refusal (429 free_mode_rate_limited)', () => {
+   })
+ 
+   test('a wait the AI SDK sits out is still retried', async () => {
+     const server = serve({
+       status: 429,
+       body: { error: 'free_mode_rate_limited', message: 'slow down' },
+       retryAfter: '1',
+     })
+ 
+     await failureOf(1)
+ 
+     expect(server.calls()).toBe(2)
+   }, 15_000)
+ 
+   test('one without a Retry-After is still retried', async () => {
+     const server = serve({
+       status: 429,
+       body: { error: 'free_mode_rate_limited', message: 'slow down' },
+     })
+ 
+     await failureOf(1)
+ 
+     expect(server.calls()).toBe(2)
+   }, 15_000)
+ })
++
++describe('a tab-ceiling refusal (409 session_limit_reached)', () => {
++  test('is refused once and keeps the ceiling copy, never reaching the refunded-start 409', async () => {
++    const TAB_LIMIT = {
++      error: 'session_limit_reached',
++      message:
++        'Freebuff allows 5 unlimited-model tabs at a time. Close another hosted-model tab and try again.',
++    }
++    const server = serve(
++      { status: 409, body: TAB_LIMIT },
++      { status: 409, body: REFUNDED },
++    )
++
++    const error = (await failureOf(3)) as APICallError
++
++    expect(server.calls()).toBe(1)
++    expect(error.isRetryable).toBe(false)
++    expect(extractApiErrorDetails(error)).toMatchObject({
++      statusCode: 409,
++      errorCode: 'session_limit_reached',
++      message: TAB_LIMIT.message,
++    })
++  })
++})
+diff --git a/sdk/src/impl/__tests__/session-superseded-no-retry.test.ts b/sdk/src/impl/__tests__/session-superseded-no-retry.test.ts
+index 64b97f997..e2feafc15 100644
+--- a/sdk/src/impl/__tests__/session-superseded-no-retry.test.ts
++++ b/sdk/src/impl/__tests__/session-superseded-no-retry.test.ts
+@@ -69,50 +69,50 @@ describe('a refunded or superseded start (409 session_superseded)', () => {
+     expect(APICallError.isInstance(error)).toBe(true)
+     const apiError = error as APICallError
+     expect(apiError.isRetryable).toBe(false)
+     expect(apiError.statusCode).toBe(409)
+     expect(apiError.message).toBe(REFUNDED.message)
+     // What every client classifies on: the CLI's superseded screen and
+     // Desktop's session-ended state both key on this code.
+     expect(extractApiErrorDetails(error)).toMatchObject({
+       statusCode: 409,
+       errorCode: 'session_superseded',
+       message: REFUNDED.message,
+     })
+   })
+ 
+   test('falls back to its own copy when the body has no message', async () => {
+     serve(409, { error: 'session_superseded' })
+ 
+     const error = (await failureOf(3)) as APICallError
+ 
+     expect(error.isRetryable).toBe(false)
+     expect(error.message).toContain('Start a new session')
+   })
+ 
+   test('any other 409 is still retried', async () => {
+     const server = serve(409, {
+-      error: 'session_limit_reached',
+-      message: 'too many tabs',
++      error: 'conflict',
++      message: 'try again',
+     })
+ 
+     await failureOf(1)
+ 
+     expect(server.calls()).toBe(2)
+   }, 15_000)
+ 
+   test('a 409 whose body is not JSON is still retried', async () => {
+     const server = serve(409, 'Conflict')
+ 
+     await failureOf(1)
+ 
+     expect(server.calls()).toBe(2)
+   }, 15_000)
+ 
+   test('session_superseded under any other status is not treated as final', async () => {
+     const server = serve(503, REFUNDED)
+ 
+     await failureOf(1)
+ 
+     expect(server.calls()).toBe(2)
+   }, 15_000)
+ })
+diff --git a/sdk/src/impl/model-provider.ts b/sdk/src/impl/model-provider.ts
+index bbc34e577..3896d1d28 100644
+--- a/sdk/src/impl/model-provider.ts
++++ b/sdk/src/impl/model-provider.ts
+@@ -315,84 +315,96 @@ export const BYOK_CONNECTION_FAILURE_MESSAGE =
+  * runtime's error parser hand the server's own copy and code to the client
+  * unchanged.
+  *
+  * - `turn_spend_limit` (429): the per-turn spend breaker is final for THIS
+  *   turn — its spend only grows, so the same run id is refused every time.
+  *   Clients read the retried failure as an ordinary rate limit and answered
+  *   it with "wait a moment or switch models", neither of which helps.
+  * - `session_superseded` (409): the start was refunded (the Desktop purchase
+  *   claim, or a refund that closed admission) or the session was taken over
+  *   by another instance. The row is gone, so every retry gets the same 409;
+  *   the user waited ~14s for the card that tells them to start a new session
+  *   (5,392 runs / 2,230 users in the 72h to 2026-10-05).
+  * - `model_at_capacity` (503): a queued free model had no slot within the
+  *   request's wait budget (web/.../model-queue.ts). Each retry re-enters the
+  *   queue and waits that budget again before the same refusal, so it is
+  *   surfaced at once — as its in-band form after the grace flush already is.
+  * - `free_mode_rate_limited` (429), only when its Retry-After is a minute or
+  *   more: a request window (5 hours, a day, the prompt windows) that no retry
+  *   outlasts, since the AI SDK waits out a Retry-After only under 60 s and
+  *   otherwise retries after 2-8 s. On a Desktop or Cloud model start the first
+  *   refusal also refunds the purchase, so the retry met `session_superseded`
+  *   instead and the user read "This model purchase was refunded … Start a new
+  *   session", which only bought another session into the same cap (Discord
+  *   #787: 29 Cloud runs in 2 hours on the daily window). A shorter wait is
+  *   still retried: the AI SDK sits it out first.
++ * - `session_limit_reached` (409): the account is over its tab ceiling. The
++ *   same shape as the daily window: on a model start the refusal refunds the
++ *   purchase and ends its row, so every retry met `session_superseded` and the
++ *   user read "This model purchase was refunded … Start a new session" instead
++ *   of "close another tab", and each new chat bought and refunded another hour
++ *   (11-14..17: ~85% of those Cloud failures).
+  */
+ const FINAL_REFUSALS: readonly {
+   status: number
+   error: string
+   /** Used only when the body carries no `message` of its own. */
+   fallbackMessage: string
+   /** Final only when this holds; always final without it. */
+   when?: (response: Response) => boolean
+ }[] = [
+   {
+     status: 429,
+     error: FREEBUFF_TURN_SPEND_LIMIT_ERROR_CODE,
+     fallbackMessage: FREEBUFF_TURN_SPEND_LIMIT_MESSAGE,
+   },
+   {
+     status: FREEBUFF_GATE_CODES.session_superseded.status,
+     error: 'session_superseded',
+     fallbackMessage:
+       'This Freebuff session has ended. Start a new session to try again.',
+   },
+   {
+     status: 503,
+     error: 'model_at_capacity',
+     fallbackMessage:
+       'This model is at capacity right now. Please try again in a few minutes or pick another model.',
+   },
+   {
+     status: 429,
+     error: 'free_mode_rate_limited',
+     fallbackMessage:
+       'You have reached a free-model request limit. Try again later.',
+     when: (response) =>
+       retryAfterMsOf(response) >= AI_SDK_MAX_HONOURED_RETRY_AFTER_MS,
+   },
++  {
++    status: FREEBUFF_GATE_CODES.session_limit_reached.status,
++    error: 'session_limit_reached',
++    fallbackMessage:
++      'Too many Freebuff tabs are running at once. Close another tab and try again.',
++  },
+ ]
+ 
+ /** The AI SDK waits out a Retry-After shorter than this before retrying; a
+  *  longer one it ignores and retries on its own 2-8 s backoff. */
+ const AI_SDK_MAX_HONOURED_RETRY_AFTER_MS = 60_000
+ 
+ /** The server's Retry-After (whole seconds), or 0 when it sent none. */
+ function retryAfterMsOf(response: Response): number {
+   const seconds = Number(response.headers.get('retry-after') ?? Number.NaN)
+   return Number.isFinite(seconds) ? seconds * 1000 : 0
+ }
+ 
+ async function throwIfFinalRefusal(
+   response: Response,
+   url: string,
+ ): Promise<void> {
+   // Only a status some refusal uses is worth reading the body for.
+   if (!FINAL_REFUSALS.some((r) => r.status === response.status)) return
+   const text = await response
+     .clone()
+     .text()
+     .catch(() => '')
+   let body: { error?: unknown; message?: unknown } | null = null
+   try {
+     body = JSON.parse(text)
