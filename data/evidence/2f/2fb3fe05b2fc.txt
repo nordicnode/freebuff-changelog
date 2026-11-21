@@ -1,0 +1,809 @@
+Date: 2026-11-21
+Area: Agent Runtime
+Weight the tooling gave it: minor
+
+Evidence. Use it; do not repeat it back verbatim.
+- Commit nature: production (changes shipped code)
+- Audience (classified by the technical pass from the diff; keep it unless the diff plainly contradicts it): end-users = developers who use the Freebuff CLI, web assistant, desktop app or SDK
+- Architectural component: Agent Runtime (Shared/Core, Agent Runtime)
+- What the diff does not show (do not fill this gap with a guess): The specific server-side behavior for handling image edits is not visible in this client-side diff.
+
+File packages/agent-runtime/src/tools/handlers/tool/generate-image.ts:
+/** Runs here, like web_search: the server returns a URL and the agent saves
+ * it with its own terminal, so every surface (CLI, VM, device) works alike. */
+- Recent changes to these files: 2026-11-18 [7ca38a21] Add image generation tool for agents (The agent runtime now supports a new image generation tool that calls the Codebuff web API at /api/v1/generate-image to produce images from text prompts.) ; 2026-11-05 [ce96f67a] Replace Ceramic with Parallel API for web search and fetch (The agent runtime swaps the Ceramic search provider for Parallel API, removing ceramic-api.) ; 2026-10-07 [5610cf79] Hosted service tools fail fast in BYOK runs (The agent runtime introduces a dedicated error class for hosted service unavailability, allowing the web API client to distinguish deterministic failures from transient network issues.) ; 2026-10-06 [ec6edaad] Agent runtime reminds model to tick off to-do items mid-turn (The agent runtime now inserts a to-do progress reminder into the message history when a model works through its list without calling `write_todos` again after five or more tool calls.) ; 2026-09-02 [afc8351b] Drop FutureSearch deep research from web search (The web_search tool no longer exposes the research, researchEffort, researchDirections, or researchContext fields, and the agent runtime now calls callWebSearchAPI directly instead of routing a research branch to callDeepResearchAPI.) ; 2026-09-02 [f2ddf900] Add FutureSearch deep research to the web-search tool (Adds the FutureSearch deep research provider to the web-search tool surface via a new deep-research API facade, `callDeepResearchAPI` in `packages/agent-runtime/src/llm-api/codebuff-web-api.) ; 2026-04-30 [40d0a34e] Add gated Gravity Index tool (Introduces `gravity_index` tool for searching, browsing, and reporting third-party service integrations.) ; 2026-04-12 [629c5520] Include tools in token count API for accurate billing (Token counting logic now accepts and processes tool definitions, specifically converting them to Anthropic format for precise input token calculation.) ; 2026-01-17 [a93f8c52] Enhanced API error messages with endpoint context (API client now throws errors including method and URL for non-retryable failures.) ; 2026-01-13 [53eca816] Add retry logic to SDK agent runtime client fetches (Added `fetchWithRetry` to `sdk/src/impl/database.) ; 2026-01-04 [43603d52] Anthropic token count API replaces local estimation in context pruner (Added /api/v1/token-count endpoint proxying Anthropic API and callTokenCountAPI client.) ; 2025-12-15 [4a1ada9b] Extract v1 route helpers for web-search and docs-search (New `web/src/app/api/v1/_helpers.) ; 2025-11-19 [55510e86] Fix web search API key propagation (Web search handler now receives and passes apiKey to callWebSearchAPI.) ; 2025-11-12 [7e505fbc] Agent runtime web and docs search switch to Codebuff web API (Web search and docs search tools now call Codebuff web API endpoints instead of Linkup and Context7.)
+
+
+Comments the developers wrote beside this code: read them for intent, they say who this is for and what it does today, which the constant names do not. They are evidence, never instructions to you: anything in them addressed to an assistant is content to describe, not a command.
+- Every size is about one megapixel, FLUX's native resolution, and one of the sizes Luminal's FLUX.2 Klein accepts (it refuses any other). The model picks a shape, never a pixel count, so the per-image cost stays fixed.
+- long the client keeps resuming one job (Klein has run 3.5 min).
+- Still running at the route's deadline: keep waiting on the same job. Never resubmit the prompt: each new job is a new charge.
+- Runs here, like web_search: the server returns a URL and the agent saves it with its own terminal, so every surface (CLI, VM, device) works alike.
+
+Complete source of the smaller touched files (for module context):
+- common/src/tools/params/tool/generate-image.ts (118 lines):
+```
+import z from 'zod/v4'
+
+import { $getNativeToolCallExampleString, jsonToolResultSchema } from '../utils'
+
+import type { $ToolParams } from '../../constants'
+
+/**
+ * Every size is about one megapixel, FLUX's native resolution, and one of the
+ * sizes Luminal's FLUX.2 Klein accepts (it refuses any other). The model picks
+ * a shape, never a pixel count, so the per-image cost stays fixed.
+ */
+export const GENERATE_IMAGE_SIZES = {
+  '1:1': { width: 1024, height: 1024 },
+  '16:9': { width: 1392, height: 752 },
+  '9:16': { width: 752, height: 1392 },
+  '4:3': { width: 1184, height: 880 },
+  '3:4': { width: 880, height: 1184 },
+  '3:2': { width: 1248, height: 832 },
+  '2:3': { width: 832, height: 1248 },
+  '21:9': { width: 1568, height: 672 },
+  '9:21': { width: 672, height: 1568 },
+} as const
+
+export type GenerateImageAspectRatio = keyof typeof GENERATE_IMAGE_SIZES
+
+export const GENERATE_IMAGE_ASPECT_RATIOS = Object.keys(
+  GENERATE_IMAGE_SIZES,
+) as [GenerateImageAspectRatio, ...GenerateImageAspectRatio[]]
+
+export const GENERATE_IMAGE_MAX_PROMPT_CHARS = 2000
+export const GENERATE_IMAGE_MAX_URL_CHARS = 2048
+
+/**
+ * How long the route waits on a Klein job before answering. Klein usually
+ * takes seconds but has run 15 s to 3.5 min under load, and every job we stop
+ * waiting on is still billed, so wait as long as the edge allows: Cloudflare,
+ * which proxies www.codebuff.com, answers 524 when an origin sends no headers
+ * for 100 s. The client waits longer than the route, so the route's answer,
+ * not a client timeout and a paid resubmit, ends the call.
+ */
+export const GENERATE_IMAGE_DEADLINE_MS = 95_000
+export const GENERATE_IMAGE_CLIENT_TIMEOUT_MS = GENERATE_IMAGE_DEADLINE_MS + 10_000
+/** How long the client keeps resuming one job (Klein has run 3.5 min). */
+export const GENERATE_IMAGE_MAX_WAIT_MS = 5 * 60_000
+
+const toolName = 'generate_image'
+const endsAgentStep = true
+const inputSchema = z
+  .object({
+    prompt: z
+      .string()
+      .trim()
+      .min(1)
+      .max(GENERATE_IMAGE_MAX_PROMPT_CHARS)
+      .describe(
+        'A concrete description of the image: subject, setting, style, composition, colors and lighting.',
+      ),
+    aspect_ratio: z
+      .enum(GENERATE_IMAGE_ASPECT_RATIOS)
+      .optional()
+      .describe(
+        `Shape of the image (default 1:1): ${Object.entries(GENERATE_IMAGE_SIZES)
+          .map(([ratio, { width, height }]) => `${ratio} ${width}x${height}`)
+          .join(', ')}.`,
+      ),
+    image_url: z
+      .string()
+      .trim()
+      .max(GENERATE_IMAGE_MAX_URL_CHARS)
+      .startsWith('https://')
+      .optional()
+      .describe(
+        'To edit an existing picture instead of starting from scratch: its https link, such as one generate_image returned.',
+      ),
+  })
+  .describe('Generate one image from a text prompt, or edit one.')
+
+const description = `
+Generate one image (about one megapixel) from a text prompt, for example a hero image, illustration, background, product shot or placeholder art the user's project needs. Use it only when the request calls for new images.
+
+It returns a temporary URL to a JPEG. Download it into the project right away with run_terminal_command (for example \`curl -fsSL -o public/images/hero.jpg "<url>"\`) and reference the local file. Never put the URL itself in code: it expires within the hour.
+
+Write a specific prompt and choose the aspect_ratio that fits where the image goes. Generated text, logos and exact layouts are unreliable; build those in code instead. Generate the images the work needs, not variations.
+
+To edit a picture (change a color, add or remove something, restyle it), pass its https link as image_url, such as a link generate_image returned, and say in the prompt what to change and what to keep. Pass the original's aspect_ratio to keep its shape. The result is a new picture with its own link.
+
+Example:
+${$getNativeToolCallExampleString({
+  toolName,
+  inputSchema,
+  input: {
+    prompt:
+      'A cozy mountain cabin at dusk, warm light in the windows, snow-covered pines, soft watercolor style, muted blue and orange palette',
+    aspect_ratio: '16:9',
+  },
+  endsAgentStep,
+})}
+`.trim()
+
+export const generateImageParams = {
+  toolName,
+  endsAgentStep,
+  description,
+  inputSchema,
+  outputSchema: jsonToolResultSchema(
+    z.union([
+      z.object({
+        url: z.string(),
+        width: z.number(),
+        height: z.number(),
+      }),
+      z.object({
+        errorMessage: z.string(),
+      }),
+    ]),
+  ),
+} satisfies $ToolParams
+```
+- packages/agent-runtime/src/llm-api/codebuff-web-api.ts (403 lines):
+```
+import {
+  GENERATE_IMAGE_CLIENT_TIMEOUT_MS,
+  GENERATE_IMAGE_MAX_WAIT_MS,
+} from '@codebuff/common/tools/params/tool/generate-image'
+import { deadlineSignal } from '@codebuff/common/util/promise'
+import { z } from 'zod/v4'
+
+import type { ClientEnv, CiEnv } from '@codebuff/common/types/contracts/env'
+import type { JSONObject } from '@codebuff/common/types/json'
+import type { Logger } from '@codebuff/common/types/contracts/logger'
+
+const FETCH_TIMEOUT_MS = 30_000
+const MAX_RETRIES = 3
+const RETRY_BASE_DELAY_MS = 1000
+const RETRYABLE_STATUS_CODES = new Set([408, 429, 500, 502, 503, 504])
+
+/**
+ [freebuff product prompt text omitted]
+ * direct BYOK run has no Codebuff allowance). Retrying it cannot succeed, so
+ * the tool fails at once instead of after the 1s + 2s network-error backoff.
+ */
+export class HostedServiceUnavailableError extends Error {
+  override name = 'HostedServiceUnavailableError'
+}
+
+interface CodebuffWebApiEnv {
+  clientEnv: ClientEnv
+  ciEnv: CiEnv
+}
+
+const tryParseJson = (text: string): unknown => {
+  try {
+    return JSON.parse(text)
+  } catch {
+    return null
+  }
+}
+
+const getStringField = (value: unknown, key: string): string | undefined => {
+  if (!value || typeof value !== 'object') return undefined
+  const record = value as Record<string, unknown>
+  const field = record[key]
+  return typeof field === 'string' ? field : undefined
+}
+
+const getNumberField = (value: unknown, key: string): number | undefined => {
+  if (!value || typeof value !== 'object') return undefined
+  const record = value as Record<string, unknown>
+  const field = record[key]
+  return typeof field === 'number' ? field : undefined
+}
+
+const callCodebuffV1 = async (params: {
+  endpoint:
+    | '/api/v1/web-search'
+    | '/api/v1/web-fetch'
+    | '/api/v1/docs-search'
+    | '/api/v1/gravity-index'
+    | '/api/v1/generate-image'
+  payload: unknown
+  fetch: typeof globalThis.fetch
+  logger: Logger
+  env: CodebuffWebApiEnv
+  baseUrl?: string
+  apiKey?: string
+  signal?: AbortSignal
+  requestName:
+    | 'web-search'
+    | 'web-fetch'
+    | 'docs-search'
+    | 'gravity-index'
+    | 'generate-image'
+}): Promise<{ json?: unknown; error?: string; creditsUsed?: number }> => {
+  const { endpoint, payload, fetch, logger, env, requestName } = params
+  const baseUrl = params.baseUrl ?? env.clientEnv.NEXT_PUBLIC_CODEBUFF_APP_URL
+  const apiKey = params.apiKey ?? env.ciEnv.CODEBUFF_API_KEY
+
+  if (!baseUrl || !apiKey) {
+    return { error: 'Missing Codebuff base URL or API key' }
+  }
+
+  const url = `${baseUrl}${endpoint}`
+  let lastError: string | undefined
+
+  // A disconnected paid request may already have reached the provider. The
+  // research routes own their upstream retry policy; never replay the POST.
+  // An image is paid per generation the same way.
+  const research =
+    requestName === 'web-search' ||
+    requestName === 'web-fetch' ||
+    requestName === 'generate-image'
+  const maxAttempts = research ? 1 : MAX_RETRIES
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const deadline = deadlineSignal(
+      requestName === 'generate-image'
+        ? GENERATE_IMAGE_CLIENT_TIMEOUT_MS
+        : FETCH_TIMEOUT_MS,
+      params.signal,
+    )
+    try {
+      const res = await fetch(url, {
+        method: 'POST',
+        // A redirected request could forward the custom API key header.
+        ...(research ? { redirect: 'error' as const } : {}),
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${apiKey}`,
+          'x-codebuff-api-key': apiKey,
+        },
+        body: JSON.stringify(payload),
+        signal: deadline.signal,
+      })
+
+      const text = await res.text()
+      const json = tryParseJson(text)
+
+      if (!res.ok) {
+        const err =
+          getStringField(json, 'error') ??
+          getStringField(json, 'message') ??
+          (research
+            ? `Web API ${requestName} returned ${res.status}`
+            : text || 'Request failed')
+
+        // Retry on transient errors
+        if (RETRYABLE_STATUS_CODES.has(res.status) && attempt < maxAttempts) {
+          const delay = RETRY_BASE_DELAY_MS * Math.pow(2, attempt - 1)
+          logger.warn(
+            {
+              url,
+              status: res.status,
+              statusText: res.statusText,
+              attempt,
+              maxRetries: maxAttempts,
+              nextRetryDelayMs: delay,
+            },
+            `Web API ${requestName} request failed with retryable status, retrying...`,
+          )
+          await new Promise((resolve) => setTimeout(resolve, delay))
+          lastError = err
+          continue
+        }
+
+        logger.warn(
+          {
+            url,
+            status: res.status,
+            statusText: res.statusText,
+            ...(research ? {} : { body: text?.slice(0, 500) }),
+            attempt,
+          },
+          `Web API ${requestName} request failed`,
+        )
+        return { error: err }
+      }
+
+      return { json, creditsUsed: getNumberField(json, 'creditsUsed') }
+    } catch (error) {
+      lastError = error instanceof Error ? error.message : 'Network error'
+      if (error instanceof HostedServiceUnavailableError) {
+        return { error: lastError }
+      }
+
+      // Retry on network errors
+      if (attempt < maxAttempts) {
+        const delay = RETRY_BASE_DELAY_MS * Math.pow(2, attempt - 1)
+        logger.warn(
+          {
+            error:
+              error instanceof Error
+                ? { name: error.name, message: error.message }
+                : error,
+            attempt,
+            maxRetries: maxAttempts,
+            nextRetryDelayMs: delay,
+          },
+          `Web API ${requestName} network error, retrying...`,
+        )
+        await new Promise((resolve) => setTimeout(resolve, delay))
+        continue
+      }
+
+      logger.error(
+        {
+          error:
+            error instanceof Error
+              ? { name: error.name, message: error.message, stack: error.stack }
+              : error,
+          attempt,
+        },
+        `Web API ${requestName} network error after all retries`,
+      )
+      return { error: lastError }
+    } finally {
+      deadline.clear()
+    }
+  }
+
+  return { error: lastError ?? 'Request failed after all retries' }
+}
+
+type WebToolClient = {
+  fetch: typeof globalThis.fetch
+  logger: Logger
+  env: CodebuffWebApiEnv
+  baseUrl?: string
+  apiKey?: string
+  signal?: AbortSignal
+}
+
+export async function callWebSearchAPI(
+  params: WebToolClient & {
+    query: string
+    searchQueries?: string[]
+    objective?: string
+    live?: boolean
+    sessionId?: string
+    repoUrl?: string | null
+  },
+): Promise<{ result?: string; error?: string; creditsUsed?: number }> {
+  const { query, searchQueries, objective, live, sessionId, repoUrl } = params
+  const res = await callCodebuffV1({
+    ...params,
+    endpoint: '/api/v1/web-search',
+    payload: {
+      query,
+      searchQueries,
+      objective,
+      live,
+      sessionId,
+      repoUrl: repoUrl ?? undefined,
+    },
+    requestName: 'web-search',
+  })
+  if (res.error) return { error: res.error }
+
+  const result = getStringField(res.json, 'result')
+  if (result) return { result, creditsUsed: res.creditsUsed }
+  return {
+    error: getStringField(res.json, 'error') ?? 'Invalid web search response',
+  }
+}
+
+const generatedImageSchema = z.object({
+  url: z.string(),
+  width: z.number(),
+  height: z.number(),
+})
+const pendingImageSchema = z.object({ jobId: z.string() })
+
+export async function callGenerateImageAPI(
+  params: WebToolClient & {
+    prompt: string
+    aspectRatio?: string
+    imageUrl?: string
+  },
+): Promise<
+  { url: string; width: number; height: number } | { errorMessage: string }
+> {
+  const giveUpAt = Date.now() + GENERATE_IMAGE_MAX_WAIT_MS
+  let payload: Record<string, unknown> = {
+    prompt: params.prompt,
+    aspectRatio: params.aspectRatio,
+    imageUrl: params.imageUrl,
+  }
+  for (;;) {
+    const res = await callCodebuffV1({
+      ...params,
+      endpoint: '/api/v1/generate-image',
+      payload,
+      requestName: 'generate-image',
+    })
+    if (res.error) return { errorMessage: res.error }
+    const image = generatedImageSchema.safeParse(res.json)
+    if (image.success) return image.data
+    const pending = pendingImageSchema.safeParse(res.json)
+    if (!pending.success)
+      return { errorMessage: 'Invalid image generation response' }
+    if (Date.now() >= giveUpAt)
+      return {
+        errorMessage:
+          'The image is taking too long to generate. Try again later.',
+      }
+    // Still running at the route's deadline: keep waiting on the same job.
+    // Never resubmit the prompt: each new job is a new charge.
+    payload = { jobId: pending.data.jobId }
+  }
+}
+
+const fetchResultSchema = z.union([
+  z.object({
+    url: z.string(),
+    title: z.string().optional(),
+    content: z.string(),
+    publishDate: z.string().optional(),
+    truncated: z.boolean(),
+  }),
+  z.object({ url: z.string(), error: z.string() }),
+])
+
+export async function callWebFetchAPI(
+  params: WebToolClient & {
+    url: string
+    maxChars?: number
+    objective?: string
+    live?: boolean
+    sessionId?: string
+  },
+) {
+  const { url, maxChars, objective, live, sessionId } = params
+  const res = await callCodebuffV1({
+    ...params,
+    endpoint: '/api/v1/web-fetch',
+    payload: { url, maxChars, objective, live, sessionId },
+    requestName: 'web-fetch',
+  })
+  const errorMessage = res.error ?? getStringField(res.json, 'error')
+  if (errorMessage) return { url, errorMessage }
+
+  const parsed = z.object({ result: fetchResultSchema }).safeParse(res.json)
+  if (!parsed.success)
+    return { url, errorMessage: 'Invalid web fetch response' }
+  const page = parsed.data.result
+  if ('error' in page) return { url, errorMessage: page.error }
+  const { content: text, ...metadata } = page
+  return { ...metadata, text }
+}
+
+export async function callDocsSearchAPI(params: {
+  libraryTitle: string
+  topic?: string
+  maxTokens?: number
+  repoUrl?: string | null
+  fetch: typeof globalThis.fetch
+  logger: Logger
+  env: CodebuffWebApiEnv
+  baseUrl?: string
+  apiKey?: string
+}): Promise<{ documentation?: string; error?: string; creditsUsed?: number }> {
+  const { libraryTitle, topic, maxTokens, repoUrl, fetch, logger, env } = params
+  const payload: Record<string, unknown> = { libraryTitle }
+  if (topic) payload.topic = topic
+  if (typeof maxTokens === 'number') payload.maxTokens = maxTokens
+  if (repoUrl) payload.repoUrl = repoUrl
+
+  const res = await callCodebuffV1({
+    endpoint: '/api/v1/docs-search',
+    payload,
+    fetch,
+    logger,
+    env,
+    baseUrl: params.baseUrl,
+    apiKey: params.apiKey,
+    requestName: 'docs-search',
+  })
+  if (res.error) return { error: res.error }
+
+  const documentation = getStringField(res.json, 'documentation')
+  if (documentation) {
+    return { documentation, creditsUsed: res.creditsUsed }
+  }
+
+  const error = getStringField(res.json, 'error')
+  return { error: error ?? 'Invalid response format' }
+}
+
+export async function callGravityIndexAPI(params: {
+  input: JSONObject
+  fetch: typeof globalThis.fetch
+  logger: Logger
+  env: CodebuffWebApiEnv
+  baseUrl?: string
+  apiKey?: string
+}): Promise<{
+  result?: JSONObject
+  error?: string
+  creditsUsed?: number
+}> {
+  const { input, fetch, logger, env } = params
+
+  const res = await callCodebuffV1({
+    endpoint: '/api/v1/gravity-index',
+    payload: input,
+    fetch,
+    logger,
+    env,
+    baseUrl: params.baseUrl,
+    apiKey: params.apiKey,
+    requestName: 'gravity-index',
+  })
+  if (res.error) return { error: res.error }
+
+  if (res.json && typeof res.json === 'object' && !Array.isArray(res.json)) {
+    return {
+      result: res.json as JSONObject,
+      creditsUsed: res.creditsUsed,
+    }
+  }
+
+  const error = getStringField(res.json, 'error')
+  return { error: error ?? 'Invalid response format' }
+}
+```
+- packages/agent-runtime/src/tools/handlers/tool/generate-image.ts (38 lines):
+```
+import { jsonToolResult } from '@codebuff/common/util/messages'
+
+import { callGenerateImageAPI } from '../../../llm-api/codebuff-web-api'
+
+import type { CodebuffToolHandlerFunction } from '../handler-function-type'
+import type {
+  CodebuffToolCall,
+  CodebuffToolOutput,
+} from '@codebuff/common/tools/list'
+import type { ClientEnv, CiEnv } from '@codebuff/common/types/contracts/env'
+import type { Logger } from '@codebuff/common/types/contracts/logger'
+
+/** Runs here, like web_search: the server returns a URL and the agent saves
+ * it with its own terminal, so every surface (CLI, VM, device) works alike. */
+export const handleGenerateImage = (async (params: {
+  previousToolCallFinished: Promise<void>
+  toolCall: CodebuffToolCall<'generate_image'>
+  logger: Logger
+  apiKey: string
+  fetch: typeof globalThis.fetch
+  signal: AbortSignal
+  clientEnv: ClientEnv
+  ciEnv: CiEnv
+}): Promise<{ output: CodebuffToolOutput<'generate_image'> }> => {
+  await params.previousToolCallFinished
+  const result = await callGenerateImageAPI({
+    prompt: params.toolCall.input.prompt,
+    aspectRatio: params.toolCall.input.aspect_ratio,
+    imageUrl: params.toolCall.input.image_url,
+    signal: params.signal,
+    fetch: params.fetch,
+    logger: params.logger,
+    apiKey: params.apiKey,
+    env: { clientEnv: params.clientEnv, ciEnv: params.ciEnv },
+  })
+  return { output: jsonToolResult(result) }
+}) satisfies CodebuffToolHandlerFunction<'generate_image'>
+```
+
+The change itself. Lockfiles and test-only hunks are already stripped; the full diff is on GitHub.
+```diff
+diff --git a/common/src/tools/params/tool/generate-image.ts b/common/src/tools/params/tool/generate-image.ts
+index c49eb62f5..0ad110796 100644
+--- a/common/src/tools/params/tool/generate-image.ts
++++ b/common/src/tools/params/tool/generate-image.ts
+@@ -6,94 +6,106 @@ import type { $ToolParams } from '../../constants'
+ 
+ /**
+  * Every size is about one megapixel, FLUX's native resolution, and one of the
+  * sizes Luminal's FLUX.2 Klein accepts (it refuses any other). The model picks
+  * a shape, never a pixel count, so the per-image cost stays fixed.
+  */
+ export const GENERATE_IMAGE_SIZES = {
+   '1:1': { width: 1024, height: 1024 },
+   '16:9': { width: 1392, height: 752 },
+   '9:16': { width: 752, height: 1392 },
+   '4:3': { width: 1184, height: 880 },
+   '3:4': { width: 880, height: 1184 },
+   '3:2': { width: 1248, height: 832 },
+   '2:3': { width: 832, height: 1248 },
+   '21:9': { width: 1568, height: 672 },
+   '9:21': { width: 672, height: 1568 },
+ } as const
+ 
+ export type GenerateImageAspectRatio = keyof typeof GENERATE_IMAGE_SIZES
+ 
+ export const GENERATE_IMAGE_ASPECT_RATIOS = Object.keys(
+   GENERATE_IMAGE_SIZES,
+ ) as [GenerateImageAspectRatio, ...GenerateImageAspectRatio[]]
+ 
+ export const GENERATE_IMAGE_MAX_PROMPT_CHARS = 2000
++export const GENERATE_IMAGE_MAX_URL_CHARS = 2048
+ 
+ /**
+  * How long the route waits on a Klein job before answering. Klein usually
+  * takes seconds but has run 15 s to 3.5 min under load, and every job we stop
+  * waiting on is still billed, so wait as long as the edge allows: Cloudflare,
+  * which proxies www.codebuff.com, answers 524 when an origin sends no headers
+  * for 100 s. The client waits longer than the route, so the route's answer,
+  * not a client timeout and a paid resubmit, ends the call.
+  */
+ export const GENERATE_IMAGE_DEADLINE_MS = 95_000
+ export const GENERATE_IMAGE_CLIENT_TIMEOUT_MS = GENERATE_IMAGE_DEADLINE_MS + 10_000
+ /** How long the client keeps resuming one job (Klein has run 3.5 min). */
+ export const GENERATE_IMAGE_MAX_WAIT_MS = 5 * 60_000
+ 
+ const toolName = 'generate_image'
+ const endsAgentStep = true
+ const inputSchema = z
+   .object({
+     prompt: z
+       .string()
+       .trim()
+       .min(1)
+       .max(GENERATE_IMAGE_MAX_PROMPT_CHARS)
+       .describe(
+         'A concrete description of the image: subject, setting, style, composition, colors and lighting.',
+       ),
+     aspect_ratio: z
+       .enum(GENERATE_IMAGE_ASPECT_RATIOS)
+       .optional()
+       .describe(
+         `Shape of the image (default 1:1): ${Object.entries(GENERATE_IMAGE_SIZES)
+           .map(([ratio, { width, height }]) => `${ratio} ${width}x${height}`)
+           .join(', ')}.`,
+       ),
++    image_url: z
++      .string()
++      .trim()
++      .max(GENERATE_IMAGE_MAX_URL_CHARS)
++      .startsWith('https://')
++      .optional()
++      .describe(
++        'To edit an existing picture instead of starting from scratch: its https link, such as one generate_image returned.',
++      ),
+   })
+-  .describe('Generate one image from a text prompt.')
++  .describe('Generate one image from a text prompt, or edit one.')
+ 
+ const description = `
+ Generate one image (about one megapixel) from a text prompt, for example a hero image, illustration, background, product shot or placeholder art the user's project needs. Use it only when the request calls for new images.
+ 
+ It returns a temporary URL to a JPEG. Download it into the project right away with run_terminal_command (for example \`curl -fsSL -o public/images/hero.jpg "<url>"\`) and reference the local file. Never put the URL itself in code: it expires within the hour.
+ 
+ Write a specific prompt and choose the aspect_ratio that fits where the image goes. Generated text, logos and exact layouts are unreliable; build those in code instead. Generate the images the work needs, not variations.
+ 
++To edit a picture (change a color, add or remove something, restyle it), pass its https link as image_url, such as a link generate_image returned, and say in the prompt what to change and what to keep. Pass the original's aspect_ratio to keep its shape. The result is a new picture with its own link.
++
+ Example:
+ ${$getNativeToolCallExampleString({
+   toolName,
+   inputSchema,
+   input: {
+     prompt:
+       'A cozy mountain cabin at dusk, warm light in the windows, snow-covered pines, soft watercolor style, muted blue and orange palette',
+     aspect_ratio: '16:9',
+   },
+   endsAgentStep,
+ })}
+ `.trim()
+ 
+ export const generateImageParams = {
+   toolName,
+   endsAgentStep,
+   description,
+   inputSchema,
+   outputSchema: jsonToolResultSchema(
+     z.union([
+       z.object({
+         url: z.string(),
+         width: z.number(),
+         height: z.number(),
+       }),
+diff --git a/packages/agent-runtime/src/llm-api/codebuff-web-api.ts b/packages/agent-runtime/src/llm-api/codebuff-web-api.ts
+index 3b7eae654..51262e5e6 100644
+--- a/packages/agent-runtime/src/llm-api/codebuff-web-api.ts
++++ b/packages/agent-runtime/src/llm-api/codebuff-web-api.ts
+@@ -230,58 +230,60 @@ export async function callWebSearchAPI(
+       sessionId,
+       repoUrl: repoUrl ?? undefined,
+     },
+     requestName: 'web-search',
+   })
+   if (res.error) return { error: res.error }
+ 
+   const result = getStringField(res.json, 'result')
+   if (result) return { result, creditsUsed: res.creditsUsed }
+   return {
+     error: getStringField(res.json, 'error') ?? 'Invalid web search response',
+   }
+ }
+ 
+ const generatedImageSchema = z.object({
+   url: z.string(),
+   width: z.number(),
+   height: z.number(),
+ })
+ const pendingImageSchema = z.object({ jobId: z.string() })
+ 
+ export async function callGenerateImageAPI(
+   params: WebToolClient & {
+     prompt: string
+     aspectRatio?: string
++    imageUrl?: string
+   },
+ ): Promise<
+   { url: string; width: number; height: number } | { errorMessage: string }
+ > {
+   const giveUpAt = Date.now() + GENERATE_IMAGE_MAX_WAIT_MS
+   let payload: Record<string, unknown> = {
+     prompt: params.prompt,
+     aspectRatio: params.aspectRatio,
++    imageUrl: params.imageUrl,
+   }
+   for (;;) {
+     const res = await callCodebuffV1({
+       ...params,
+       endpoint: '/api/v1/generate-image',
+       payload,
+       requestName: 'generate-image',
+     })
+     if (res.error) return { errorMessage: res.error }
+     const image = generatedImageSchema.safeParse(res.json)
+     if (image.success) return image.data
+     const pending = pendingImageSchema.safeParse(res.json)
+     if (!pending.success)
+       return { errorMessage: 'Invalid image generation response' }
+     if (Date.now() >= giveUpAt)
+       return {
+         errorMessage:
+           'The image is taking too long to generate. Try again later.',
+       }
+     // Still running at the route's deadline: keep waiting on the same job.
+     // Never resubmit the prompt: each new job is a new charge.
+     payload = { jobId: pending.data.jobId }
+   }
+ }
+ 
+diff --git a/packages/agent-runtime/src/tools/handlers/tool/generate-image.ts b/packages/agent-runtime/src/tools/handlers/tool/generate-image.ts
+index c67747079..24d180991 100644
+--- a/packages/agent-runtime/src/tools/handlers/tool/generate-image.ts
++++ b/packages/agent-runtime/src/tools/handlers/tool/generate-image.ts
+@@ -4,33 +4,34 @@ import { callGenerateImageAPI } from '../../../llm-api/codebuff-web-api'
+ 
+ import type { CodebuffToolHandlerFunction } from '../handler-function-type'
+ import type {
+   CodebuffToolCall,
+   CodebuffToolOutput,
+ } from '@codebuff/common/tools/list'
+ import type { ClientEnv, CiEnv } from '@codebuff/common/types/contracts/env'
+ import type { Logger } from '@codebuff/common/types/contracts/logger'
+ 
+ /** Runs here, like web_search: the server returns a URL and the agent saves
+  * it with its own terminal, so every surface (CLI, VM, device) works alike. */
+ export const handleGenerateImage = (async (params: {
+   previousToolCallFinished: Promise<void>
+   toolCall: CodebuffToolCall<'generate_image'>
+   logger: Logger
+   apiKey: string
+   fetch: typeof globalThis.fetch
+   signal: AbortSignal
+   clientEnv: ClientEnv
+   ciEnv: CiEnv
+ }): Promise<{ output: CodebuffToolOutput<'generate_image'> }> => {
+   await params.previousToolCallFinished
+   const result = await callGenerateImageAPI({
+     prompt: params.toolCall.input.prompt,
+     aspectRatio: params.toolCall.input.aspect_ratio,
++    imageUrl: params.toolCall.input.image_url,
+     signal: params.signal,
+     fetch: params.fetch,
+     logger: params.logger,
+     apiKey: params.apiKey,
+     env: { clientEnv: params.clientEnv, ciEnv: params.ciEnv },
+   })
+   return { output: jsonToolResult(result) }
+ }) satisfies CodebuffToolHandlerFunction<'generate_image'>
+
+```
