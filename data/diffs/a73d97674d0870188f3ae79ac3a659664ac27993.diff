@@ -1,0 +1,485 @@
+diff --git a/packages/agent-runtime/src/__tests__/process-str-replace.test.ts b/packages/agent-runtime/src/__tests__/process-str-replace.test.ts
+index d1f931335..58525b0ee 100644
+--- a/packages/agent-runtime/src/__tests__/process-str-replace.test.ts
++++ b/packages/agent-runtime/src/__tests__/process-str-replace.test.ts
+@@ -36,50 +36,82 @@ describe('processStrReplace', () => {
+     }
+   })
+ 
+   it('should handle Windows line endings', async () => {
+     const initialContent = 'const x = 1;\r\nconst y = 2;\r\n'
+     const oldStr = 'const y = 2;\r\n'
+     const newStr = 'const y = 3;\r\n'
+ 
+     const result = await processStrReplace({
+       path: 'test.ts',
+       replacements: [
+         { oldString: oldStr, newString: newStr, allowMultiple: false },
+       ],
+       initialContentPromise: Promise.resolve(initialContent),
+       logger,
+     })
+ 
+     expect(result).not.toBeNull()
+     expect('content' in result).toBe(true)
+     if ('content' in result) {
+       expect(result.content).toBe('const x = 1;\r\nconst y = 3;\r\n')
+       expect(result.patch).toContain('\r\n')
+     }
+   })
+ 
++  // 2026-11-23: an edit to a large file with mixed line endings rewrites every
++  // LF line, and the unbounded diff held a Cloud runner's event loop for 9-17
++  // minutes. Unfixed, this case runs ~17 s (past the 5 s test timeout).
++  it('edits a large mixed-line-ending file without a quadratic diff', async () => {
++    const lines = Array.from(
++      { length: 16_000 },
++      (_, i) => `const value${i} = ${i}${i % 2 ? '\r\n' : '\n'}`,
++    )
++    const initialContent = lines.join('')
++    const result = await processStrReplace({
++      path: 'big.ts',
++      replacements: [
++        {
++          oldString: 'const value10 = 10',
++          newString: 'const value10 = 11',
++          allowMultiple: false,
++        },
++      ],
++      initialContentPromise: Promise.resolve(initialContent),
++      logger,
++    })
++    expect('content' in result).toBe(true)
++    if ('content' in result) {
++      expect(result.content).toBe(
++        initialContent
++          .replace('const value10 = 10', 'const value10 = 11')
++          .replace(/\r?\n/g, '\r\n'),
++      )
++      expect(applyPatch(initialContent, result.patch)).toBe(result.content)
++    }
++  })
++
+   it('should handle indentation differences', async () => {
+     const initialContent = '  const x = 1;\n    const y = 2;\n'
+     const oldStr = 'const y = 2;'
+     const newStr = 'const y = 3;'
+ 
+     const result = await processStrReplace({
+       path: 'test.ts',
+       replacements: [
+         { oldString: oldStr, newString: newStr, allowMultiple: false },
+       ],
+       initialContentPromise: Promise.resolve(initialContent),
+       logger,
+     })
+ 
+     expect(result).not.toBeNull()
+     expect('content' in result).toBe(true)
+     if ('content' in result) {
+       expect(result.content).toBe('  const x = 1;\n    const y = 3;\n')
+     }
+   })
+ 
+   it('should handle whitespace-only differences', async () => {
+     const initialContent = 'const x = 1;\nconst  y  =  2;\n'
+     const oldStr = 'const  y  =  2;'
+     const newStr = 'const y = 3;'
+diff --git a/packages/agent-runtime/src/process-file-block.ts b/packages/agent-runtime/src/process-file-block.ts
+index fc82b653f..09cecf41c 100644
+--- a/packages/agent-runtime/src/process-file-block.ts
++++ b/packages/agent-runtime/src/process-file-block.ts
+@@ -1,33 +1,33 @@
+ import {
+   promptSuccess,
+   type PromptResult,
+ } from '@codebuff/common/util/error'
+ import { cleanMarkdownCodeBlock } from '@codebuff/common/util/file'
+ import { FILE_WRITE_GUARD_EVENT } from '@codebuff/common/util/axiom-only-log'
+-import { createPatch } from 'diff'
+ 
++import { createBoundedPatch } from './util/bounded-patch'
+ import {
+   detectTruncatedRewrite,
+   truncatedRewriteMessage,
+ } from './util/truncated-write-guard'
+ 
+ import type { Logger } from '@codebuff/common/types/contracts/logger'
+ 
+ type WriteFileSuccess = {
+   tool: 'write_file'
+   path: string
+   content: string
+   patch: string | undefined
+   messages: string[]
+ }
+ 
+ type WriteFileError = {
+   tool: 'write_file'
+   path: string
+   error: string
+ }
+ 
+ export type WriteFileResult = WriteFileSuccess | WriteFileError
+ 
+ /** Answering a no-op write plainly matters: a model re-sending the file's
+  * current content read the bare "skipping" as an invitation to retry. */
+@@ -93,51 +93,55 @@ export async function processFileBlock(
+   // A much shorter copy of the file that stops mid-expression is a cut-off
+   // write, not a rewrite: refuse it rather than replace the file with it.
+   const truncatedRewrite = detectTruncatedRewrite(
+     normalizedInitialContent,
+     normalizedNewContent,
+   )
+   if (truncatedRewrite) {
+     logger.warn(
+       {
+         axiomEvent: FILE_WRITE_GUARD_EVENT,
+         metric: 'truncated_rewrite_refused',
+         toolName: 'write_file',
+         oldLines: truncatedRewrite.oldLines,
+         newLines: truncatedRewrite.newLines,
+         openBrackets: truncatedRewrite.openBrackets,
+       },
+       'Refused a write_file that would replace a file with a cut-off copy',
+     )
+     return promptSuccess({
+       tool: 'write_file' as const,
+       path,
+       error: truncatedRewriteMessage(path, truncatedRewrite),
+     })
+   }
+ 
+-  let patch = createPatch(path, normalizedInitialContent, normalizedNewContent)
++  let patch = createBoundedPatch(
++    path,
++    normalizedInitialContent,
++    normalizedNewContent,
++  )
+   const lines = patch.split('\n')
+   const hunkStartIndex = lines.findIndex((line) => line.startsWith('@@'))
+   if (hunkStartIndex !== -1) {
+     patch = lines.slice(hunkStartIndex).join('\n')
+   } else {
+     logger.debug(
+       {
+         path,
+         initialContent,
+         changes: newContent,
+         patch,
+       },
+       `processFileBlock: No change to ${path}`,
+     )
+     return promptSuccess({
+       tool: 'write_file' as const,
+       path,
+       error: FILE_CONTENT_UNCHANGED_MESSAGE,
+     })
+   }
+   logger.debug(
+     {
+       path,
+       newContent,
+       patch,
+diff --git a/packages/agent-runtime/src/process-str-replace.ts b/packages/agent-runtime/src/process-str-replace.ts
+index dccf068c4..d167a7a64 100644
+--- a/packages/agent-runtime/src/process-str-replace.ts
++++ b/packages/agent-runtime/src/process-str-replace.ts
+@@ -1,28 +1,27 @@
+-import { createPatch } from 'diff'
+-
+ import { tryToDoStringReplacementWithExtraIndentation } from './generate-diffs-prompt'
++import { createBoundedPatch } from './util/bounded-patch'
+ 
+ import type { Logger } from '@codebuff/common/types/contracts/logger'
+ 
+ function normalizeLineEndings(params: { str: string }): string {
+   return params.str.replace(/\r\n/g, '\n')
+ }
+ 
+ export async function processStrReplace(params: {
+   path: string
+   replacements: {
+     oldString: string
+     newString: string
+     allowMultiple: boolean
+   }[]
+   initialContentPromise: Promise<string | null>
+   logger: Logger
+ }): Promise<
+   | {
+       tool: 'str_replace'
+       path: string
+       content: string
+       patch: string
+       messages: string[]
+     }
+   | { tool: 'str_replace'; path: string; error: string }
+@@ -96,51 +95,51 @@ export async function processStrReplace(params: {
+         : normalizedCurrentContent.replaceAll(
+             updatedOldStr,
+             () => updatedNewStr,
+           )
+   }
+ 
+   currentContent = currentContent.replaceAll('\n', lineEnding)
+ 
+   // If no successful replacements occurred, return error
+   if (initialContent === currentContent) {
+     logger.debug(
+       {
+         path,
+         initialContent,
+       },
+       `processStrReplace: No change to ${path}`,
+     )
+     messages.push('No change to the file')
+     return {
+       tool: 'str_replace' as const,
+       path,
+       error: messages.join('\n\n'),
+     }
+   }
+ 
+-  let patch = createPatch(path, initialContent, currentContent)
++  let patch = createBoundedPatch(path, initialContent, currentContent)
+   const lines = patch.split('\n')
+   const hunkStartIndex = lines.findIndex((line) => line.startsWith('@@'))
+   if (hunkStartIndex !== -1) {
+     patch = lines.slice(hunkStartIndex).join('\n')
+   }
+   const finalPatch = patch
+ 
+   logger.debug(
+     {
+       path,
+       newContent: currentContent,
+       patch: finalPatch,
+       messages,
+     },
+     `processStrReplace: Updated file ${path}`,
+   )
+ 
+   return {
+     tool: 'str_replace' as const,
+     path,
+     content: currentContent!,
+     patch: finalPatch,
+     messages,
+   }
+ }
+diff --git a/packages/agent-runtime/src/tools/handlers/tool/propose-write-file.ts b/packages/agent-runtime/src/tools/handlers/tool/propose-write-file.ts
+index e0409497d..0b1847966 100644
+--- a/packages/agent-runtime/src/tools/handlers/tool/propose-write-file.ts
++++ b/packages/agent-runtime/src/tools/handlers/tool/propose-write-file.ts
+@@ -1,31 +1,30 @@
+-import { createPatch } from 'diff'
+-
+ import {
+   getProposedContent,
+   setProposedContent,
+ } from './proposed-content-store'
++import { createBoundedPatch } from '../../../util/bounded-patch'
+ 
+ import type { CodebuffToolHandlerFunction } from '../handler-function-type'
+ import type {
+   CodebuffToolCall,
+   CodebuffToolOutput,
+ } from '@codebuff/common/tools/list'
+ import type { RequestOptionalFileFn } from '@codebuff/common/types/contracts/client'
+ import type { Logger } from '@codebuff/common/types/contracts/logger'
+ import type { ParamsExcluding } from '@codebuff/common/types/function-params'
+ 
+ /**
+  * Proposes writing a file without actually applying the changes.
+  * Simply overwrites the file exactly with the given content (creating if it doesn't exist).
+  * Returns a unified diff of the changes for review.
+  */
+ export const handleProposeWriteFile = (async (
+   params: {
+     previousToolCallFinished: Promise<void>
+     toolCall: CodebuffToolCall<'propose_write_file'>
+ 
+     logger: Logger
+     runId: string
+ 
+     requestOptionalFile: RequestOptionalFileFn
+   } & ParamsExcluding<RequestOptionalFileFn, 'filePath'>,
+@@ -38,50 +37,50 @@ export const handleProposeWriteFile = (async (
+     requestOptionalFile,
+   } = params
+   const { path, content } = toolCall.input
+ 
+   // Get content from proposed state first (by runId), then fall back to disk
+   const getProposedOrDiskContent = async (): Promise<string | null> => {
+     const proposedContent = getProposedContent(runId, path)
+     if (proposedContent !== undefined) {
+       return proposedContent
+     }
+     return requestOptionalFile({ ...params, filePath: path })
+   }
+ 
+   const initialContent = await getProposedOrDiskContent()
+ 
+   // Normalize content (remove leading newline if present)
+   const newContent = content.startsWith('\n') ? content.slice(1) : content
+ 
+   // Store the proposed content for future propose calls on the same file (by runId)
+   setProposedContent(runId, path, Promise.resolve(newContent))
+ 
+   await previousToolCallFinished
+ 
+   // Generate unified diff
+   const oldContent = initialContent ?? ''
+-  let patch = createPatch(path, oldContent, newContent)
++  let patch = createBoundedPatch(path, oldContent, newContent)
+   
+   // Strip the header lines, keep only from @@ onwards
+   const lines = patch.split('\n')
+   const hunkStartIndex = lines.findIndex((line) => line.startsWith('@@'))
+   if (hunkStartIndex !== -1) {
+     patch = lines.slice(hunkStartIndex).join('\n')
+   }
+ 
+   const isNewFile = initialContent === null
+   const message = isNewFile ? `Proposed new file ${path}` : `Proposed changes to ${path}`
+ 
+   return {
+     output: [
+       {
+         type: 'json',
+         value: {
+           file: path,
+           message,
+           unifiedDiff: patch,
+         },
+       },
+     ],
+   }
+ }) as CodebuffToolHandlerFunction<'propose_write_file'>
+diff --git a/packages/agent-runtime/src/util/__tests__/bounded-patch.test.ts b/packages/agent-runtime/src/util/__tests__/bounded-patch.test.ts
+new file mode 100644
+index 000000000..f8f8330f0
+--- /dev/null
++++ b/packages/agent-runtime/src/util/__tests__/bounded-patch.test.ts
+@@ -0,0 +1,26 @@
++import { describe, expect, it } from 'bun:test'
++import { applyPatch } from 'diff'
++
++import { spanPatch } from '../bounded-patch'
++
++// The fallback patch is applied to users' files by Desktop and Cloud
++// (`changeFile`, workspace-tools.ts): a wrong hunk corrupts the file.
++describe('spanPatch', () => {
++  it('applies to give exactly the new content', () => {
++    const lines = (n: number) =>
++      Array.from({ length: n }, (_, i) => `line ${i}\n`).join('')
++    const cases: Array<[string, string]> = [
++      [lines(20), lines(20).replace('line 10\n', 'changed\n')],
++      [lines(20), lines(20).replace('line 0\n', '')],
++      [lines(20), `${lines(20)}appended\n`],
++      [lines(20), lines(20).slice(0, -1)],
++      [lines(20).slice(0, -1), lines(20)],
++      ['a\nb\nc', 'a\nB\nc'],
++      ['a\r\nb\nc\r\n', 'a\r\nb\r\nc\r\n'],
++      [lines(5), ''],
++      ['', lines(5)],
++    ]
++    for (const [before, after] of cases)
++      expect(applyPatch(before, spanPatch('f.ts', before, after))).toBe(after)
++  })
++})
+diff --git a/packages/agent-runtime/src/util/bounded-patch.ts b/packages/agent-runtime/src/util/bounded-patch.ts
+new file mode 100644
+index 000000000..ee6d1de78
+--- /dev/null
++++ b/packages/agent-runtime/src/util/bounded-patch.ts
+@@ -0,0 +1,88 @@
++import { createPatch, formatPatch } from 'diff'
++
++/**
++ * jsdiff's line diff is Myers, O((N+M)·D) in time, and it runs synchronously.
++ * A str_replace on a large file with mixed line endings rewrites every LF line
++ * (process-str-replace.ts re-applies one ending), so D is the whole file: on
++ * 2026-11-23 one such edit held a Cloud runner's event loop for 9-17 minutes,
++ * every chat lease on it lapsed, and each restart of the turn froze the next
++ * runner (7 runners in a row, ~100 turns cut). A 32k-line mixed file took
++ * ~70 s; with these caps a 100k-line one takes ~0.25 s.
++ */
++export const PATCH_MAX_EDIT_LINES = 2_000
++/** Backstop for a huge file whose edit stays under the line cap. */
++export const PATCH_DIFF_TIMEOUT_MS = 1_000
++/** jsdiff's default context. */
++const CONTEXT_LINES = 4
++
++/**
++ * `createPatch`, but never one that blocks the process for long: past the
++ * caps it returns a single hunk from the first changed line to the last one.
++ * Both apply with `applyPatch` to give exactly `newStr`; the fallback is just
++ * not minimal.
++ */
++export function createBoundedPatch(
++  path: string,
++  oldStr: string,
++  newStr: string,
++): string {
++  return (
++    createPatch(path, oldStr, newStr, undefined, undefined, {
++      maxEditLength: PATCH_MAX_EDIT_LINES,
++      timeout: PATCH_DIFF_TIMEOUT_MS,
++    }) ?? spanPatch(path, oldStr, newStr)
++  )
++}
++
++/** Lines with their `\n` kept, as jsdiff compares them. */
++function linesOf(text: string): string[] {
++  if (!text) return []
++  const parts = text.split('\n')
++  const lines = parts.map((line, i) =>
++    i < parts.length - 1 ? `${line}\n` : line,
++  )
++  if (lines[lines.length - 1] === '') lines.pop()
++  return lines
++}
++
++/** One hunk over everything between the common first and last lines. O(N). */
++export function spanPatch(path: string, oldStr: string, newStr: string) {
++  const a = linesOf(oldStr)
++  const b = linesOf(newStr)
++  let start = 0
++  while (start < a.length && start < b.length && a[start] === b[start]) start++
++  let end = 0
++  while (
++    end < a.length - start &&
++    end < b.length - start &&
++    a[a.length - 1 - end] === b[b.length - 1 - end]
++  )
++    end++
++  const lead = Math.min(start, CONTEXT_LINES)
++  const trail = Math.min(end, CONTEXT_LINES)
++  const lines: string[] = []
++  // Only a file's last line can lack its newline; jsdiff marks it after that line.
++  const push = (prefix: ' ' | '-' | '+', line: string) => {
++    if (line.endsWith('\n')) lines.push(prefix + line.slice(0, -1))
++    else lines.push(prefix + line, '\\ No newline at end of file')
++  }
++  for (let i = start - lead; i < start; i++) push(' ', a[i])
++  for (let i = start; i < a.length - end; i++) push('-', a[i])
++  for (let i = start; i < b.length - end; i++) push('+', b[i])
++  for (let i = a.length - end; i < a.length - end + trail; i++) push(' ', a[i])
++  return formatPatch({
++    oldFileName: path,
++    newFileName: path,
++    oldHeader: undefined,
++    newHeader: undefined,
++    hunks: [
++      {
++        oldStart: start - lead + 1,
++        oldLines: a.length - end + trail - (start - lead),
++        newStart: start - lead + 1,
++        newLines: b.length - end + trail - (start - lead),
++        lines,
++      },
++    ],
++  })
++}
