@@ -1,0 +1,577 @@
+diff --git a/common/src/mcp/__tests__/flaky-list-tools-server.ts b/common/src/mcp/__tests__/flaky-list-tools-server.ts
+new file mode 100644
+index 000000000..91a6432e0
+--- /dev/null
++++ b/common/src/mcp/__tests__/flaky-list-tools-server.ts
+@@ -0,0 +1,22 @@
++/**
++ * Stdio MCP server fixture whose first `tools/list` fails and every later one
++ * answers, like a server still warming up when the client first asks.
++ */
++import { Server } from '@modelcontextprotocol/sdk/server/index.js'
++import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
++import { ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js'
++
++const server = new Server(
++  { name: 'flaky-list-tools-server', version: '1.0.0' },
++  { capabilities: { tools: {} } },
++)
++
++let lists = 0
++server.setRequestHandler(ListToolsRequestSchema, async () => {
++  if (lists++ === 0) throw new Error('not ready yet')
++  return {
++    tools: [{ name: 'ready', inputSchema: { type: 'object', properties: {} } }],
++  }
++})
++
++await server.connect(new StdioServerTransport())
+diff --git a/common/src/mcp/__tests__/list-tools.test.ts b/common/src/mcp/__tests__/list-tools.test.ts
+new file mode 100644
+index 000000000..741862742
+--- /dev/null
++++ b/common/src/mcp/__tests__/list-tools.test.ts
+@@ -0,0 +1,92 @@
++import { describe, expect, test } from 'bun:test'
++import { dirname, join } from 'node:path'
++
++import { getMCPClient, listAllTools, listMCPTools } from '../client'
++import { listAllMcpTools } from '../list-tools'
++
++import type { Client } from '@modelcontextprotocol/sdk/client/index.js'
++
++const tool = (name: string) => ({
++  name,
++  inputSchema: { type: 'object' as const },
++})
++
++/** An MCP client whose `tools/list` answers with `page(cursor, call)`; `call` counts from 0. */
++function fakeClient(
++  page: (
++    cursor: string | undefined,
++    call: number,
++  ) => { names: string[]; nextCursor?: string },
++) {
++  const cursors: (string | undefined)[] = []
++  const client = {
++    async listTools(params?: { cursor?: string }) {
++      cursors.push(params?.cursor)
++      const { names, nextCursor } = page(params?.cursor, cursors.length - 1)
++      return { tools: names.map(tool), nextCursor }
++    },
++  }
++  return { client: client as unknown as Pick<Client, 'listTools'>, cursors }
++}
++
++describe('listing a server whose tools/list is paginated', () => {
++  test('the CLI and SDK client follows nextCursor and returns every page', async () => {
++    const { client, cursors } = fakeClient((cursor) =>
++      cursor === 'page-2'
++        ? { names: ['c'] }
++        : { names: ['a', 'b'], nextCursor: 'page-2' },
++    )
++
++    const result = await listAllTools(client)
++
++    expect(result.tools.map((t) => t.name)).toEqual(['a', 'b', 'c'])
++    expect(result.nextCursor).toBeUndefined()
++    expect(cursors).toEqual([undefined, 'page-2'])
++  })
++
++  test('a server that names a cursor it already sent is not asked again', async () => {
++    // Each answer brings a new tool, so only the cursor check can end this.
++    const { client, cursors } = fakeClient((_cursor, call) => ({
++      names: [`tool-${call}`],
++      nextCursor: 'again',
++    }))
++
++    const result = await listAllTools(client)
++
++    expect(result.tools.map((t) => t.name)).toEqual(['tool-0', 'tool-1'])
++    expect(cursors).toEqual([undefined, 'again'])
++  })
++
++  test('later pages stop at the cap, but a first page over it is kept whole', async () => {
++    const names = (prefix: string, n: number) =>
++      Array.from({ length: n }, (_, i) => `${prefix}${i}`)
++    const paged = await listAllMcpTools(
++      async (cursor) =>
++        cursor
++          ? { tools: names(cursor, 3).map(tool), nextCursor: `${cursor}+` }
++          : { tools: names('first', 2).map(tool), nextCursor: 'p' },
++      { maxTools: 4 },
++    )
++    expect(paged.map((t) => t.name)).toEqual(['first0', 'first1', 'p0', 'p1'])
++
++    // One unpaginated page used to be returned whole, so it still is.
++    const single = await listAllMcpTools(
++      async () => ({ tools: names('t', 6).map(tool), nextCursor: 'p' }),
++      { maxTools: 4 },
++    )
++    expect(single).toHaveLength(6)
++  })
++})
++
++test('a failed listing is not cached, so the next call asks the server again', async () => {
++  const clientId = await getMCPClient({
++    type: 'stdio',
++    command: 'bun',
++    args: [join(dirname(import.meta.path), 'flaky-list-tools-server.ts')],
++    env: process.env as Record<string, string>,
++  })
++
++  await expect(listMCPTools(clientId)).rejects.toThrow(/not ready yet/)
++  const result = await listMCPTools(clientId)
++  expect(result.tools.map((t) => t.name)).toEqual(['ready'])
++})
+diff --git a/common/src/mcp/client.ts b/common/src/mcp/client.ts
+index 98b53ae04..1c2c986fd 100644
+--- a/common/src/mcp/client.ts
++++ b/common/src/mcp/client.ts
+@@ -1,32 +1,33 @@
+ import { Client } from '@modelcontextprotocol/sdk/client/index.js'
+ import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js'
+ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
+ import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
+ 
+ import { getErrorObject } from '../util/error'
+ import { mcpContentToToolResultOutputs } from './content-mapping'
++import { listAllMcpTools } from './list-tools'
+ import { normalizeMcpServerUrl } from './server-url'
+ 
+ import type { MCPConfig } from '../types/mcp'
+ import type { ToolResultOutput } from '../types/messages/content-part'
+ import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js'
+ import type {
+   CallToolResult,
+ } from '@modelcontextprotocol/sdk/types.js'
+ 
+ // Cap on how much of a failed stdio server's stderr we retain for the error
+ // message — enough to show the real failure without unbounded growth.
+ const STDERR_BUFFER_CAP = 8192
+ 
+ const runningClients: Record<string, Client> = {}
+ const listToolsCache: Record<
+   string,
+   ReturnType<typeof Client.prototype.listTools>
+ > = {}
+ 
+ /**
+  * Substitutes environment variable references ($VAR_NAME) in a string with their values.
+  * Supports both simple replacement ("$VAR_NAME") and interpolation ("Bearer $VAR_NAME").
+  */
+ function substituteEnvInValue(value: string): string {
+   return value.replace(/\$([A-Z_][A-Z0-9_]*)/g, (match, varName) => {
+@@ -158,44 +159,62 @@ export async function getMCPClient(config: MCPConfig): Promise<string> {
+       throw new Error(
+         `${baseMessage}. Failed to start MCP server via \`${commandStr}\`. ` +
+           `Ensure the command is installed and runnable (e.g. an up-to-date ` +
+           `node/npm/npx, or python/uvx) and that any required env vars are set.` +
+           (detail ? `\nServer stderr:\n${detail}` : ''),
+       )
+     }
+     throw new Error(
+       `${baseMessage}. Failed to connect to MCP server at ${config.url}.`,
+     )
+   }
+   runningClients[key] = client
+ 
+   return key
+ }
+ 
+ export function listMCPTools(
+   clientId: string,
+   ...args: Parameters<typeof Client.prototype.listTools>
+ ): ReturnType<typeof Client.prototype.listTools> {
+   const client = runningClients[clientId]
+   if (!client) {
+     throw new Error(`listTools: client not found with id: ${clientId}`)
+   }
+   if (!listToolsCache[clientId]) {
+-    listToolsCache[clientId] = client.listTools(...args)
++    const listing = listAllTools(client, ...args)
++    listToolsCache[clientId] = listing
++    // A failed listing is not kept, or one slow start would hide the server's tools for the rest
++    // of the process: the next call asks the server again.
++    listing.catch(() => {
++      if (listToolsCache[clientId] === listing) delete listToolsCache[clientId]
++    })
+   }
+   return listToolsCache[clientId]
+ }
+ 
++/** Every page of a server's `tools/list` as one result, with no `nextCursor` (see list-tools.ts). */
++export async function listAllTools(
++  client: Pick<Client, 'listTools'>,
++  ...[params, options]: Parameters<typeof Client.prototype.listTools>
++): ReturnType<typeof Client.prototype.listTools> {
++  return {
++    tools: await listAllMcpTools((cursor) =>
++      client.listTools(cursor ? { ...params, cursor } : params, options),
++    ),
++  }
++}
++
+ export async function callMCPTool(
+   clientId: string,
+   ...args: Parameters<typeof Client.prototype.callTool>
+ ): Promise<ToolResultOutput[]> {
+   const client = runningClients[clientId]
+   if (!client) {
+     throw new Error(`callTool: client not found with id: ${clientId}`)
+   }
+   const callResult = await client.callTool(...args)
+   const result = callResult as CallToolResult
+   const content = result.content
+ 
+   return mcpContentToToolResultOutputs(content)
+ }
+diff --git a/common/src/mcp/list-tools.ts b/common/src/mcp/list-tools.ts
+new file mode 100644
+index 000000000..31179e45f
+--- /dev/null
++++ b/common/src/mcp/list-tools.ts
+@@ -0,0 +1,53 @@
++/**
++ * `tools/list` is paginated in MCP: a server may return its tools a page at a time, each page naming
++ * the cursor for the next. A client that reads one page sees only the first page's tools.
++ */
++
++/**
++ * Later pages are fetched only while fewer tools than this are held. Cloud's custom MCP refuses a
++ * server listing more, and Desktop publishes at most `LOCAL_MCP_TOOL_LIMIT` (also 200) of a local
++ * server's tools to chats.
++ */
++export const MCP_LIST_TOOLS_MAX = 200
++/** A backstop for a server whose pages keep naming a fresh cursor. */
++export const MCP_LIST_TOOLS_MAX_PAGES = 20
++
++export interface McpToolsPage<T> {
++  tools: T[]
++  nextCursor?: string
++}
++
++/**
++ * Every tool a server lists, following `nextCursor`. The first page is returned whole, as the single
++ * `tools/list` call this replaces returned it, so a server that does not paginate sees no change.
++ * Later pages fill the list up to `maxTools`. Fetching stops at a cursor already followed, at a page
++ * that adds no tool name not already held, or after `maxPages`; a name a later page repeats is dropped.
++ */
++export async function listAllMcpTools<T extends { name: string }>(
++  listPage: (cursor: string | undefined) => Promise<McpToolsPage<T>>,
++  {
++    maxTools = MCP_LIST_TOOLS_MAX,
++    maxPages = MCP_LIST_TOOLS_MAX_PAGES,
++  }: { maxTools?: number; maxPages?: number } = {},
++): Promise<T[]> {
++  const first = await listPage(undefined)
++  const tools = [...(first.tools ?? [])]
++  const names = new Set(tools.map((tool) => tool.name))
++  const followed = new Set<string>()
++  let cursor = first.nextCursor
++  for (let page = 1; page < maxPages; page++) {
++    if (!cursor || followed.has(cursor) || tools.length >= maxTools) break
++    followed.add(cursor)
++    const next = await listPage(cursor)
++    let added = 0
++    for (const tool of next.tools ?? []) {
++      if (names.has(tool.name)) continue
++      names.add(tool.name)
++      tools.push(tool)
++      added++
++    }
++    if (added === 0) break
++    cursor = next.nextCursor
++  }
++  return tools.slice(0, Math.max(first.tools?.length ?? 0, maxTools))
++}
+diff --git a/common/src/sites/__tests__/next-prepare.test.ts b/common/src/sites/__tests__/next-prepare.test.ts
+index b1e286884..38b24c4c9 100644
+--- a/common/src/sites/__tests__/next-prepare.test.ts
++++ b/common/src/sites/__tests__/next-prepare.test.ts
+@@ -1,30 +1,37 @@
+ import { afterEach, expect, test } from 'bun:test'
+ import { createHash } from 'node:crypto'
+-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
++import {
++  mkdir,
++  mkdtemp,
++  readFile,
++  rename,
++  rm,
++  writeFile,
++} from 'node:fs/promises'
+ import { tmpdir } from 'node:os'
+-import { join } from 'node:path'
++import { delimiter, join } from 'node:path'
+ import { pathToFileURL } from 'node:url'
+ import { bundleSite } from '../local-files'
+ import { withNodeStdinProbe } from './node-transport-fixture'
+ import {
+   NEXT_ADAPTER_VERSION,
+   NEXT_WRANGLER_VERSION,
+   nextInstallInvocation,
+   nextPreparationEnvironment,
+   prepareNextSite,
+ } from '../next-prepare'
+ 
+ const roots: string[] = []
+ afterEach(async () => {
+   await Promise.all(
+     roots.splice(0).map((root) => rm(root, { recursive: true, force: true })),
+   )
+ })
+ 
+ test('Windows package shims use only fixed install words while native builds remain direct', () => {
+   for (const manager of ['npm', 'pnpm', 'yarn']) {
+     const windows = nextInstallInvocation(manager, 'win32')
+     const posix = nextInstallInvocation(manager, 'linux')
+     expect(windows.command).toBe('cmd.exe')
+     expect(windows.args.slice(0, 3)).toEqual(['/d', '/s', '/c'])
+     expect(windows.args[3]).toBe(`${manager}.cmd ${posix.args.join(' ')}`)
+@@ -166,50 +173,94 @@ test('prepares the same private cache and public artifact contract without repla
+   expect(
+     bundle.assets?.some((asset) =>
+       Buffer.from(asset.contentBase64, 'base64').toString().includes('private'),
+     ),
+   ).toBe(false)
+   const local = await readFile(
+     join(root, result.localWranglerConfigPath),
+     'utf8',
+   )
+   expect(local).toContain('NEXT_CACHE_DO_QUEUE')
+   expect(local).toContain('NEXT_TAG_CACHE_DO_SHARDED')
+   expect(local).toContain('enable_ctx_exports')
+   expect(local).toContain('NOTES')
+   expect(local).toContain('UPLOADS')
+   expect(local).toContain('http://localhost:8787')
+   expect(local).not.toContain('must-not-copy')
+   expect(local).not.toContain('"remote"')
+   await prepareNextSite(root)
+   expect(
+     (await readFile(join(root, '.gitignore'), 'utf8')).split(
+       '/freebuff-sites-build/',
+     ),
+   ).toHaveLength(2)
+ })
+ 
++// Incident guard: every first Next.js publish failed on Node 20, 24 and 26.
++// The program asked Node for the adapter before installing it, Node kept the
++// miss, and the build step right after the install could not find the adapter.
++// The adapter's entry sits under dist/, as the real one does: a package with an
++// index.js at its root is still found and hides the failure.
++test.skipIf(process.platform === 'win32')(
++  'a first build installs the adapter and finds it in the same run',
++  async () => {
++    const root = await fixture()
++    const adapter = join(root, 'node_modules/@opennextjs/cloudflare')
++    await rm(join(adapter, 'index.js'))
++    await mkdir(join(adapter, 'dist/api'))
++    await writeFile(join(adapter, 'dist/api/index.js'), '')
++    await writeFile(
++      join(adapter, 'package.json'),
++      JSON.stringify({
++        name: '@opennextjs/cloudflare',
++        version: NEXT_ADAPTER_VERSION,
++        type: 'module',
++        main: './dist/api/index.js',
++        exports: { '.': './dist/api/index.js' },
++      }),
++    )
++    const staged = join(root, 'staged')
++    await mkdir(staged)
++    await rename(join(root, 'node_modules/@opennextjs'), join(staged, 'scope'))
++    const bin = join(root, 'install-bin')
++    await mkdir(bin)
++    await writeFile(
++      join(bin, 'npm'),
++      `#!/bin/sh\nmv '${join(staged, 'scope')}' node_modules/@opennextjs\n`,
++      { mode: 0o755 },
++    )
++    const previousPath = process.env.PATH
++    try {
++      process.env.PATH = bin + delimiter + (previousPath ?? '')
++      expect((await prepareNextSite(root)).runtime).toBe('opennext')
++    } finally {
++      if (previousPath === undefined) delete process.env.PATH
++      else process.env.PATH = previousPath
++    }
++  },
++)
++
+ test('refuses to overwrite an existing deployment config or unrelated output directory', async () => {
+   const root = await fixture()
+   await writeFile(
+     join(root, 'freebuff.open-next.config.ts'),
+     'export default {custom: true}',
+   )
+   await expect(prepareNextSite(root)).rejects.toThrow(
+     'already exists and is not generated',
+   )
+   expect(
+     await readFile(join(root, 'freebuff.open-next.config.ts'), 'utf8'),
+   ).toBe('export default {custom: true}')
+   const second = await fixture()
+   await mkdir(join(second, 'freebuff-sites-build'))
+   await writeFile(join(second, 'freebuff-sites-build/notes.txt'), 'user notes')
+   await expect(prepareNextSite(second)).rejects.toThrow(
+     'not created by Freebuff',
+   )
+   expect(
+     await readFile(join(second, 'freebuff-sites-build/notes.txt'), 'utf8'),
+   ).toBe('user notes')
+ })
+ 
+ test('Next realtime generates a local helper and retains the capability on rebuild without shipping helper code', async () => {
+   const root = await fixture()
+diff --git a/common/src/sites/next-prepare.ts b/common/src/sites/next-prepare.ts
+index 7462bb21a..93eae63de 100644
+--- a/common/src/sites/next-prepare.ts
++++ b/common/src/sites/next-prepare.ts
+@@ -206,99 +206,103 @@ export function nextPreparationEnvironment(
+     'TMP',
+     'TEMP',
+     'SystemRoot',
+     'ComSpec',
+     'PATHEXT',
+     'PNPM_HOME',
+     'BUN_INSTALL',
+   ]
+   return {
+     ...Object.fromEntries(
+       allowed
+         .filter((key) => environment[key] !== undefined)
+         .map((key) => [key, environment[key]]),
+     ),
+     CI: '1',
+     NODE_ENV: 'production',
+     NEXT_TELEMETRY_DISABLED: '1',
+     WRANGLER_SEND_METRICS: 'false',
+   }
+ }
+ 
+ // Plain JavaScript deliberately: Cloud executes this program without the host's
+ // TypeScript loader, dependencies, filesystem or credentials.
+ const NEXT_PREPARATION_PROGRAM = String.raw`
+ import { readFile, writeFile, mkdir, readdir, realpath, lstat, copyFile, open, rm } from 'node:fs/promises';
+-import { readFileSync } from 'node:fs';
++import { existsSync, readFileSync, realpathSync } from 'node:fs';
+ import { resolve, relative, join, dirname, extname, isAbsolute, sep } from 'node:path';
+ import { createHash } from 'node:crypto';
+ import { createRequire } from 'node:module';
+ import { pathToFileURL } from 'node:url';
+ import { spawn } from 'node:child_process';
+ 
+ let stage = 'checking the project';
+ let logPath = 'freebuff-sites-build/build.log';
+ let log;
+ const safeError = (message) => Object.assign(new Error(message), { safe: true });
+ const within = (root, path) => { const rel = relative(root, path); return rel !== '..' && !rel.startsWith('..' + sep) && !isAbsolute(rel); };
+ const exists = async (path) => { try { await lstat(path); return true; } catch (error) { if (error.code === 'ENOENT') return false; throw error; } };
+ const json = async (path) => JSON.parse(await readFile(path, 'utf8'));
+ const slash = (path) => path.split(sep).join('/');
+ const marker = '// Generated by Freebuff Sites. Changes are regenerated when publishing.\n';
+ try {
+   const root = await realpath(process.cwd());
+   const project = await realpath(resolve(root, input.projectDirectory));
+   if (!within(root, project)) throw safeError('Choose a Next.js project directory inside this workspace.');
+   const version = process.versions.node.split('.').map(Number);
+   if (version[0] < 20 || (version[0] === 20 && version[1] < 19)) throw safeError('OpenNext needs Node.js 20.19 or newer.');
+   const pkgPath = join(project, 'package.json');
+   const pkg = await json(pkgPath);
+   if (!pkg.dependencies?.next && !pkg.devDependencies?.next) throw safeError('The selected directory is not a Next.js project.');
+   const out = join(project, 'freebuff-sites-build');
+   if (await exists(out)) {
+     if ((await lstat(out)).isSymbolicLink() || !await exists(join(out, '.freebuff-generated'))) throw safeError('freebuff-sites-build already contains files not created by Freebuff. Rename that directory before preparing this project.');
+   } else {
+     await mkdir(out);
+     await writeFile(join(out, '.freebuff-generated'), 'Freebuff Sites build output\n', { flag: 'wx' });
+   }
+   logPath = slash(relative(root, join(out, 'build.log')));
+   log = await open(join(out, 'build.log'), 'w', 0o600);
+   const childEnv = Object.fromEntries(['PATH','HOME','USERPROFILE','USER','LOGNAME','SHELL','TMPDIR','TMP','TEMP','SystemRoot','ComSpec','PATHEXT','PNPM_HOME','BUN_INSTALL'].filter((key) => process.env[key] !== undefined).map((key) => [key, process.env[key]]));
+   Object.assign(childEnv, { CI: '1', NEXT_TELEMETRY_DISABLED: '1', WRANGLER_SEND_METRICS: 'false' });
+   const run = (command, args, windowsVerbatimArguments=false) => new Promise((resolve, reject) => {
+     const child = spawn(command, args, { cwd: project, env: childEnv, windowsVerbatimArguments, stdio: ['ignore', log.fd, log.fd] });
+     child.once('error', reject);
+-    child.once('close', (code) => code === 0 ? resolve() : reject(new Error('command failed')));
++    child.once('close', (code, signal) => code === 0 ? resolve() : reject(new Error([command, ...args].join(' ') + (signal ? ' was stopped by ' + signal : ' exited with code ' + code))));
+   });
+   const projectRequire = createRequire(pkgPath);
++  // Read node_modules directly, the way Node walks it. Asking Node to resolve a
++  // package before it is installed makes Node 20, 24 and 26 remember that it has
++  // no package.json for the rest of this process, so the same lookup after the
++  // install still fails and a first build stops here. Nothing above the install
++  // may call projectRequire.resolve or import a package by name.
+   const packageRoot = (name) => {
+-    let directory = dirname(projectRequire.resolve(name));
+-    while (dirname(directory) !== directory) {
+-      try { if (JSON.parse(readFileSync(join(directory,'package.json'),'utf8')).name === name) return directory; } catch {}
+-      directory = dirname(directory);
++    for (let directory = project; ; directory = dirname(directory)) {
++      const candidate = join(directory, 'node_modules', name);
++      if (existsSync(join(candidate, 'package.json'))) return realpathSync(candidate);
++      if (dirname(directory) === directory) throw new Error('Package not found: ' + name);
+     }
+-    throw new Error('Package not found');
+   };
+   const installed = (name) => { try { return JSON.parse(readFileSync(join(packageRoot(name),'package.json'),'utf8')).version; } catch { return null; } };
+   const assertSupportedNext = (version) => {
+     const parts=(version||'').split('.').map(Number);
+     if (!((parts[0] === 15 && (parts[1] > 5 || parts[1] === 5 && parts[2] >= 28)) || (parts[0] === 16 && (parts[1] > 4 || parts[1] === 4 && parts[2] >= 1)))) {
+       throw safeError('This OpenNext adapter supports Next.js 15.5.28+ (15.x) and 16.4.1+ (16.x). Update Next.js, test the app, then prepare it again. Freebuff did not change your Next.js version.');
+     }
+   };
+   if(installed('next')) assertSupportedNext(installed('next'));
+   let manager = typeof pkg.packageManager === 'string' ? pkg.packageManager.split('@')[0] : null;
+   if (!manager) {
+     for (let directory=project;within(root,directory);directory=dirname(directory)) {
+       const ancestorPackage=await exists(join(directory,'package.json'))?await json(join(directory,'package.json')):{};
+       if(typeof ancestorPackage.packageManager==='string')manager=ancestorPackage.packageManager.split('@')[0];
+       for (const [lock, name] of [['bun.lock','bun'], ['bun.lockb','bun'], ['pnpm-lock.yaml','pnpm'], ['yarn.lock','yarn'], ['package-lock.json','npm']]) {
+         if (!manager&&await exists(join(directory, lock))) { manager = name; break; }
+       }
+       if(manager||directory===root)break;
+     }
+   }
+   manager ||= 'npm';
+   if (!['bun','npm','pnpm','yarn'].includes(manager)) throw safeError('Use npm, Bun, pnpm or Yarn to install this Next.js project.');
+   stage = 'installing the OpenNext adapter';
+   if (installed('@opennextjs/cloudflare') !== input.adapterVersion || installed('wrangler') !== input.wranglerVersion || !installed('next')) {
+     const invocation=input.installCommands[process.platform==='win32'?'win32':'posix'][manager];
+@@ -448,33 +452,34 @@ try {
+   });
+   if (!modules.some((module) => module.name === 'deploy-entry.js')) throw safeError('Wrangler did not produce the expected Worker entrypoint.');
+   const cacheDir = join(out,'cache');
+   await rm(cacheDir,{recursive:true,force:true});
+   await mkdir(cacheDir);
+   const cache = [];
+   await walk(join(project,'.open-next/cache'),async (path,name) => {
+     const parts=name.split('/'), isFetch=parts[0]==='__fetch';
+     if(isFetch) parts.shift();
+     const buildId=parts.shift();
+     if(!buildId || !/^[A-Za-z0-9_-]+$/.test(buildId) || !parts.length || (!isFetch && !name.endsWith('.cache'))) throw safeError('OpenNext produced an unsupported cache entry.');
+     const route='/' + parts.join('/').replace(isFetch ? /$^/ : /\.cache$/,'');
+     const hash=createHash('sha256').update(route).digest('hex');
+     const key='incremental-cache/'+buildId+'/'+hash+(isFetch?'.fetch':'.cache');
+     const file=cache.length+'.json';
+     await copyFile(path,join(cacheDir,file));
+     cache.push({key,path:'cache/'+file});
+   });
+   const manifest={runtime:'opennext',...(realtime?{realtime:true}:{}),entrypoint:'deploy-entry.js',compatibilityDate:localConfig.compatibility_date,compatibilityFlags:hostedFlags,modules,assetsDirectory:'assets',cache,spa:false};
+   await writeFile(join(out,'manifest.json'),JSON.stringify(manifest,null,2)+'\n');
+   stage = 'seeding the local preview cache';
+   await run(process.execPath,[adapterCli,'populateCache','local','--config','freebuff.wrangler.jsonc']);
+   await log.close(); log=undefined;
+   process.stdout.write('FREEBUFF_NEXT_RESULT:'+JSON.stringify({runtime:'opennext',manifestPath:slash(relative(root,join(out,'manifest.json'))),localWranglerConfigPath:slash(relative(root,join(project,'freebuff.wrangler.jsonc'))),...(realtime?{realtimeWranglerConfigPath:slash(relative(root,join(project,'freebuff-realtime/wrangler.jsonc')))}:{}),logPath,nextVersion,adapterVersion:input.adapterVersion})+'\n');
+ } catch(error) {
+-  if(log) { await log.write('\nPreparation failed at '+stage+'\n'); await log.close(); }
++  // The message below sends people to this log, so the reason must be in it.
++  if(log) { try { await log.write('\nPreparation failed at '+stage+'\n'+(error?.stack||String(error))+'\n'); await log.close(); } catch {} }
+   const message=(error?.safe?error.message:'Next.js preparation failed while '+stage+'. Inspect '+logPath+' for the build error.').slice(0,4096);
+   const errorLine='FREEBUFF_NEXT_ERROR:'+message+'\n';
+   process.stderr.write(errorLine);
+   process.stdout.write(errorLine);
+   process.exitCode=1;
+ }
+ `
