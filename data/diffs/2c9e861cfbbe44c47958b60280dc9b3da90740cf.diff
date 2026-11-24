@@ -1,0 +1,168 @@
+diff --git a/common/src/util/__tests__/log-data.test.ts b/common/src/util/__tests__/log-data.test.ts
+index de8f884c5..dd231f70e 100644
+--- a/common/src/util/__tests__/log-data.test.ts
++++ b/common/src/util/__tests__/log-data.test.ts
+@@ -1,32 +1,48 @@
+ import { describe, expect, test } from 'bun:test'
+ 
+ import { serializeLogData, toJsonSafeLogData } from '../log-data'
+ 
+ const parse = (data: unknown) => JSON.parse(serializeLogData(data)!)
+ 
+ describe('serializeLogData', () => {
++  test('groups account-bound models in stream recovery logs without exposing handles', () => {
++    const handle = 'fbm1.synthetic-catalog-handle'
++    for (const metric of [
++      'stream_recovery_detected',
++      'stream_recovery_rescued',
++      'stream_recovery_gave_up',
++      'stream_silent_timeout_continued',
++    ]) {
++      const data = { metric, model: handle, runId: 'run-123' }
++      expect(parse(data)).toEqual({ ...data, model: 'catalog' })
++      expect(data.model).toBe(handle)
++      const plain = { ...data, model: 'openrouter/example' }
++      expect(parse(plain)).toEqual(plain)
++    }
++  })
++
+   // JSON.stringify(new Error('x')) is '{}': the reason never reached Axiom.
+   test('an error keeps its name and message', () => {
+     const row = parse({ error: new TypeError('fetch failed') })
+     expect(row.error.name).toBe('TypeError')
+     expect(row.error.message).toBe('fetch failed')
+     expect(typeof row.error.stack).toBe('string')
+   })
+ 
+   test('keeps the fields a library adds, and walks the cause', () => {
+     const cause = Object.assign(new Error('canceling statement'), {
+       code: '57014',
+     })
+     const error = Object.assign(new Error('Failed query', { cause }), {
+       query: 'select 1',
+     })
+     const row = parse({ error })
+     expect(row.error.query).toBe('select 1')
+     expect(row.error.cause.message).toBe('canceling statement')
+     expect(row.error.cause.code).toBe('57014')
+   })
+ 
+   // The 2026-10-02 ad-revenue rollup failure: a bulk insert's DrizzleQueryError
+   // was 522 KB of SQL and params, the row was cut at the data cap, and the
+   // Postgres reason on `cause` never reached Axiom.
+   test('a huge failed query keeps its cause and drops the payload', () => {
+diff --git a/common/src/util/log-data.ts b/common/src/util/log-data.ts
+index 1f8b129e1..d780db8ed 100644
+--- a/common/src/util/log-data.ts
++++ b/common/src/util/log-data.ts
+@@ -1,26 +1,27 @@
+ import { MAX_LOG_DATA_BYTES } from '../schemas/logs'
++import { isFreebuffModelHandle } from '../types/freebuff-model-catalog'
+ import { redactErrorFieldForLog, redactQueryErrorForLog } from './log-redaction'
+ 
+ import type { LogLevel } from '../types/contracts/logs'
+ 
+ /**
+  * Shared pieces of the Axiom log-row pipeline used by every producer that
+  * ingests rows — the long-lived sink (packages/logging/src/sink.ts) and the
+  * Convex direct-ingest helper (freebuff/web/convex/lib/axiom_log.ts). Living
+  * here keeps the serialized `data` contract and level ordering identical
+  * across producers, so APL queries behave the same regardless of which
+  * service emitted a row. Deliberately light on imports (the schemas module
+  * pulls only zod) so it stays safe for the Convex bundle.
+  */
+ 
+ /** Numeric severity order for LogLevel, used for min-level gating. */
+ export const LOG_LEVEL_ORDER: Record<LogLevel, number> = {
+   debug: 10,
+   info: 20,
+   warn: 30,
+   error: 40,
+   fatal: 50,
+ }
+ 
+ /** Stack traces cost ingest on every error row; the top frames carry it. */
+ const MAX_ERROR_STACK_CHARS = 2_000
+@@ -148,61 +149,80 @@ function fitLogDataToCap(data: unknown, originalBytes: number): string {
+       // A dropped field still costs its name in `_omitted`.
+       budget -= field.key.length + 12
+     }
+   }
+ 
+   // Nothing fit: fall back to a preview, so a single enormous field still
+   // leaves a readable head rather than only its byte count.
+   if (Object.keys(kept).length === 0) {
+     return wholePayloadPreview(stringifyLogData(data) ?? '')
+   }
+ 
+   const fitted = stringifyLogData({
+     ...kept,
+     _truncated: true,
+     original_bytes: originalBytes,
+     _omitted: omitted,
+   })
+   // The budget arithmetic should make this unreachable; a payload whose
+   // serialization grew anyway falls back rather than breaking the cap.
+   if (fitted === undefined || fitted.length > MAX_LOG_DATA_BYTES) {
+     return wholePayloadPreview(stringifyLogData(data) ?? '')
+   }
+   return fitted
+ }
+ 
++function redactStreamRecoveryModel(data: unknown): unknown {
++  if (data === null || typeof data !== 'object' || Array.isArray(data)) {
++    return data
++  }
++  const { metric, model } = data as Record<string, unknown>
++  if (
++    typeof metric === 'string' &&
++    (metric.startsWith('stream_recovery_') ||
++      metric.startsWith('stream_silent_timeout_')) &&
++    typeof model === 'string' &&
++    isFreebuffModelHandle(model)
++  ) {
++    // Older clients also send the handle in unmarked error rows.
++    return { ...data, model: 'catalog' }
++  }
++  return data
++}
++
+ /**
+  * Serialize a log payload to a single string field, tolerating circular refs
+  * and capping size. The cap applies to ALL sources so a large `data` payload
+  * can't inflate Axiom ingest cost. The truncated form is still valid JSON so
+  * query scripts can `parse_json(data)`.
+  *
+  * An oversized object keeps the fields that fit (see {@link fitLogDataToCap});
+  * only an oversized string or array collapses to a `preview`.
+  */
+-export function serializeLogData(data: unknown): string | null {
+-  if (data == null) return null
++export function serializeLogData(input: unknown): string | null {
++  if (input == null) return null
++  const data = redactStreamRecoveryModel(input)
+   let serialized: string
+   if (typeof data === 'string') {
+     serialized = data
+   } else {
+     const stringified = stringifyLogData(data)
+     if (stringified === undefined) return null
+     serialized = stringified
+   }
+   if (serialized.length > MAX_LOG_DATA_BYTES) {
+     return typeof data === 'string'
+       ? JSON.stringify({
+           _truncated: true,
+           original_bytes: serialized.length,
+           preview: serialized.slice(0, MAX_LOG_DATA_BYTES),
+         })
+       : fitLogDataToCap(data, serialized.length)
+   }
+   return serialized
+ }
+ 
+ /**
+  * The same payload with every `Error` replaced by its JSON form, as plain
+  * JSON values rather than a string.
+  *
+  * For producers that hand their payload to ANOTHER process before it reaches
