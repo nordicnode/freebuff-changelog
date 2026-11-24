@@ -1,0 +1,339 @@
+diff --git a/sdk/src/byok.test.ts b/sdk/src/byok.test.ts
+index 616183acc..0f913dc3a 100644
+--- a/sdk/src/byok.test.ts
++++ b/sdk/src/byok.test.ts
+@@ -1,40 +1,39 @@
+ import { afterEach, describe, expect, test } from 'bun:test'
+ import { promises as fs } from 'node:fs'
+ import { tmpdir } from 'node:os'
+ import path from 'node:path'
+ import {
+   ByokCredentialError,
+   createByokConnectionStore,
+   createBunByokConnectionStore,
+   createBunByokMetadataStore,
+   normalizeByokBaseUrl,
+   byokModelLimits,
+   byokCompletionUrl,
+   BYOK_DEFAULT_CONTEXT_WINDOW,
+   BYOK_DEFAULT_MAX_OUTPUT_TOKENS,
+-  BYOK_DISCOVERED_CONTEXT_WINDOW_CAP,
+   BYOK_UNKNOWN_REMOTE_CONTEXT_WINDOW,
+   clearByokContextWindowCache,
+   contextWindowFromModelList,
+   withEffectiveByokLimits,
+   type ResolvedByokConnection,
+   type ByokConnection,
+   type ByokSecretStore,
+ } from './byok'
+ import {
+   CHATGPT_CONTEXT_WINDOW,
+   CHATGPT_DEFAULT_MODELS,
+   CHATGPT_MAX_OUTPUT_TOKENS,
+   CHATGPT_SIGN_IN_AGAIN,
+   type ChatGptTokens,
+ } from './chatgpt'
+ import { fakeChatGptJwt } from './__tests__/fixtures/chatgpt-jwt'
+ 
+ const directories: string[] = []
+ afterEach(async () => {
+   for (const dir of directories.splice(0))
+     await fs.rm(dir, { recursive: true, force: true })
+ })
+ const input = {
+   name: 'Fixture',
+   provider: 'openai-compatible' as const,
+@@ -712,62 +711,66 @@ describe('effective BYOK limits for a run', () => {
+   })
+ 
+   test('an untouched default takes the window the provider lists, keeping the credential hidden', async () => {
+     const { calls, fetchImpl } = listing({
+       data: [{ id: 'acme/coder', max_model_len: 65_536 }],
+     })
+     const connection = resolved()
+     const effective = await withEffectiveByokLimits(connection, { fetch: fetchImpl })
+     expect(effective).toMatchObject({ contextWindow: 65_536, maxOutputTokens: 4_096 })
+     expect(effective.apiKey).toBe('listing-secret')
+     expect(effective.assertCurrent).toBe(connection.assertCurrent)
+     expect(Object.keys(effective)).not.toContain('apiKey')
+     expect(JSON.stringify(effective)).not.toContain('listing-secret')
+     expect(Object.isFrozen(effective)).toBe(true)
+     expect(byokModelLimits(effective).maxContextLength).toBe(
+       Math.floor((65_536 - 4_096) * 0.9),
+     )
+     expect(calls).toEqual([
+       { url: 'https://llm.example.com/v1/models', auth: 'Bearer listing-secret' },
+     ])
+     // One listing per endpoint and model, not one per turn.
+     await withEffectiveByokLimits(connection, { fetch: fetchImpl })
+     expect(calls).toHaveLength(1)
+   })
+ 
+-  test('OpenRouter is asked without the key, and a huge window is capped', async () => {
++  test.each([
++    [1_048_576, 1_048_576, 940_032],
++    [4_000_000, 2_000_000, 1_796_313],
++  ])('OpenRouter window %i uses %i tokens and a %i compaction budget', async (reported, window, budget) => {
+     const { calls, fetchImpl } = listing({
+       data: [
+-        { id: 'vendor/giant', context_length: 1_048_576 },
++        { id: 'vendor/giant', context_length: reported },
+         { id: 'vendor/small', context_length: 40_960 },
+       ],
+     })
+     const giant = await withEffectiveByokLimits(
+       resolved({ provider: 'openrouter', baseUrl: undefined, model: 'vendor/giant' }),
+       { fetch: fetchImpl },
+     )
+-    expect(giant.contextWindow).toBe(BYOK_DISCOVERED_CONTEXT_WINDOW_CAP)
++    expect(giant.contextWindow).toBe(window)
++    expect(byokModelLimits(giant).maxContextLength).toBe(budget)
+     const free = await withEffectiveByokLimits(
+       resolved({ provider: 'openrouter', baseUrl: undefined, model: 'vendor/small:free' }),
+       { fetch: fetchImpl },
+     )
+     expect(free.contextWindow).toBe(40_960)
+     expect(calls[0]).toEqual({ url: 'https://openrouter.ai/api/v1/models', auth: null })
+   })
+ 
+   test('an unlisted remote model gets 128k; a local server keeps its configured default', async () => {
+     const miss = listing({ data: [{ id: 'someone/else', context_length: 8_192 }] })
+     expect(
+       (await withEffectiveByokLimits(resolved(), { fetch: miss.fetchImpl })).contextWindow,
+     ).toBe(BYOK_UNKNOWN_REMOTE_CONTEXT_WINDOW)
+     const local = resolved({ baseUrl: 'http://127.0.0.1:1234/v1' })
+     expect(await withEffectiveByokLimits(local, { fetch: miss.fetchImpl })).toBe(local)
+     expect(local.contextWindow).toBe(BYOK_DEFAULT_CONTEXT_WINDOW)
+   })
+ 
+   test('a failing or unreachable listing never fails the run', async () => {
+     const failed = listing({ error: 'nope' }, 500)
+     expect(
+       (await withEffectiveByokLimits(resolved(), { fetch: failed.fetchImpl })).contextWindow,
+     ).toBe(BYOK_UNKNOWN_REMOTE_CONTEXT_WINDOW)
+     clearByokContextWindowCache()
+     const offline = (async () => {
+diff --git a/sdk/src/byok.ts b/sdk/src/byok.ts
+index ba49ebec6..9d20d4e14 100644
+--- a/sdk/src/byok.ts
++++ b/sdk/src/byok.ts
+@@ -2,64 +2,66 @@
+ import { promises as fs } from 'node:fs'
+ import { homedir } from 'node:os'
+ import path from 'node:path'
+ import { z } from 'zod/v4'
+ import { byokReasoningEfforts } from '@codebuff/common/constants/reasoning-effort'
+ import type { ReasoningEffort } from '@codebuff/common/constants/reasoning-effort'
+ import {
+   CHATGPT_BYOK_PROVIDER,
+   CHATGPT_CODEX_BASE_URL,
+   CHATGPT_CODEX_RESPONSES_URL,
+   CHATGPT_CONTEXT_WINDOW,
+   CHATGPT_DEFAULT_MODELS,
+   CHATGPT_MAX_OUTPUT_TOKENS,
+   ChatGptAuthError,
+   needsChatGptRefresh,
+   parseChatGptTokens,
+   refreshChatGptTokens,
+   serializeChatGptTokens,
+   type ChatGptModelChoice,
+   type ChatGptTokens,
+ } from './chatgpt'
+ import { getSystemProcessEnv } from './env'
+ import { recoverByokLock } from './impl/byok-lock'
+ 
+ export const BYOK_SECRET_SERVICE = 'com.freebuff.byok.v1'
++/** Largest context window supported by BYOK connection validation. */
++const BYOK_MAX_CONTEXT_WINDOW = 2_000_000
+ const envReference = /^env:[A-Za-z_][A-Za-z0-9_]*$/
+ const ownedReference = /^connection:[a-f0-9-]+:[1-9][0-9]*$/
+ /** One ChatGPT sign-in, shared by every model saved from it (see saveChatGptSignIn). */
+ const chatGptReference = /^chatgpt:[a-f0-9-]+$/
+ const text = z.string().trim().min(1).max(256)
+ const connectionSchema = z
+   .object({
+     id: z.uuid(),
+     revision: z.number().int().positive(),
+     name: text,
+     provider: z.enum(['openrouter', 'openai-compatible', CHATGPT_BYOK_PROVIDER]),
+     model: text,
+     baseUrl: z.string().max(2048).optional(),
+-    contextWindow: z.number().int().min(4096).max(2_000_000).optional(),
++    contextWindow: z.number().int().min(4096).max(BYOK_MAX_CONTEXT_WINDOW).optional(),
+     maxOutputTokens: z.number().int().min(1).max(1_000_000).optional(),
+     credentialRef: z
+       .string()
+       .refine(
+         (value) =>
+           envReference.test(value) ||
+           ownedReference.test(value) ||
+           chatGptReference.test(value),
+       ),
+     createdAt: z.iso.datetime(),
+     updatedAt: z.iso.datetime(),
+   })
+   .strict()
+ export type ByokConnection = z.infer<typeof connectionSchema>
+ export type ByokProvider = ByokConnection['provider']
+ /** Runtime-only. The built-in resolver makes apiKey non-enumerable. */
+ export type ResolvedByokConnection = ByokConnection & {
+   apiKey: string
+   /** Recheck revocation before every provider request; never serialized. */
+   assertCurrent?: () => Promise<void>
+   /**
+    * ChatGPT sign-ins only: a current access token, refreshed when it is about
+    * to expire. `apiKey` holds the token current when the run started, for
+    * scrubbing; requests must use this instead. Never serialized.
+    */
+@@ -273,80 +275,74 @@ function parseConnections(value: unknown): ByokConnection[] {
+   for (const item of parsed.data) {
+     byokModelLimits(item)
+     normalizeByokBaseUrl(item.provider, item.baseUrl)
+     if (
+       item.provider === CHATGPT_BYOK_PROVIDER
+         ? !chatGptReference.test(item.credentialRef)
+         : !envReference.test(item.credentialRef) &&
+           !item.credentialRef.startsWith(`connection:${item.id}:`)
+     ) {
+       throw new ByokConnectionStateError(
+         'BYOK credential reference belongs to a different connection',
+       )
+     }
+   }
+   return parsed.data
+ }
+ /**
+  * The limits a connection gets when nobody chose any. The Desktop settings
+  * form pre-fills exactly this pair, and the store persists it, so a stored
+  * 32,768 / 4,096 almost always means "not configured" rather than a decision.
+  */
+ export const BYOK_DEFAULT_CONTEXT_WINDOW = 32_768
+ export const BYOK_DEFAULT_MAX_OUTPUT_TOKENS = 4_096
+ /** A remote endpoint that does not report its model's window. */
+ export const BYOK_UNKNOWN_REMOTE_CONTEXT_WINDOW = 131_072
+-/**
+- * The most an automatically-chosen window may be: the hosted budget's order of
+- * magnitude, since every token of a BYOK request is billed to the user's key.
+- * A user who wants more types it into the connection.
+- */
+-export const BYOK_DISCOVERED_CONTEXT_WINDOW_CAP = 400_000
+ 
+ /**
+  * A connection's limits as a run uses them. `maxOutputTokens` is the stored
+  * setting; `reservedOutputTokens` is the most output a request asks for, and
+  * `maxContextLength` (the compaction budget) is 90% of the window left after it.
+  *
+  * The reservation is at most half the window. The settings form's `max`
+  * offers an output limit of window - 1, which left a budget of 0: the agent
+  * schema then refused every agent of the run before any model call (Cloud,
+  * 2026-11). A prompt plus output over the window is also a request a strict
+  * endpoint refuses. Any valid window keeps a budget of at least 1,843.
+  */
+ export function byokModelLimits(connection: {
+   contextWindow?: number
+   maxOutputTokens?: number
+ }) {
+   const contextWindow = connection.contextWindow ?? BYOK_DEFAULT_CONTEXT_WINDOW
+   const maxOutputTokens =
+     connection.maxOutputTokens ??
+     Math.min(BYOK_DEFAULT_MAX_OUTPUT_TOKENS, Math.floor(contextWindow / 4))
+   if (
+     !Number.isInteger(contextWindow) ||
+     contextWindow < 4096 ||
+-    contextWindow > 2_000_000 ||
++    contextWindow > BYOK_MAX_CONTEXT_WINDOW ||
+     !Number.isInteger(maxOutputTokens) ||
+     maxOutputTokens < 1 ||
+     maxOutputTokens >= contextWindow
+   ) {
+     throw new Error(
+       'Choose a context limit of 4096–2000000 tokens and a smaller positive output limit',
+     )
+   }
+   const reservedOutputTokens = Math.min(
+     maxOutputTokens,
+     Math.floor(contextWindow / 2),
+   )
+   return {
+     contextWindow,
+     maxOutputTokens,
+     reservedOutputTokens,
+     maxContextLength: Math.floor((contextWindow - reservedOutputTokens) * 0.9),
+   }
+ }
+ 
+ /** True when the connection carries the untouched default limits (see above). */
+ export function hasDefaultByokLimits(connection: {
+   contextWindow?: number
+   maxOutputTokens?: number
+ }): boolean {
+@@ -518,66 +514,66 @@ function copyRuntimeFields(
+   target: ResolvedByokConnection,
+   source: ResolvedByokConnection,
+ ): ResolvedByokConnection {
+   Object.defineProperty(target, 'apiKey', {
+     value: source.apiKey,
+     enumerable: false,
+   })
+   for (const field of ['assertCurrent', 'accessToken'] as const)
+     if (source[field])
+       Object.defineProperty(target, field, {
+         value: source[field],
+         enumerable: false,
+       })
+   return target
+ }
+ 
+ /**
+  * The connection a run should use: identical, unless its limits are the
+  * untouched defaults. Those are a 32,768-token guess, and for a coding agent
+  * whose tool schemas and prompt alone are ~15-20k tokens, compacting at 80% of
+  * 90% of (32,768 - 4,096) leaves a few thousand tokens of conversation: every
+  * few tool calls the run compacted, and the summary itself sat above the line
+  * (Desktop feedback 2026-09-24 and 09-27, "compacts every 3-5 turns").
+  *
+  * The provider's own number wins when its `/models` listing reports one
+- * (capped at BYOK_DISCOVERED_CONTEXT_WINDOW_CAP). Otherwise a remote endpoint
+- * gets 128k, which nearly every hosted coding model supports, and a loopback
++ * (up to the same maximum as a manually configured window). Otherwise a remote
++ * endpoint gets 128k, which nearly every hosted coding model supports, and a loopback
+  * server keeps the configured default, because a local server's window is
+  * whatever it was launched with. Limits a user actually typed are never
+  * replaced. The credential stays non-enumerable on the copy.
+  */
+ export async function withEffectiveByokLimits(
+   connection: ResolvedByokConnection,
+   options: { fetch?: typeof globalThis.fetch } = {},
+ ): Promise<ResolvedByokConnection> {
+   if (!hasDefaultByokLimits(connection)) return connection
+   const discovered = await discoverByokContextWindow(connection, options.fetch)
+   const contextWindow =
+     // A window must exceed the output limit (byokModelLimits' own rule).
+     discovered !== undefined && discovered > BYOK_DEFAULT_MAX_OUTPUT_TOKENS
+-      ? Math.min(discovered, BYOK_DISCOVERED_CONTEXT_WINDOW_CAP)
++      ? Math.min(discovered, BYOK_MAX_CONTEXT_WINDOW)
+       : isLoopbackByokEndpoint(connection)
+         ? BYOK_DEFAULT_CONTEXT_WINDOW
+         : BYOK_UNKNOWN_REMOTE_CONTEXT_WINDOW
+   if (
+     contextWindow === (connection.contextWindow ?? BYOK_DEFAULT_CONTEXT_WINDOW)
+   )
+     return connection
+   const effective = {
+     ...connection,
+     contextWindow,
+     maxOutputTokens:
+       connection.maxOutputTokens ?? BYOK_DEFAULT_MAX_OUTPUT_TOKENS,
+   } as ResolvedByokConnection
+   return Object.freeze(copyRuntimeFields(effective, connection))
+ }
+ 
+ function cleanInput(input: ByokConnectionInput) {
+   if (input.provider === CHATGPT_BYOK_PROVIDER)
+     throw new Error('Sign in with ChatGPT to add a ChatGPT provider')
+   const limits = byokModelLimits(input)
+   const name = text.safeParse(input.name),
+     model = text.safeParse(input.model)
+   if (!name.success || !model.success)
+     throw new Error('Connection name and model must contain 1–256 characters')
+   const baseUrl = normalizeByokBaseUrl(input.provider, input.baseUrl)
