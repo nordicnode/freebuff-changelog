@@ -1,0 +1,964 @@
+diff --git a/cli/src/__tests__/unit/create-run-config.test.ts b/cli/src/__tests__/unit/create-run-config.test.ts
+index 46ffc3ee5..733b25841 100644
+--- a/cli/src/__tests__/unit/create-run-config.test.ts
++++ b/cli/src/__tests__/unit/create-run-config.test.ts
+@@ -1,28 +1,30 @@
+ import { describe, test, expect, mock } from 'bun:test'
+ 
++import { buildAdAuctionRequest } from '../../ads/ad-request'
+ import { createStreamController } from '../../hooks/stream-state'
++import { useChatStore } from '../../state/chat-store'
+ import { createMessageUpdater } from '../../utils/message-updater'
+ import { createRunConfig, isSensitiveFile } from '../../utils/create-run-config'
+ 
+ import type { CreateRunConfigParams } from '../../utils/create-run-config'
+ 
+ describe('createRunConfig', () => {
+   const config = (agent: CreateRunConfigParams['agent']) =>
+     createRunConfig({
+       agent,
+       prompt: 'hi',
+       content: undefined,
+       previousRunState: null,
+       agentDefinitions: [],
+       signal: new AbortController().signal,
+     } as unknown as CreateRunConfigParams)
+ 
+   test('analytics observers cannot break SDK callbacks and ignore lost chat ownership', () => {
+     let active = true
+     const observeEvent = mock(() => {
+       throw new Error('capture unavailable')
+     })
+     const observeChunk = mock(() => {
+       throw new Error('capture unavailable')
+     })
+     const run = createRunConfig({
+@@ -132,25 +134,88 @@ describe('isSensitiveFile', () => {
+     ['id_rsa_github', true],
+     ['id_rsa.pub', false], // public keys allowed
+ 
+     // Credentials suffix pattern
+     ['aws_credentials', true],
+     ['db_credentials', true],
+ 
+     // Substring patterns
+     ['kubeconfig', true],
+     ['my-kubeconfig.yaml', true],
+     ['terraform.tfstate', true],
+     ['prod.tfstate.backup', true],
+ 
+     // Non-sensitive (should NOT be blocked)
+     ['package.json', false],
+     ['README.md', false],
+     ['src/index.ts', false],
+     ['.envrc', false],
+     ['credentials.ts', false],
+     ['terraform.tf', false],
+     ['kube-config.ts', false],
+   ])('%s → %s', (file, expected) => {
+     expect(isSensitiveFile(file)).toBe(expected)
+   })
+ })
++
++describe('every run carries the ad session and UA for gravity_index', () => {
++  const run = (extraCodebuffMetadata?: Record<string, string>) =>
++    createRunConfig({
++      agent: 'custom',
++      prompt: 'hi',
++      content: undefined,
++      previousRunState: null,
++      agentDefinitions: [],
++      signal: new AbortController().signal,
++      ...(extraCodebuffMetadata ? { extraCodebuffMetadata } : {}),
++    } as unknown as CreateRunConfigParams)
++
++  // The values Gravity sees on this chat's ad requests: body `sessionId` and
++  // the `User-Agent` header (resolveGravityUserAgent prefers the header).
++  const adRequestIdentity = async () => {
++    const saved = process.env.CODEBUFF_API_KEY
++    process.env.CODEBUFF_API_KEY = saved || 'test-key'
++    try {
++      const built = await buildAdAuctionRequest({
++        provider: 'gravity',
++        surface: 'cli_chat',
++        placementId: 'Above-Input-CLI',
++      })
++      expect(built).not.toBeNull()
++      return {
++        sessionId: JSON.parse(String(built!.init.body)).sessionId as string,
++        userAgent: (built!.init.headers as Record<string, string>)[
++          'User-Agent'
++        ],
++      }
++    } finally {
++      if (saved === undefined) delete process.env.CODEBUFF_API_KEY
++      else process.env.CODEBUFF_API_KEY = saved
++    }
++  }
++
++  test('equal to the ad request, with no caller metadata (Codebuff, BYOK)', async () => {
++    const ad = await adRequestIdentity()
++    expect(ad.sessionId).toBeString()
++    expect(run().extraCodebuffMetadata).toEqual({
++      gravity_ad_session_id: ad.sessionId,
++      gravity_end_user_agent: ad.userAgent,
++    })
++  })
++
++  test('follows a new chat, as the ad request does', async () => {
++    const before = run().extraCodebuffMetadata.gravity_ad_session_id
++    useChatStore.getState().reset()
++    const ad = await adRequestIdentity()
++    expect(ad.sessionId).not.toBe(before)
++    expect(run().extraCodebuffMetadata.gravity_ad_session_id).toBe(ad.sessionId)
++  })
++
++  test("merged under the caller's metadata, which is kept", async () => {
++    const ad = await adRequestIdentity()
++    expect(run({ freebuff_instance_id: 'inst-1' }).extraCodebuffMetadata).toEqual({
++      gravity_ad_session_id: ad.sessionId,
++      gravity_end_user_agent: ad.userAgent,
++      freebuff_instance_id: 'inst-1',
++    })
++  })
++})
+diff --git a/cli/src/ads/gravity-index-run-metadata.ts b/cli/src/ads/gravity-index-run-metadata.ts
+new file mode 100644
+index 000000000..71a7e599d
+--- /dev/null
++++ b/cli/src/ads/gravity-index-run-metadata.ts
+@@ -0,0 +1,21 @@
++import { useChatStore } from '../state/chat-store'
++import { getCliAdRequestUserAgent } from '../utils/ad-client-identity'
++
++/**
++ * The run metadata the `gravity_index` handler copies into a search, so
++ * Gravity can join an Index recommendation to this user's ad traffic: the
++ * SAME `sessionId` the CLI sends on its ad requests (the chat's
++ * `chatSessionId`, regenerated on a new chat) and the SAME User-Agent header
++ * they carry (`Freebuff-CLI/<v>`), which is what Gravity sees on ads
++ * (`resolveGravityUserAgent`: the header wins). Read from the sources
++ * `buildAdAuctionRequest` reads, never copied, so the two cannot drift.
++ *
++ * No IP: the CLI calls the API from the user's machine, so the request's own
++ * address is already the user's.
++ */
++export function gravityIndexRunMetadata(): Record<string, string> {
++  return {
++    gravity_ad_session_id: useChatStore.getState().chatSessionId,
++    gravity_end_user_agent: getCliAdRequestUserAgent(),
++  }
++}
+diff --git a/cli/src/utils/create-run-config.ts b/cli/src/utils/create-run-config.ts
+index 88a00cdcb..e38d7d794 100644
+--- a/cli/src/utils/create-run-config.ts
++++ b/cli/src/utils/create-run-config.ts
+@@ -1,31 +1,32 @@
+ import path from 'path'
+ 
+ import { MAX_AGENT_STEPS_DEFAULT } from '@codebuff/common/constants/agents'
+ import { FREEBUFF_BASE3_AGENT_IDS } from '@codebuff/common/constants/free-agents'
+ import { isSensitiveEnvFilePath } from '@codebuff/common/util/env-file-path'
+ 
++import { gravityIndexRunMetadata } from '../ads/gravity-index-run-metadata'
+ import {
+   createEventHandler,
+   createStreamChunkHandler,
+ } from './sdk-event-handlers'
+ 
+ import type { PrintModeEvent } from '@codebuff/common/types/print-mode'
+ import type { EventHandlerState, StreamChunkEvent } from './sdk-event-handlers'
+ import type { Logger } from '@codebuff/common/types/contracts/logger'
+ import type {
+   AgentDefinition,
+   ConversationSummary,
+   FileFilter,
+   MessageContent,
+   ResolvedByokConnection,
+   RunState,
+ } from '@codebuff/sdk'
+ 
+ export type CreateRunConfigParams = {
+   logger: Logger
+   agent: AgentDefinition | string
+   prompt: string
+   content: MessageContent[] | undefined
+   previousRunState: RunState | null
+   agentDefinitions: AgentDefinition[]
+   eventHandlerState: EventHandlerState
+@@ -140,37 +141,42 @@ export const createRunConfig = (params: CreateRunConfigParams) => {
+     ),
+     maxAgentSteps: MAX_AGENT_STEPS_DEFAULT,
+     handleStreamChunk: (event: StreamChunkEvent) => {
+       handleStreamChunk(event)
+       if (eventHandlerState.isActive?.() !== false) {
+         try {
+           params.observeChunk?.(event)
+         } catch {
+           // Analytics must not fail a run.
+         }
+       }
+     },
+     handleEvent: (event: PrintModeEvent) => {
+       handleEvent(event)
+       if (eventHandlerState.isActive?.() !== false) {
+         try {
+           params.observeEvent?.(event)
+         } catch {
+           // Analytics must not fail a run.
+         }
+       }
+     },
+     signal: params.signal,
+     costMode,
+     byok,
+-    extraCodebuffMetadata,
++    // Every run, sponsored or not: the gravity_index handler reads these
++    // (see gravityIndexRunMetadata). The caller's own keys win.
++    extraCodebuffMetadata: {
++      ...gravityIndexRunMetadata(),
++      ...(extraCodebuffMetadata ?? {}),
++    },
+     onStateSnapshot,
+     onCompactionSummary,
+     onCompactionStart,
+     onCompaction,
+     drainSteeringMessages,
+     fileFilter: ((filePath: string) => {
+       if (isSensitiveFile(filePath)) return { status: 'blocked' }
+       return { status: 'allow' }
+     }) satisfies FileFilter,
+   }
+ }
+diff --git a/common/src/desktop-cloud/end-user.ts b/common/src/desktop-cloud/end-user.ts
+new file mode 100644
+index 000000000..4fc17e279
+--- /dev/null
++++ b/common/src/desktop-cloud/end-user.ts
+@@ -0,0 +1,13 @@
++/**
++ * The end user's own user agent on a Cloud send that our Freebuff Web
++ * workspace gateway relays: the gateway's fetch carries its own runtime's UA,
++ * so it forwards the browser's or phone app's here. The Cloud API records it
++ * with the run for Gravity's per-search `user_agent` (web
++ * desktop-cloud/end-user.ts). Like the UA itself it proves nothing, so any
++ * caller may send it; the end user's IP travels only in the signed client
++ * relay (`CLIENT_RELAY_HEADER`).
++ */
++export const CLOUD_END_USER_AGENT_HEADER = 'x-freebuff-end-user-agent'
++
++/** Gravity's `user_agent` cap (common/src/types/gravity-index.ts). */
++export const CLOUD_END_USER_AGENT_MAX_CHARS = 1024
+diff --git a/common/src/types/__tests__/gravity-index.test.ts b/common/src/types/__tests__/gravity-index.test.ts
+index 0ab4b47b3..0c38066cc 100644
+--- a/common/src/types/__tests__/gravity-index.test.ts
++++ b/common/src/types/__tests__/gravity-index.test.ts
+@@ -26,26 +26,95 @@ describe('gravity-index schemas', () => {
+   test('catalog actions reject non-object metadata, like search', () => {
+     for (const action of ['browse', 'list_categories', 'search']) {
+       const result = gravityIndexApiInputSchema.safeParse({
+         action,
+         query: 'email',
+         metadata: 'freebuff_web',
+       })
+       expect(result.success).toBe(false)
+     }
+   })
+ 
+   test('catalog actions still strip the other attribution fields', () => {
+     const parsed = gravityIndexApiInputSchema.parse({
+       action: 'list_categories',
+       external_user_id: 'someone',
+       external_session_id: 'session-1',
+     })
+     expect(parsed).toEqual({ action: 'list_categories' })
+   })
+ 
+   test('the tool-facing schema never offers metadata to the model', () => {
+     expect(Object.keys(gravityIndexInputSchema.shape)).not.toContain(
+       'metadata',
+     )
+   })
++  test('the tool-facing schema never offers the end-user runtime fields', () => {
++    const keys = Object.keys(gravityIndexInputSchema.shape)
++    for (const field of ['end_user_ip', 'end_user_agent', 'ad_session_id']) {
++      expect(keys).not.toContain(field)
++    }
++    const parsed = gravityIndexInputSchema.parse({
++      action: 'search',
++      query: 'email',
++      end_user_ip: '8.8.8.8',
++      end_user_agent: 'ua',
++      ad_session_id: 'session',
++    })
++    expect(parsed).not.toHaveProperty('end_user_ip')
++    expect(parsed).not.toHaveProperty('end_user_agent')
++    expect(parsed).not.toHaveProperty('ad_session_id')
++  })
++
++  test('the API search schema keeps the end-user runtime fields', () => {
++    const parsed = gravityIndexApiInputSchema.parse({
++      action: 'search',
++      query: 'email',
++      end_user_ip: '8.8.8.8',
++      end_user_agent: 'Mozilla/5.0',
++      ad_session_id: 'ad-session-1',
++    })
++    expect(parsed).toMatchObject({
++      end_user_ip: '8.8.8.8',
++      end_user_agent: 'Mozilla/5.0',
++      ad_session_id: 'ad-session-1',
++    })
++  })
++
++  test('the API search schema caps the end-user runtime fields', () => {
++    const base = { action: 'search', query: 'email' }
++    for (const [field, max] of [
++      ['end_user_ip', 64],
++      ['end_user_agent', 1024],
++      ['ad_session_id', 256],
++    ] as const) {
++      expect(
++        gravityIndexApiInputSchema.safeParse({ ...base, [field]: 'x'.repeat(max) })
++          .success,
++      ).toBe(true)
++      expect(
++        gravityIndexApiInputSchema.safeParse({
++          ...base,
++          [field]: 'x'.repeat(max + 1),
++        }).success,
++      ).toBe(false)
++    }
++  })
++
++  test('only search accepts the end-user runtime fields', () => {
++    for (const body of [
++      { action: 'browse', category: 'Email' },
++      { action: 'list_categories' },
++      { action: 'get_service', slug: 'sendgrid' },
++    ]) {
++      const parsed = gravityIndexApiInputSchema.parse({
++        ...body,
++        end_user_ip: '8.8.8.8',
++        end_user_agent: 'ua',
++        ad_session_id: 'session',
++      })
++      expect(parsed).not.toHaveProperty('end_user_ip')
++      expect(parsed).not.toHaveProperty('end_user_agent')
++      expect(parsed).not.toHaveProperty('ad_session_id')
++    }
++  })
+ })
+diff --git a/common/src/types/gravity-index.ts b/common/src/types/gravity-index.ts
+index 0439dbe5e..8ed2eb809 100644
+--- a/common/src/types/gravity-index.ts
++++ b/common/src/types/gravity-index.ts
+@@ -102,50 +102,62 @@ const reportIntegrationInputSchema = z.object({
+ const runtimeAttributionFields = {
+   external_session_id: z
+     .string()
+     .optional()
+     .describe(
+       'Stable Codebuff session ID for Gravity API key attribution. Codebuff usually fills this automatically.',
+     ),
+   // Raw, stable per-end-user identifier for Gravity attribution + payout
+   // matching. Surfaces that run under a shared service account (e.g. Freebuff
+   // Web) set this to the real end user so conversions don't all collapse onto
+   // the service account. The server hashes it before sending it to Gravity.
+   // Codebuff usually fills this automatically.
+   external_user_id: z
+     .string()
+     .optional()
+     .describe(
+       'Stable per-end-user identifier for Gravity attribution. Codebuff usually fills this automatically.',
+     ),
+   metadata: jsonObjectSchema
+     .optional()
+     .describe(
+       'Non-sensitive API key metadata for Gravity attribution and debugging. Codebuff usually fills this automatically.',
+     ),
+ }
+ 
++// The end user's network identity and ad session, for Gravity's CPM search
++// fields (user_ip, user_agent, session_id). Stamped by the agent runtime from
++// server-set run metadata on hosted runs, the CLI and Desktop; never offered to
++// the model. The server decides what to trust: `end_user_ip` only from the
++// Freebuff Web service account or a Cloud run's own token (our servers), the
++// user agent and ad session from any caller.
++const searchRuntimeFields = {
++  end_user_ip: z.string().max(64).optional(),
++  end_user_agent: z.string().max(1024).optional(),
++  ad_session_id: z.string().max(256).optional(),
++}
++
+ // Tool-facing schema presented to the LLM provider. Native function-calling
+ // providers require the top-level `parameters` to be a JSON Schema of
+ // `type: "object"`, so this MUST be a flat `z.object` rather than a top-level
+ // discriminated union (which serializes to `oneOf`/`anyOf` with no top-level
+ // type). Per-action requiredness is enforced server-side by
+ // `gravityIndexApiInputSchema` below.
+ export const gravityIndexInputSchema = z
+   .object({
+     action: z
+       .enum([
+         'search',
+         'browse',
+         'list_categories',
+         'get_service',
+         'provision',
+         'report_integration',
+       ])
+       .describe(
+         'Which Gravity Index operation to perform. search: recommend a provider; browse: list catalog services; list_categories: list categories with counts; get_service: full detail for a known slug; provision: create the account for the user and receive credentials; report_integration: report a completed integration.',
+       ),
+     query: queryField
+       .optional()
+       .describe(
+         `For action "search": what the user needs, including stack, constraints, and required capabilities when known. Example: "serverless database with branching for a Next.js app".`,
+       ),
+@@ -181,35 +193,67 @@ export const gravityIndexInputSchema = z
+       .optional()
+       .describe(
+         'For action "report_integration": slug of the service that was actually integrated (required).',
+       ),
+     user_consent: z
+       .literal(true)
+       .optional()
+       .describe(
+         'For action "provision": must be true, and only after the user has explicitly approved creating an account on this service (required).',
+       ),
+   })
+   .describe(`Use the Gravity Index tool discovery and install API.`)
+ 
+ // Catalog reads (browse / list_categories / get_service) keep only the
+ // runtime-stamped `metadata`, so the server's attribution log can record which
+ // surface made the call. They are plain GETs upstream: the server does not
+ // forward metadata to Gravity for them, and they carry no user attribution.
+ // Like every runtime field, this is server-side only: the flat tool-facing
+ // schema above never offers `metadata` to the model.
+ const catalogMetadataFields = {
+   metadata: runtimeAttributionFields.metadata,
+ }
+ 
+ export const gravityIndexApiInputSchema = z
+   .discriminatedUnion('action', [
+-    searchInputSchema.extend(runtimeAttributionFields),
++    searchInputSchema.extend({
++      ...runtimeAttributionFields,
++      ...searchRuntimeFields,
++    }),
+     browseInputSchema.extend(catalogMetadataFields),
+     listCategoriesInputSchema.extend(catalogMetadataFields),
+     getServiceInputSchema.extend(catalogMetadataFields),
+     provisionInputSchema.extend(runtimeAttributionFields),
+     reportIntegrationInputSchema.extend(runtimeAttributionFields),
+   ])
+   .describe(`Use the Gravity Index tool discovery and install API.`)
+ 
+ export type GravityIndexInput = z.infer<typeof gravityIndexApiInputSchema>
++
++/**
++ * Run-metadata keys that carry the END USER's network identity and ad session
++ * to the gravity_index tool (the hosted Cloud worker, the CLI, the legacy Web
++ * runner set them on the SDK run's `extraCodebuffMetadata`). They are for the
++ * Gravity Index search alone: completion requests must never carry them, or
++ * the user's raw IP would reach LLM providers and our request audit logs. The
++ * SDK strips them where completion metadata is built (sdk/src/impl/llm.ts) and
++ * the completions route deletes them again on arrival.
++ */
++export const GRAVITY_END_USER_RUN_METADATA_KEYS = {
++  end_user_ip: 'gravity_end_user_ip',
++  end_user_agent: 'gravity_end_user_agent',
++  ad_session_id: 'gravity_ad_session_id',
++} as const
++
++const GRAVITY_END_USER_KEY_SET: ReadonlySet<string> = new Set(
++  Object.values(GRAVITY_END_USER_RUN_METADATA_KEYS),
++)
++
++/** A copy of run metadata without the end-user keys (for completion requests). */
++export function withoutGravityEndUserMetadata<T extends Record<string, unknown>>(
++  metadata: T,
++): T {
++  const rest: Record<string, unknown> = {}
++  for (const [key, value] of Object.entries(metadata))
++    if (!GRAVITY_END_USER_KEY_SET.has(key)) rest[key] = value
++  return rest as T
++}
+diff --git a/packages/agent-runtime/src/__tests__/gravity-index-tool.test.ts b/packages/agent-runtime/src/__tests__/gravity-index-tool.test.ts
+index ff6509df6..b7216793d 100644
+--- a/packages/agent-runtime/src/__tests__/gravity-index-tool.test.ts
++++ b/packages/agent-runtime/src/__tests__/gravity-index-tool.test.ts
+@@ -720,26 +720,153 @@ describe('gravity_index tool', () => {
+       agentType: 'gravity-test-agent',
+     }
+     const { agentTemplates } = assembleLocalAgentTemplates({
+       ...agentRuntimeImpl,
+       fileContext: runAgentStepBaseParams.fileContext,
+     })
+ 
+     await runAgentStep({
+       ...runAgentStepBaseParams,
+       localAgentTemplates: agentTemplates,
+       agentTemplate: agentTemplates['gravity-test-agent'],
+       agentState,
+       prompt: 'Browse email providers',
+     })
+ 
+     expect(spy).toHaveBeenCalledWith(
+       expect.objectContaining({
+         input: expect.objectContaining({
+           action: 'browse',
+           category: 'Email',
+           q: 'send',
+         }),
+       }),
+     )
+   })
++  describe('end-user signals from run metadata', () => {
++    const META = {
++      gravity_end_user_ip: '  8.8.4.4  ',
++      gravity_end_user_agent: ' Mozilla/5.0 (Macintosh) ',
++      gravity_ad_session_id: ' ad-session-9 ',
++    }
++
++    const runToolCall = async (
++      toolInput: Record<string, unknown>,
++      extraCodebuffMetadata?: Record<string, string>,
++    ) => {
++      const spy = spyOn(webApi, 'callGravityIndexAPI').mockResolvedValue({
++        result: { search_id: 'search-1' },
++      })
++      mockAgentStream([
++        createToolCallChunk('gravity_index', toolInput),
++        createToolCallChunk('end_turn', {}),
++      ])
++      const sessionState = getInitialSessionState(
++        runAgentStepBaseParams.fileContext,
++      )
++      const { agentTemplates } = assembleLocalAgentTemplates({
++        ...agentRuntimeImpl,
++        fileContext: runAgentStepBaseParams.fileContext,
++      })
++      await runAgentStep({
++        ...runAgentStepBaseParams,
++        localAgentTemplates: agentTemplates,
++        agentTemplate: agentTemplates['gravity-test-agent'],
++        agentState: {
++          ...sessionState.mainAgentState,
++          agentType: 'gravity-test-agent',
++        },
++        prompt: 'Find an email provider',
++        ...(extraCodebuffMetadata ? { extraCodebuffMetadata } : {}),
++      })
++      expect(spy).toHaveBeenCalledTimes(1)
++      return spy.mock.calls[0]?.[0]?.input as Record<string, unknown>
++    }
++
++    test('copies the run metadata onto a search, trimmed', async () => {
++      const input = await runToolCall(
++        { action: 'search', query: 'transactional email' },
++        META,
++      )
++      expect(input).toMatchObject({
++        end_user_ip: '8.8.4.4',
++        end_user_agent: 'Mozilla/5.0 (Macintosh)',
++        ad_session_id: 'ad-session-9',
++        // The runtime's own session id still rides along; the server picks.
++        external_session_id: 'test-session',
++      })
++    })
++
++    test('copies only the keys that are present and non-blank', async () => {
++      const input = await runToolCall(
++        { action: 'search', query: 'transactional email' },
++        { gravity_end_user_agent: 'Freebuff-CLI/0.2.38', gravity_end_user_ip: '   ' },
++      )
++      expect(input.end_user_agent).toBe('Freebuff-CLI/0.2.38')
++      expect(input).not.toHaveProperty('end_user_ip')
++      expect(input).not.toHaveProperty('ad_session_id')
++    })
++
++    test('a search with no run metadata carries none of the fields', async () => {
++      const input = await runToolCall({
++        action: 'search',
++        query: 'transactional email',
++      })
++      expect(input).not.toHaveProperty('end_user_ip')
++      expect(input).not.toHaveProperty('end_user_agent')
++      expect(input).not.toHaveProperty('ad_session_id')
++    })
++
++    test('caps each field at the web API schema limit', async () => {
++      const input = await runToolCall(
++        { action: 'search', query: 'transactional email' },
++        {
++          gravity_end_user_ip: 'i'.repeat(100),
++          gravity_end_user_agent: 'a'.repeat(2000),
++          gravity_ad_session_id: 's'.repeat(400),
++        },
++      )
++      expect(input.end_user_ip).toBe('i'.repeat(64))
++      expect(input.end_user_agent).toBe('a'.repeat(1024))
++      expect(input.ad_session_id).toBe('s'.repeat(256))
++    })
++
++    test.each([
++      [{ action: 'browse', category: 'Email' }],
++      [{ action: 'list_categories' }],
++      [{ action: 'get_service', slug: 'sendgrid' }],
++      // No search_id, so the report preflight is skipped and it goes upstream.
++      [{ action: 'report_integration', integrated_slug: 'sendgrid' }],
++    ])('does not stamp them on %o', async (toolInput) => {
++      const input = await runToolCall(toolInput, META)
++      expect(input.action).toBe(toolInput.action)
++      expect(input).not.toHaveProperty('end_user_ip')
++      expect(input).not.toHaveProperty('end_user_agent')
++      expect(input).not.toHaveProperty('ad_session_id')
++    })
++
++    test('model-written values never reach the API input', async () => {
++      const input = await runToolCall({
++        action: 'search',
++        query: 'transactional email',
++        end_user_ip: '6.6.6.6',
++        end_user_agent: 'evil',
++        ad_session_id: 'evil-session',
++      })
++      expect(input).not.toHaveProperty('end_user_ip')
++      expect(input).not.toHaveProperty('end_user_agent')
++      expect(input).not.toHaveProperty('ad_session_id')
++    })
++
++    test('run metadata wins over model-written values', async () => {
++      const input = await runToolCall(
++        {
++          action: 'search',
++          query: 'transactional email',
++          end_user_ip: '6.6.6.6',
++        },
++        META,
++      )
++      expect(input.end_user_ip).toBe('8.8.4.4')
++    })
++  })
+ })
+diff --git a/packages/agent-runtime/src/tools/handlers/tool/gravity-index.ts b/packages/agent-runtime/src/tools/handlers/tool/gravity-index.ts
+index 9d599d312..a5eed9336 100644
+--- a/packages/agent-runtime/src/tools/handlers/tool/gravity-index.ts
++++ b/packages/agent-runtime/src/tools/handlers/tool/gravity-index.ts
+@@ -1,25 +1,26 @@
++import { GRAVITY_END_USER_RUN_METADATA_KEYS } from '@codebuff/common/types/gravity-index'
+ import { FREEBUFF_DESKTOP_THREAD_AGENT_ID } from '@codebuff/common/constants/free-agents'
+ import { jsonToolResult } from '@codebuff/common/util/messages'
+ 
+ import { callGravityIndexAPI } from '../../../llm-api/codebuff-web-api'
+ 
+ import type { CodebuffToolHandlerFunction } from '../handler-function-type'
+ import type {
+   CodebuffToolCall,
+   CodebuffToolOutput,
+ } from '@codebuff/common/tools/list'
+ import type { AgentTemplate } from '@codebuff/common/types/agent-template'
+ import type { ClientEnv, CiEnv } from '@codebuff/common/types/contracts/env'
+ import type { JSONObject, JSONValue } from '@codebuff/common/types/json'
+ import type { Logger } from '@codebuff/common/types/contracts/logger'
+ import type { Message } from '@codebuff/common/types/messages/codebuff-message'
+ import type { AgentState } from '@codebuff/common/types/session-state'
+ 
+ const omitUndefined = (value: Record<string, JSONValue | undefined>) => {
+   const result: JSONObject = {}
+   for (const [key, field] of Object.entries(value)) {
+     if (field !== undefined) {
+       result[key] = field
+     }
+   }
+   return result
+@@ -191,50 +192,74 @@ const GRAVITY_CLIENT_PLATFORMS = new Set(['web', 'ios', 'android', 'desktop'])
+ 
+ /** Hosted workspace runs (freebuff.com Web, /chat, iOS, Android, Desktop "send to Cloud") share
+  *  local Desktop's root agent id, so the template alone labels them `freebuff_desktop`. The
+  *  worker's run-metadata hint relabels them `freebuff_cloud` with the client's platform. The hint
+  *  only upgrades a user-key surface: it never turns a service-account surface into one that drops
+  *  external_user_id. */
+ const resolveGravitySurface = (
+   agentTemplate: { id: string },
+   runMetadata: Record<string, string> | undefined,
+ ): { surface: string; clientPlatform: string | undefined } => {
+   const surface = gravitySurface(agentTemplate)
+   if (
+     runMetadata?.[GRAVITY_SURFACE_METADATA_KEY] !== 'freebuff_cloud' ||
+     isServiceAccountSurface(surface)
+   ) {
+     return { surface, clientPlatform: undefined }
+   }
+   const platform = runMetadata[GRAVITY_CLIENT_PLATFORM_METADATA_KEY]
+   return {
+     surface: 'freebuff_cloud',
+     clientPlatform:
+       platform && GRAVITY_CLIENT_PLATFORMS.has(platform) ? platform : 'web',
+   }
+ }
+ 
++/** Run metadata keys our own code sets for Gravity's CPM search fields: the
++ *  hosted Cloud worker (end user's IP, user agent, ad session), the CLI and
++ *  Desktop (user agent, ad session). Server- or client-set run metadata, never
++ *  model output. The web API decides which of them to trust. */
++const GRAVITY_END_USER_METADATA = GRAVITY_END_USER_RUN_METADATA_KEYS
++
++/** The web API schema's caps (common/src/types/gravity-index.ts): a longer
++ *  value would fail the whole search's validation, so it is cut here. */
++const GRAVITY_END_USER_MAX = { end_user_ip: 64, end_user_agent: 1024, ad_session_id: 256 }
++
++const gravityEndUserFields = (
++  runMetadata: Record<string, string> | undefined,
++): Partial<Record<keyof typeof GRAVITY_END_USER_METADATA, string>> => {
++  const fields: Partial<Record<keyof typeof GRAVITY_END_USER_METADATA, string>> =
++    {}
++  for (const [field, key] of Object.entries(GRAVITY_END_USER_METADATA) as Array<
++    [keyof typeof GRAVITY_END_USER_METADATA, string]
++  >) {
++    const value = runMetadata?.[key]?.trim()
++    if (value) fields[field] = value.slice(0, GRAVITY_END_USER_MAX[field])
++  }
++  return fields
++}
++
+ export const handleGravityIndex = (async (params: {
+   previousToolCallFinished: Promise<void>
+   toolCall: CodebuffToolCall<'gravity_index'>
+   agentTemplate: AgentTemplate
+   /** Absent in direct unit tests; the runtime always passes it. */
+   agentState?: AgentState
+   logger: Logger
+   apiKey: string
+   /** The run's server-set metadata; carries the hosted Cloud surface hint. */
+   extraCodebuffMetadata?: Record<string, string>
+ 
+   agentStepId: string
+   clientSessionId: string
+   fingerprintId: string
+   repoId: string | undefined
+   userInputId: string
+   userId: string | undefined
+ 
+   fetch: typeof globalThis.fetch
+   clientEnv: ClientEnv
+   ciEnv: CiEnv
+ }): Promise<{
+   output: CodebuffToolOutput<'gravity_index'>
+   creditsUsed: number
+ }> => {
+@@ -319,59 +344,70 @@ export const handleGravityIndex = (async (params: {
+         integrated_slug: preflight.integratedSlug,
+       }
+     }
+     const existingMetadata = isJSONObject(existingInput.metadata)
+       ? existingInput.metadata
+       : {}
+     const { surface, clientPlatform } = resolveGravitySurface(
+       agentTemplate,
+       extraCodebuffMetadata,
+     )
+     // client_platform is server-set only: drop any the model supplied.
+     const { client_platform: _modelClientPlatform, ...modelMetadata } =
+       existingMetadata
+     const metadata = {
+       ...modelMetadata,
+       ...omitUndefined({
+         surface,
+         client_platform: clientPlatform,
+         tool_call_id: toolCall.toolCallId,
+         agent_step_id: agentStepId,
+         fingerprint_id: fingerprintId,
+         user_input_id: userInputId,
+         repo_id: repoId,
+       }),
+     }
++    // Runtime-only search fields come from run metadata alone, never from the
++    // tool call (the tool-facing schema already strips them; this keeps it so).
++    const {
++      end_user_ip: _modelEndUserIp,
++      end_user_agent: _modelEndUserAgent,
++      ad_session_id: _modelAdSessionId,
++      ...toolInput
++    } = existingInput as JSONObject
+     const input = {
+-      ...existingInput,
++      ...toolInput,
+       external_session_id: clientSessionId,
+       // On service-account surfaces, `fingerprintId` (e.g.
+       // `freebuff-chat-<userId>` or the project id) is sent as the external
+       // user id. Other surfaces omit it.
+       ...(isServiceAccountSurface(surface)
+         ? { external_user_id: fingerprintId }
+         : {}),
++      ...(toolCall.input.action === 'search'
++        ? gravityEndUserFields(extraCodebuffMetadata)
++        : {}),
+       metadata,
+     } satisfies JSONObject
+ 
+     const webApi = await callGravityIndexAPI({
+       input,
+       fetch,
+       logger,
+       apiKey,
+       env: { clientEnv, ciEnv },
+     })
+ 
+     if (webApi.error || !webApi.result) {
+       logger.warn(
+         {
+           ...gravityContext,
+           durationMs: Date.now() - startedAt,
+           success: false,
+           error: webApi.error,
+         },
+         'Gravity Index returned error',
+       )
+       return {
+         output: jsonToolResult({
+           errorMessage: webApi.error ?? 'Invalid Gravity Index response',
+         }),
+diff --git a/sdk/src/impl/__tests__/provider-options-metadata.test.ts b/sdk/src/impl/__tests__/provider-options-metadata.test.ts
+index 3f4ad35fb..a40b09cc8 100644
+--- a/sdk/src/impl/__tests__/provider-options-metadata.test.ts
++++ b/sdk/src/impl/__tests__/provider-options-metadata.test.ts
+@@ -65,26 +65,46 @@ describe('getProviderOptions — codebuff_metadata', () => {
+       },
+     })
+     const meta = (opts.codebuff as any).codebuff_metadata
+     expect(meta.freebuff_client_env).toBe('v1;in=1')
+     expect(meta.freebuff_input_profile).toBe('v1;tc=3')
+     expect(meta.client_id).toBe('session-1')
+     expect(meta.cost_mode).toBe('free')
+   })
+ 
+   it('extraCodebuffMetadata does not overwrite reserved keys', () => {
+     const opts = getProviderOptions({
+       ...baseParams,
+       costMode: 'free',
+       extraCodebuffMetadata: {
+         // These are intentionally the same keys the function already sets —
+         // make sure a misuse doesn't let callers override server-trusted
+         // identifiers. The spread currently puts caller keys last, which
+         // means it WOULD override. If that's ever intentional, change this
+         // test; for now, lock it down.
+         run_id: 'evil-override',
+       },
+     })
+     const meta = (opts.codebuff as any).codebuff_metadata
+     expect(meta.run_id).toBe('run-1')
+   })
++
++  it('never puts the end user\'s Gravity IP, user agent or ad session on a completion', () => {
++    const opts = getProviderOptions({
++      ...baseParams,
++      extraCodebuffMetadata: {
++        freebuff_instance_id: 'abc-123',
++        gravity_surface: 'freebuff_cloud',
++        gravity_end_user_ip: '8.8.8.8',
++        gravity_end_user_agent: 'Mozilla/5.0',
++        gravity_ad_session_id: 'thread-1',
++      },
++    })
++    const meta = (opts.codebuff as any).codebuff_metadata
++    expect(meta.freebuff_instance_id).toBe('abc-123')
++    expect(meta.gravity_surface).toBe('freebuff_cloud')
++    expect(meta).not.toHaveProperty('gravity_end_user_ip')
++    expect(meta).not.toHaveProperty('gravity_end_user_agent')
++    expect(meta).not.toHaveProperty('gravity_ad_session_id')
++  })
+ })
++
+diff --git a/sdk/src/impl/llm.ts b/sdk/src/impl/llm.ts
+index 5114293bd..7637a431d 100644
+--- a/sdk/src/impl/llm.ts
++++ b/sdk/src/impl/llm.ts
+@@ -1,27 +1,28 @@
+ import { models, PROFIT_MARGIN } from '@codebuff/common/old-constants'
+ import { buildArray } from '@codebuff/common/util/array'
++import { withoutGravityEndUserMetadata } from '@codebuff/common/types/gravity-index'
+ import {
+   STREAM_RECOVERY_EVENT,
+   TOOL_CALL_REPAIR_EVENT,
+ } from '@codebuff/common/util/axiom-only-log'
+ import { normalizeProviderRequestBodyForCacheDebug } from '@codebuff/common/util/cache-debug'
+ import {
+   parseToolJson,
+   TOOL_NAME_ALIASES,
+ } from '@codebuff/common/tools/repair-tool-json'
+ import {
+   getErrorObject,
+   isFetchIdleTimeoutError,
+   promptAborted,
+   promptSuccess,
+ } from '@codebuff/common/util/error'
+ import { convertCbToModelMessages } from '@codebuff/common/util/messages'
+ import { isExplicitlyDefinedModel } from '@codebuff/common/util/model-utils'
+ import { StopSequenceHandler } from '@codebuff/common/util/stop-sequence'
+ import {
+   streamText,
+   generateText,
+   Output,
+   NoSuchToolError,
+   APICallError,
+   ToolCallRepairError,
+@@ -110,52 +111,54 @@ export function getProviderOptions(params: {
+   } = params
+ 
+   let providerConfig: Record<string, any>
+ 
+   // Use agent's provider options if provided, otherwise use defaults
+   if (agentProviderOptions) {
+     providerConfig = agentProviderOptions
+   } else {
+     // Set allow_fallbacks based on whether model is explicitly defined
+     const isExplicitlyDefined = isExplicitlyDefinedModel(model)
+ 
+     providerConfig = {
+       order: providerOrder[model as keyof typeof providerOrder],
+       allow_fallbacks: !isExplicitlyDefined,
+     }
+   }
+ 
+   return {
+     ...providerOptions,
+     // Could either be "codebuff" or "openaiCompatible"
+     codebuff: {
+       ...providerOptions?.codebuff,
+       // All values here get appended to the request body
+       codebuff_metadata: {
+         // Caller-supplied keys go first so they can't override reserved
+-        // identifiers the SDK sets, like run_id/client_id/cost_mode.
+-        ...(extraCodebuffMetadata ?? {}),
++        // identifiers the SDK sets, like run_id/client_id/cost_mode. The end
++        // user's IP/UA/ad session are for the gravity_index tool only and
++        // never ride a completion (common/src/types/gravity-index.ts).
++        ...withoutGravityEndUserMetadata(extraCodebuffMetadata ?? {}),
+         run_id: runId,
+         client_id: clientSessionId,
+         ...(n && { n }),
+         ...(costMode && { cost_mode: costMode }),
+         ...(cacheDebugCorrelation && {
+           cache_debug_correlation: cacheDebugCorrelation,
+         }),
+       },
+       provider: providerConfig,
+     },
+   }
+ }
+ 
+ // Usage accounting type for OpenRouter/Codebuff backend responses
+ // Forked from https://github.com/OpenRouterTeam/ai-sdk-provider/
+ type OpenRouterUsageAccounting = {
+   cost: number | null
+   costDetails: {
+     upstreamInferenceCost: number | null
+   }
+ }
+ 
+ function getModelProvider(model: LanguageModel): string {
+   if (typeof model === 'string') return model
+   return model.provider
