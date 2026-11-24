@@ -1,0 +1,476 @@
+diff --git a/common/src/types/__tests__/gravity-index.test.ts b/common/src/types/__tests__/gravity-index.test.ts
+new file mode 100644
+index 000000000..0ab4b47b3
+--- /dev/null
++++ b/common/src/types/__tests__/gravity-index.test.ts
+@@ -0,0 +1,51 @@
++import { describe, expect, test } from 'bun:test'
++
++import {
++  gravityIndexApiInputSchema,
++  gravityIndexInputSchema,
++} from '../gravity-index'
++
++describe('gravity-index schemas', () => {
++  test('catalog actions keep runtime-stamped metadata', () => {
++    for (const body of [
++      { action: 'browse', category: 'Email' },
++      { action: 'list_categories' },
++      { action: 'get_service', slug: 'sendgrid' },
++    ]) {
++      const parsed = gravityIndexApiInputSchema.parse({
++        ...body,
++        metadata: { surface: 'freebuff_cli', client_platform: 'web' },
++      })
++      expect('metadata' in parsed && parsed.metadata).toEqual({
++        surface: 'freebuff_cli',
++        client_platform: 'web',
++      })
++    }
++  })
++
++  test('catalog actions reject non-object metadata, like search', () => {
++    for (const action of ['browse', 'list_categories', 'search']) {
++      const result = gravityIndexApiInputSchema.safeParse({
++        action,
++        query: 'email',
++        metadata: 'freebuff_web',
++      })
++      expect(result.success).toBe(false)
++    }
++  })
++
++  test('catalog actions still strip the other attribution fields', () => {
++    const parsed = gravityIndexApiInputSchema.parse({
++      action: 'list_categories',
++      external_user_id: 'someone',
++      external_session_id: 'session-1',
++    })
++    expect(parsed).toEqual({ action: 'list_categories' })
++  })
++
++  test('the tool-facing schema never offers metadata to the model', () => {
++    expect(Object.keys(gravityIndexInputSchema.shape)).not.toContain(
++      'metadata',
++    )
++  })
++})
+diff --git a/common/src/types/gravity-index.ts b/common/src/types/gravity-index.ts
+index 083bf010d..0439dbe5e 100644
+--- a/common/src/types/gravity-index.ts
++++ b/common/src/types/gravity-index.ts
+@@ -169,37 +169,47 @@ export const gravityIndexInputSchema = z
+     q: z
+       .string()
+       .optional()
+       .describe(
+         'For action "browse": optional keyword filter, e.g. sendgrid or postgres.',
+       ),
+     slug: slugField
+       .optional()
+       .describe(
+         'For actions "get_service" and "provision": service slug, e.g. supabase, stripe, sendgrid (required).',
+       ),
+     integrated_slug: integratedSlugField
+       .optional()
+       .describe(
+         'For action "report_integration": slug of the service that was actually integrated (required).',
+       ),
+     user_consent: z
+       .literal(true)
+       .optional()
+       .describe(
+         'For action "provision": must be true, and only after the user has explicitly approved creating an account on this service (required).',
+       ),
+   })
+   .describe(`Use the Gravity Index tool discovery and install API.`)
+ 
++// Catalog reads (browse / list_categories / get_service) keep only the
++// runtime-stamped `metadata`, so the server's attribution log can record which
++// surface made the call. They are plain GETs upstream: the server does not
++// forward metadata to Gravity for them, and they carry no user attribution.
++// Like every runtime field, this is server-side only: the flat tool-facing
++// schema above never offers `metadata` to the model.
++const catalogMetadataFields = {
++  metadata: runtimeAttributionFields.metadata,
++}
++
+ export const gravityIndexApiInputSchema = z
+   .discriminatedUnion('action', [
+     searchInputSchema.extend(runtimeAttributionFields),
+-    browseInputSchema,
+-    listCategoriesInputSchema,
+-    getServiceInputSchema,
++    browseInputSchema.extend(catalogMetadataFields),
++    listCategoriesInputSchema.extend(catalogMetadataFields),
++    getServiceInputSchema.extend(catalogMetadataFields),
+     provisionInputSchema.extend(runtimeAttributionFields),
+     reportIntegrationInputSchema.extend(runtimeAttributionFields),
+   ])
+   .describe(`Use the Gravity Index tool discovery and install API.`)
+ 
+ export type GravityIndexInput = z.infer<typeof gravityIndexApiInputSchema>
+diff --git a/packages/agent-runtime/src/__tests__/gravity-index-tool.test.ts b/packages/agent-runtime/src/__tests__/gravity-index-tool.test.ts
+index 36b80d896..4fb0512ce 100644
+--- a/packages/agent-runtime/src/__tests__/gravity-index-tool.test.ts
++++ b/packages/agent-runtime/src/__tests__/gravity-index-tool.test.ts
+@@ -241,50 +241,175 @@ describe('gravity_index tool', () => {
+       const agentState = {
+         ...sessionState.mainAgentState,
+         agentType: rootAgentId,
+       }
+       const { agentTemplates } = assembleLocalAgentTemplates({
+         ...agentRuntimeImpl,
+         fileContext,
+       })
+ 
+       await runAgentStep({
+         ...runAgentStepBaseParams,
+         agentType: rootAgentId,
+         fileContext,
+         localAgentTemplates: agentTemplates,
+         agentTemplate: agentTemplates[rootAgentId],
+         agentState,
+         prompt: 'Find an email provider',
+       })
+ 
+       const input = spy.mock.calls[0]?.[0]?.input
+       expect(input).toMatchObject({ metadata: { surface: 'freebuff_desktop' } })
+       expect(input).not.toHaveProperty('external_user_id')
+     },
+   )
+ 
++  // Hosted workspace runs (Web, /chat, iOS, Android, Desktop "send to Cloud") run the same root id
++  // as local Desktop; the Cloud worker's run metadata relabels them `freebuff_cloud` with the
++  // client's platform. They still run on the user's own workspace token: no external_user_id.
++  const runDesktopRootSearch = async (params: {
++    extraCodebuffMetadata?: Record<string, string>
++    modelMetadata?: Record<string, string>
++  }) => {
++    const rootAgentId = 'freebuff-desktop-thread-local-v3'
++    const spy = spyOn(webApi, 'callGravityIndexAPI').mockResolvedValue({
++      result: { search_id: 'search-1' },
++    })
++    mockAgentStream([
++      createToolCallChunk('gravity_index', {
++        action: 'search',
++        query: 'transactional email for Next.js',
++        ...(params.modelMetadata ? { metadata: params.modelMetadata } : {}),
++      }),
++      createToolCallChunk('end_turn', {}),
++    ])
++    const fileContext = {
++      ...mockFileContext,
++      agentTemplates: {
++        [rootAgentId]: {
++          ...gravityTestAgent,
++          id: rootAgentId,
++          displayName: 'Freebuff',
++        },
++      },
++    }
++    const sessionState = getInitialSessionState(fileContext)
++    const { agentTemplates } = assembleLocalAgentTemplates({
++      ...agentRuntimeImpl,
++      fileContext,
++    })
++    await runAgentStep({
++      ...runAgentStepBaseParams,
++      agentType: rootAgentId,
++      fileContext,
++      localAgentTemplates: agentTemplates,
++      agentTemplate: agentTemplates[rootAgentId],
++      agentState: { ...sessionState.mainAgentState, agentType: rootAgentId },
++      prompt: 'Find an email provider',
++      ...(params.extraCodebuffMetadata
++        ? { extraCodebuffMetadata: params.extraCodebuffMetadata }
++        : {}),
++    })
++    return spy.mock.calls[0]?.[0]?.input
++  }
++
++  test.each([
++    ['web', 'web'],
++    ['ios', 'ios'],
++    ['android', 'android'],
++    ['desktop', 'desktop'],
++    [undefined, 'web'],
++    ['not-a-platform', 'web'],
++  ])(
++    'tags a hosted run (client platform %s) as freebuff_cloud with client_platform %s',
++    async (platform, expected) => {
++      const input = await runDesktopRootSearch({
++        extraCodebuffMetadata: {
++          freebuff_instance_id: 'session',
++          freebuff_multi_session: '1',
++          gravity_surface: 'freebuff_cloud',
++          ...(platform ? { gravity_client_platform: platform } : {}),
++        },
++      })
++      expect(input).toMatchObject({
++        metadata: { surface: 'freebuff_cloud', client_platform: expected },
++      })
++      expect(input).not.toHaveProperty('external_user_id')
++    },
++  )
++
++  test('keeps local Desktop as freebuff_desktop with no client_platform', async () => {
++    const input = await runDesktopRootSearch({
++      extraCodebuffMetadata: {
++        freebuff_instance_id: 'session',
++        freebuff_multi_session: '1',
++      },
++      // A model-written client_platform is not trusted.
++      modelMetadata: { client_platform: 'ios' },
++    })
++    expect(input).toMatchObject({ metadata: { surface: 'freebuff_desktop' } })
++    expect(input?.metadata).not.toHaveProperty('client_platform')
++    expect(input).not.toHaveProperty('external_user_id')
++  })
++
++  test('a hosted hint never relabels a service-account surface', async () => {
++    const spy = spyOn(webApi, 'callGravityIndexAPI').mockResolvedValue({
++      result: { search_id: 'search-1' },
++    })
++    mockAgentStream([
++      createToolCallChunk('gravity_index', { action: 'search', query: 'email' }),
++      createToolCallChunk('end_turn', {}),
++    ])
++    const rootAgentId = 'base3-free-deepseek'
++    const fileContext = {
++      ...mockFileContext,
++      agentTemplates: {
++        [rootAgentId]: { ...gravityTestAgent, id: rootAgentId },
++      },
++    }
++    const sessionState = getInitialSessionState(fileContext)
++    const { agentTemplates } = assembleLocalAgentTemplates({
++      ...agentRuntimeImpl,
++      fileContext,
++    })
++    await runAgentStep({
++      ...runAgentStepBaseParams,
++      agentType: rootAgentId,
++      fileContext,
++      localAgentTemplates: agentTemplates,
++      agentTemplate: agentTemplates[rootAgentId],
++      agentState: { ...sessionState.mainAgentState, agentType: rootAgentId },
++      prompt: 'Find an email provider',
++      extraCodebuffMetadata: { gravity_surface: 'freebuff_cloud' },
++    })
++    const input = spy.mock.calls[0]?.[0]?.input
++    expect(input).toMatchObject({
++      metadata: { surface: 'freebuff_web' },
++      external_user_id: 'test-fingerprint',
++    })
++  })
++
+   // Both freebuff Web root families, because the harness swap changed the id
+   // prefix: a base3 root that fell through to `codebuff_cli` would attribute
+   // Web clicks to the CLI and would stop forwarding the per-end-user id that
+   // keeps the shared service account from collapsing every user into one.
+   test.each(['base2-free-deepseek', 'base3-free-deepseek'])(
+     'tags %s traffic with the freebuff_web surface and forwards external_user_id',
+     async (rootAgentId) => {
+       const spy = spyOn(webApi, 'callGravityIndexAPI').mockResolvedValue({
+         result: { search_id: 'search-1' },
+       })
+ 
+       mockAgentStream([
+         createToolCallChunk('gravity_index', {
+           action: 'search',
+           query: 'transactional email for Next.js',
+         }),
+         createToolCallChunk('end_turn', {}),
+       ])
+ 
+       const fileContext = {
+         ...mockFileContext,
+         agentTemplates: {
+           [rootAgentId]: {
+             ...gravityTestAgent,
+             id: rootAgentId,
+diff --git a/packages/agent-runtime/src/tools/handlers/tool/gravity-index.ts b/packages/agent-runtime/src/tools/handlers/tool/gravity-index.ts
+index 2aa4374d2..9d599d312 100644
+--- a/packages/agent-runtime/src/tools/handlers/tool/gravity-index.ts
++++ b/packages/agent-runtime/src/tools/handlers/tool/gravity-index.ts
+@@ -160,80 +160,114 @@ export const preflightReportIntegration = (params: {
+  *  template. */
+ const gravitySurface = (agentTemplate: { id: string }): string => {
+   if (agentTemplate.id === 'base-chat') return 'freebuff_chat'
+   // Freebuff Desktop's thread agents (`freebuff-desktop-thread-{local,worktree}[-v3]`). Desktop runs
+   // on the signed-in user's own key, so it attributes like the CLI (no external_user_id) and only
+   // needs its own label so its clicks and conversions are not counted as CLI traffic.
+   if (agentTemplate.id.startsWith(FREEBUFF_DESKTOP_THREAD_AGENT_ID)) {
+     return 'freebuff_desktop'
+   }
+   // Freebuff Web project agents are the `base2-free*` and `base3-free*`
+   // families (both prefixes: the harness swap changed the root ids).
+   if (
+     agentTemplate.id.startsWith('base2-free') ||
+     agentTemplate.id.startsWith('base3-free')
+   ) {
+     return 'freebuff_web'
+   }
+   return 'codebuff_cli'
+ }
+ 
+ /** Surfaces that run under a shared service-account API key; these send a
+  *  per-end-user identifier with the request. */
+ const isServiceAccountSurface = (surface: string): boolean =>
+   surface === 'freebuff_chat' || surface === 'freebuff_web'
+ 
++/** Run metadata keys the hosted Cloud worker (web/src/server/desktop-cloud/agent.ts) sets on
++ *  every hosted workspace run. Server-set only: the model cannot write run metadata. */
++const GRAVITY_SURFACE_METADATA_KEY = 'gravity_surface'
++const GRAVITY_CLIENT_PLATFORM_METADATA_KEY = 'gravity_client_platform'
++
++const GRAVITY_CLIENT_PLATFORMS = new Set(['web', 'ios', 'android', 'desktop'])
++
++/** Hosted workspace runs (freebuff.com Web, /chat, iOS, Android, Desktop "send to Cloud") share
++ *  local Desktop's root agent id, so the template alone labels them `freebuff_desktop`. The
++ *  worker's run-metadata hint relabels them `freebuff_cloud` with the client's platform. The hint
++ *  only upgrades a user-key surface: it never turns a service-account surface into one that drops
++ *  external_user_id. */
++const resolveGravitySurface = (
++  agentTemplate: { id: string },
++  runMetadata: Record<string, string> | undefined,
++): { surface: string; clientPlatform: string | undefined } => {
++  const surface = gravitySurface(agentTemplate)
++  if (
++    runMetadata?.[GRAVITY_SURFACE_METADATA_KEY] !== 'freebuff_cloud' ||
++    isServiceAccountSurface(surface)
++  ) {
++    return { surface, clientPlatform: undefined }
++  }
++  const platform = runMetadata[GRAVITY_CLIENT_PLATFORM_METADATA_KEY]
++  return {
++    surface: 'freebuff_cloud',
++    clientPlatform:
++      platform && GRAVITY_CLIENT_PLATFORMS.has(platform) ? platform : 'web',
++  }
++}
++
+ export const handleGravityIndex = (async (params: {
+   previousToolCallFinished: Promise<void>
+   toolCall: CodebuffToolCall<'gravity_index'>
+   agentTemplate: AgentTemplate
+   /** Absent in direct unit tests; the runtime always passes it. */
+   agentState?: AgentState
+   logger: Logger
+   apiKey: string
++  /** The run's server-set metadata; carries the hosted Cloud surface hint. */
++  extraCodebuffMetadata?: Record<string, string>
+ 
+   agentStepId: string
+   clientSessionId: string
+   fingerprintId: string
+   repoId: string | undefined
+   userInputId: string
+   userId: string | undefined
+ 
+   fetch: typeof globalThis.fetch
+   clientEnv: ClientEnv
+   ciEnv: CiEnv
+ }): Promise<{
+   output: CodebuffToolOutput<'gravity_index'>
+   creditsUsed: number
+ }> => {
+   const {
+     previousToolCallFinished,
+     toolCall,
+     agentTemplate,
+     agentState,
+     agentStepId,
+     apiKey,
++    extraCodebuffMetadata,
+     clientSessionId,
+     fingerprintId,
+     logger,
+     repoId,
+     userId,
+     userInputId,
+     fetch,
+     clientEnv,
+     ciEnv,
+   } = params
+   const { action } = toolCall.input
+ 
+   const startedAt = Date.now()
+   const gravityContext = {
+     toolCallId: toolCall.toolCallId,
+     action,
+     userId,
+     agentStepId,
+     clientSessionId,
+     fingerprintId,
+     userInputId,
+     repoId,
+   }
+ 
+   await previousToolCallFinished
+@@ -266,55 +300,62 @@ export const handleGravityIndex = (async (params: {
+           creditsUsed,
+         }
+       }
+       if (preflight.rewritten) {
+         logger.info(
+           {
+             ...gravityContext,
+             rewritten: preflight.rewritten,
+             fromSearchId: toolCall.input.search_id,
+             toSearchId: preflight.searchId,
+             fromSlug: toolCall.input.integrated_slug,
+             toSlug: preflight.integratedSlug,
+           },
+           'Gravity report_integration corrected from this run’s searches',
+         )
+       }
+       existingInput = {
+         ...existingInput,
+         search_id: preflight.searchId,
+         integrated_slug: preflight.integratedSlug,
+       }
+     }
+     const existingMetadata = isJSONObject(existingInput.metadata)
+       ? existingInput.metadata
+       : {}
+-    const surface = gravitySurface(agentTemplate)
++    const { surface, clientPlatform } = resolveGravitySurface(
++      agentTemplate,
++      extraCodebuffMetadata,
++    )
++    // client_platform is server-set only: drop any the model supplied.
++    const { client_platform: _modelClientPlatform, ...modelMetadata } =
++      existingMetadata
+     const metadata = {
+-      ...existingMetadata,
++      ...modelMetadata,
+       ...omitUndefined({
+         surface,
++        client_platform: clientPlatform,
+         tool_call_id: toolCall.toolCallId,
+         agent_step_id: agentStepId,
+         fingerprint_id: fingerprintId,
+         user_input_id: userInputId,
+         repo_id: repoId,
+       }),
+     }
+     const input = {
+       ...existingInput,
+       external_session_id: clientSessionId,
+       // On service-account surfaces, `fingerprintId` (e.g.
+       // `freebuff-chat-<userId>` or the project id) is sent as the external
+       // user id. Other surfaces omit it.
+       ...(isServiceAccountSurface(surface)
+         ? { external_user_id: fingerprintId }
+         : {}),
+       metadata,
+     } satisfies JSONObject
+ 
+     const webApi = await callGravityIndexAPI({
+       input,
+       fetch,
+       logger,
+       apiKey,
+       env: { clientEnv, ciEnv },
