@@ -1,0 +1,192 @@
+diff --git a/common/src/types/freebuff-session.ts b/common/src/types/freebuff-session.ts
+index 97c4c9c9d..86ca89221 100644
+--- a/common/src/types/freebuff-session.ts
++++ b/common/src/types/freebuff-session.ts
+@@ -1326,52 +1326,56 @@ export type FreebuffSessionServerResponse =
+       desktopTabCapExempt?: true
+       desktopPurchases?: FreebuffDesktopPurchaseInfo[]
+       desktopRefunds?: FreebuffDesktopRefundInfo[]
+     }
+ 
+ /** Emitted only after the reversal ledger entry and purchase marker commit. */
+ export interface FreebuffDesktopRefundInfo {
+   /** Durable execution claims belonging to this purchase; omitted by older APIs. */
+   claimInstanceIds?: string[]
+   purchaseId: string
+   model: string
+   amount: number
+   walletAmount: number
+   /** Refunded bonus retired in the same settlement; absent on older APIs. */
+   expiredBonusAmount?: number
+   refundedAt: string
+   /** Original debit's accounting instant; legacy receipts use Pacific dates. */
+   poolDate: string
+   /** Immutable pool opening date (YYYY-MM-DD) in its historical reset timezone.
+    * Absent for legacy Pacific debits and older APIs. */
+   poolLocalDate?: string
+ }
+ 
+ export interface FreebuffDesktopPurchaseInfo {
+   model: string
++  /** While paused, when the paused hour stops waiting. */
+   expiresAt: string
+   holderInstanceId?: string
++  /** A paused hour (`freebuff-session-pause.ts`): the time the next session
++   *  on this model resumes it with. Absent on a running hour. */
++  pausedRemainingMs?: number
+ }
+ 
+ /**
+  * The session gate on `/api/v1/chat/completions`, as a wire contract.
+  *
+  * A rejection is identified by its `error` code paired with its HTTP status,
+  * never by its `message` — the prose is written for whoever is sitting in front
+  * of the client and is free to be rewritten. BOTH halves are required to match:
+  * 409/410 are ordinary provider outcomes on their own, and the codes are
+  * generic enough that an upstream error body can echo one, so a status-only or
+  * code-only test lets an unrelated failure impersonate the gate.
+  *
+  * `endsTheSession` marks the codes that mean the caller's row is GONE. Every
+  * one of them has the same recovery — forget the dead window and re-admit on
+  * the same instance id — which is why clients collapse them into one state
+  * rather than handling four. `false` is a refusal the session survives.
+  *
+  * Lives here because three surfaces need it and it drifted into three copies:
+  * the server that emits it (chat/completions), the CLI that matches it, and
+  * Desktop, which classifies it out of the SDK's relayed `AgentOutput`. See
+  * docs/freebuff-session-admission.md.
+  */
+ export const FREEBUFF_GATE_CODES = {
+   waiting_room_required: { status: 428, endsTheSession: true },
+   session_expired: { status: 410, endsTheSession: true },
+diff --git a/common/src/util/__tests__/freebuff-session-pause.test.ts b/common/src/util/__tests__/freebuff-session-pause.test.ts
+new file mode 100644
+index 000000000..f48ef7f57
+--- /dev/null
++++ b/common/src/util/__tests__/freebuff-session-pause.test.ts
+@@ -0,0 +1,48 @@
++import { describe, expect, test } from 'bun:test'
++
++import {
++  FREEBUFF_SESSION_PAUSE_COST_MS,
++  FREEBUFF_SESSION_PAUSE_MIN_KEEP_MS,
++  freebuffSessionPauseKeepsMs,
++} from '../freebuff-session-pause'
++
++const minute = 60_000
++const now = Date.parse('2026-11-24T12:00:00Z')
++
++describe('what a pause keeps', () => {
++  test('the time left, less 15 minutes', () => {
++    expect(FREEBUFF_SESSION_PAUSE_COST_MS).toBe(15 * minute)
++    expect(freebuffSessionPauseKeepsMs(now + 42 * minute, now)).toBe(
++      27 * minute,
++    )
++    expect(freebuffSessionPauseKeepsMs(now + 60 * minute, now)).toBe(
++      45 * minute,
++    )
++  })
++
++  test('nothing when the cost would leave less than a minute', () => {
++    expect(
++      freebuffSessionPauseKeepsMs(
++        now +
++          FREEBUFF_SESSION_PAUSE_COST_MS +
++          FREEBUFF_SESSION_PAUSE_MIN_KEEP_MS,
++        now,
++      ),
++    ).toBe(FREEBUFF_SESSION_PAUSE_MIN_KEEP_MS)
++    expect(
++      freebuffSessionPauseKeepsMs(
++        now +
++          FREEBUFF_SESSION_PAUSE_COST_MS +
++          FREEBUFF_SESSION_PAUSE_MIN_KEEP_MS -
++          1,
++        now,
++      ),
++    ).toBe(0)
++    expect(freebuffSessionPauseKeepsMs(now + 10 * minute, now)).toBe(0)
++    expect(freebuffSessionPauseKeepsMs(now - minute, now)).toBe(0)
++  })
++
++  test('nothing for an unreadable expiry', () => {
++    expect(freebuffSessionPauseKeepsMs(Number.NaN, now)).toBe(0)
++  })
++})
+diff --git a/common/src/util/freebuff-session-pause.ts b/common/src/util/freebuff-session-pause.ts
+new file mode 100644
+index 000000000..9eb9c3a43
+--- /dev/null
++++ b/common/src/util/freebuff-session-pause.ts
+@@ -0,0 +1,71 @@
++/**
++ * Pausing a paid hour (2026-11-24, product): a running session can stop its
++ * clock and keep the time it has left for later, less a fixed cost. The cost
++ * is the prompt cache: a paused chat's cached context is gone when it comes
++ * back, so its first turns are billed at the full input price.
++ *
++ * Only an hour a hosted chat (Web, Desktop's workspace window) or a current
++ * CLI holds can pause: those are the purchases in `freebuff_desktop_purchase`.
++ * The server decides (`pauseDesktopPurchase`); clients use these figures to
++ * say beforehand what a pause would keep.
++ */
++
++/** `POST` with the chat's instance id: pause the hour that claim holds. */
++export const FREEBUFF_SESSION_PAUSE_PATH = '/api/v1/freebuff/session/pause'
++
++/** What pausing takes off the time left. */
++export const FREEBUFF_SESSION_PAUSE_COST_MS = 15 * 60_000
++
++/** The least a pause may keep: below this there is nothing worth saving. */
++export const FREEBUFF_SESSION_PAUSE_MIN_KEEP_MS = 60_000
++
++/** How long a paused hour waits to be resumed. After that it ends as an
++ *  unresumed hour does, through the ordinary hour-end refund. */
++export const FREEBUFF_PAUSED_HOUR_HOLD_MS = 24 * 60 * 60_000
++
++/** The time a pause at `nowMs` would keep of an hour ending at
++ *  `expiresAtMs`, or 0 when it would keep less than the minimum. */
++export function freebuffSessionPauseKeepsMs(
++  expiresAtMs: number,
++  nowMs: number,
++): number {
++  if (!Number.isFinite(expiresAtMs) || !Number.isFinite(nowMs)) return 0
++  const kept = expiresAtMs - nowMs - FREEBUFF_SESSION_PAUSE_COST_MS
++  return kept >= FREEBUFF_SESSION_PAUSE_MIN_KEEP_MS ? kept : 0
++}
++
++/** Why the server would not pause an hour. */
++export type FreebuffSessionPauseRefusal =
++  /** No live paid hour on this claim (ended, expired, or never bought). */
++  | 'not_found'
++  /** A turn is running or queued on it: stop or finish it first. */
++  | 'busy'
++  /** Less than the cost plus the minimum is left. */
++  | 'too_short'
++  /** Nothing has run on it yet: ending it refunds the hour in full. */
++  | 'unused'
++
++export type FreebuffSessionPauseResponse =
++  | {
++      status: 'paused'
++      /** The time the hour keeps, already less the cost. */
++      keptMs: number
++      /** ISO instant the paused hour stops waiting. */
++      pausedUntil: string
++    }
++  | {
++      status: 'refused'
++      reason: FreebuffSessionPauseRefusal
++      message: string
++    }
++
++export const FREEBUFF_SESSION_PAUSE_REFUSAL_MESSAGES: Record<
++  FreebuffSessionPauseRefusal,
++  string
++> = {
++  not_found: 'This chat has no running session to pause.',
++  busy: 'Stop or finish the running turn before pausing.',
++  too_short: 'Less than 16 minutes are left, so a pause would keep nothing.',
++  unused:
++    'Nothing has run in this session yet. End it instead to get the hour back.',
++}
