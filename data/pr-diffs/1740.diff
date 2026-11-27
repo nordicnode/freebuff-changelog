@@ -1,0 +1,271 @@
+diff --git a/cli/src/utils/__tests__/detect-shell-argv.test.ts b/cli/src/utils/__tests__/detect-shell-argv.test.ts
+new file mode 100644
+index 0000000000..f10ec3169c
+--- /dev/null
++++ b/cli/src/utils/__tests__/detect-shell-argv.test.ts
+@@ -0,0 +1,66 @@
++/**
++ * `detect-shell` sets up a child process to ask who our parent is. It used to
++ * build that as a command LINE and hand it to `execSync`, which runs a string
++ * through a shell — so anything interpolated into it is shell syntax, not data.
++ * `process.ppid` is a number today, so that was never exploitable; the reason to
++ * pin it is that the shape invited the next edit to interpolate something that
++ * is not a number.
++ *
++ * This runs the POSIX branch on every platform by overriding `process.platform`
++ * for the duration of the test. That is deliberate: asserting only on Linux
++ * would have made this a test that passes here by doing nothing, which is the
++ * failure mode it exists to prevent.
++ *
++ * Probes run 2026-11-26, both against the change that introduced this file:
++ *  (a) `execFileSync('ps', ['-p', String(process.ppid), '-o', 'comm='])`
++ *      reverted to `execSync(\`ps -p ${process.ppid} -o comm=\`)` -> the
++ *      "no command line" assertion red (execSync called once).
++ *  (b) the ppid moved into the program name (`execFileSync('ps -p 1', [])`)
++ *      -> the argv assertion red, so the check is watching the real element.
++ */
++import { mock } from 'bun:test'
++import { afterAll, describe, expect, test } from 'bun:test'
++
++const execFileCalls: Array<[unknown, unknown]> = []
++const execSyncCalls: unknown[] = []
++
++const realChildProcess = { ...(await import('node:child_process')) }
++
++mock.module('child_process', () => ({
++  ...realChildProcess,
++  execFileSync: (...args: unknown[]) => {
++    execFileCalls.push([args[0], args[1]])
++    return Buffer.from('bash\n')
++  },
++  execSync: (...args: unknown[]) => {
++    execSyncCalls.push(args[0])
++    return Buffer.from('bash\n')
++  },
++}))
++
++const realPlatform = process.platform
++Object.defineProperty(process, 'platform', { value: 'linux' })
++
++const { detectShell } = await import('../detect-shell')
++
++afterAll(() => {
++  Object.defineProperty(process, 'platform', { value: realPlatform })
++  mock.restore()
++})
++
++describe('detect-shell parent inspection', () => {
++  test('asks ps with an argument array, never a command line', () => {
++    const shell = detectShell({ SHELL: undefined, COMSPEC: undefined } as never)
++
++    expect(shell).toBe('bash')
++    expect(execSyncCalls).toEqual([])
++    expect(execFileCalls).toHaveLength(1)
++    expect(execFileCalls[0]?.[0]).toBe('ps')
++    expect(execFileCalls[0]?.[1]).toEqual([
++      '-p',
++      String(process.ppid),
++      '-o',
++      'comm=',
++    ])
++  })
++})
+diff --git a/cli/src/utils/detect-shell.ts b/cli/src/utils/detect-shell.ts
+index dfb14e0e5d..75f3dba2a1 100644
+--- a/cli/src/utils/detect-shell.ts
++++ b/cli/src/utils/detect-shell.ts
+@@ -1,4 +1,4 @@
+-import { execSync } from 'child_process'
++import { execFileSync } from 'child_process'
+ 
+ import { getCliEnv } from './env'
+ 
+@@ -60,8 +60,9 @@ function detectFromEnvironment(env: CliEnv): ShellName | null {
+ function detectViaParentProcessInspection(): ShellName | null {
+   try {
+     if (process.platform === 'win32') {
+-      const parentProcess = execSync(
+-        'wmic process get ParentProcessId,CommandLine',
++      const parentProcess = execFileSync(
++        'wmic',
++        ['process', 'get', 'ParentProcessId,CommandLine'],
+         { stdio: 'pipe' },
+       )
+         .toString()
+@@ -70,9 +71,15 @@ function detectViaParentProcessInspection(): ShellName | null {
+       if (parentProcess.includes('powershell')) return 'powershell'
+       if (parentProcess.includes('cmd.exe')) return 'cmd.exe'
+     } else {
+-      const parentProcess = execSync(`ps -p ${process.ppid} -o comm=`, {
+-        stdio: 'pipe',
+-      })
++      // Arguments, not a command line: `execSync` would hand this string to a
++      // shell, so `${process.ppid}` would be shell-parsed rather than passed.
++      // `process.ppid` is always a number today, which is why this is a change
++      // of shape rather than a fix for a live exploit.
++      const parentProcess = execFileSync(
++        'ps',
++        ['-p', String(process.ppid), '-o', 'comm='],
++        { stdio: 'pipe' },
++      )
+         .toString()
+         .trim()
+       const normalized = normalizeCandidate(parentProcess)
+diff --git a/sdk/scripts/publish.ts b/sdk/scripts/publish.ts
+index 4de9740954..2b31bb3d2d 100755
+--- a/sdk/scripts/publish.ts
++++ b/sdk/scripts/publish.ts
+@@ -1,6 +1,6 @@
+ #!/usr/bin/env node
+ 
+-import { execSync } from 'child_process'
++import { execFileSync } from 'child_process'
+ import fs from 'fs'
+ import path from 'path'
+ import { fileURLToPath } from 'url'
+@@ -12,12 +12,18 @@ function log(message) {
+   console.log(`📦 ${message}`)
+ }
+ 
+-function run(command, options = {}) {
+-  log(`Running: ${command}`)
++/**
++ * Takes an argv array, never a command line: no shell parses this, so nothing
++ * a caller passes can become syntax. `execSync(command)` runs its string
++ * through a shell, which is one interpolation away from an injection.
++ */
++function run(argv, options = {}) {
++  const [file, ...args] = argv
++  log(`Running: ${argv.join(' ')}`)
+   try {
+-    return execSync(command, { stdio: 'inherit', ...options })
++    return execFileSync(file, args, { stdio: 'inherit', ...options })
+   } catch (error) {
+-    console.error(`❌ Command failed: ${command}`)
++    console.error(`❌ Command failed: ${argv.join(' ')}`)
+     process.exit(1)
+   }
+ }
+@@ -30,7 +36,7 @@ function main() {
+ 
+   // Verify the package
+   log('Verifying package contents...')
+-  run('npm pack --dry-run')
++  run(['npm', 'pack', '--dry-run'])
+ 
+   if (isDryRun) {
+     log('Dry run complete! Package is ready for publishing.')
+@@ -41,7 +47,7 @@ function main() {
+   // Publish
+   log('Publishing to npm...')
+   const packageJson = JSON.parse(fs.readFileSync('package.json', 'utf8'))
+-  run('npm publish')
++  run(['npm', 'publish'])
+   log('✅ SDK published successfully!')
+   log(`📦 Package: ${packageJson.name}@${packageJson.version}`)
+ }
+diff --git a/sdk/scripts/verify.ts b/sdk/scripts/verify.ts
+index 841a629fdf..83660a0227 100644
+--- a/sdk/scripts/verify.ts
++++ b/sdk/scripts/verify.ts
+@@ -8,7 +8,7 @@
+  *   bun run verify --skip-build  # Skip build step (use existing dist)
+  */
+ 
+-import { execSync, type ExecSyncOptions } from 'child_process'
++import { execFileSync, type ExecFileSyncOptions } from 'child_process'
+ import { existsSync, rmSync } from 'fs'
+ import { join } from 'path'
+ 
+@@ -44,8 +44,17 @@ function success(message: string) {
+   console.log(`  ✅ ${message}`)
+ }
+ 
+-function run(command: string, options: ExecSyncOptions = {}) {
+-  execSync(command, { cwd: sdkRoot, stdio: 'inherit', ...options })
++/**
++ * Takes an argv array, never a command line, so no argument can be read as
++ * shell syntax. The previous signature took a string and handed it to
++ * `execSync`, which runs it through a shell.
++ */
++function run(argv: readonly string[], options: ExecFileSyncOptions = {}) {
++  const [file, ...args] = argv
++  if (!file) {
++    throw new Error('run() needs a program name')
++  }
++  execFileSync(file, args, { cwd: sdkRoot, stdio: 'inherit', ...options })
+ }
+ 
+ function removeOldSdk(projectPath: string) {
+@@ -63,7 +72,7 @@ function cleanAndBuild() {
+   rmSync(distPath, { recursive: true, force: true })
+ 
+   step('Building SDK...')
+-  run('bun run build')
++  run(['bun', 'run', 'build'])
+ 
+   success('Build complete')
+ }
+@@ -72,7 +81,7 @@ function typecheck() {
+   log('Step 2: TypeScript Check')
+ 
+   step('Running typecheck on source...')
+-  run('tsc --noEmit -p .')
++  run(['tsc', '--noEmit', '-p', '.'])
+ 
+   success('TypeScript check passed')
+ }
+@@ -81,7 +90,7 @@ function smokeTest() {
+   log('Step 3: Smoke Test')
+ 
+   step('Running dist smoke tests...')
+-  run('bun run smoke-test-dist.ts')
++  run(['bun', 'run', 'smoke-test-dist.ts'])
+ 
+   success('Smoke test passed')
+ }
+@@ -99,16 +108,22 @@ function runDistCopySubproject(projectName: string) {
+   removeOldSdk(projectPath)
+ 
+   // Install dependencies
+-  execSync('npm install --silent --install-links', {
++  execFileSync('npm', ['install', '--silent', '--install-links'], {
+     cwd: projectPath,
+     stdio: 'inherit',
+   })
+ 
+   // Run setup (copies dist to node_modules)
+-  execSync('npm run setup', { cwd: projectPath, stdio: 'inherit' })
++  execFileSync('npm', ['run', 'setup'], {
++    cwd: projectPath,
++    stdio: 'inherit',
++  })
+ 
+   // Run all tests (imports + types)
+-  execSync('npm run test:all', { cwd: projectPath, stdio: 'inherit' })
++  execFileSync('npm', ['run', 'test:all'], {
++    cwd: projectPath,
++    stdio: 'inherit',
++  })
+ 
+   success(`${projectName} passed`)
+ }
+@@ -125,13 +140,16 @@ function runFileRefSubproject(projectName: string) {
+   removeOldSdk(projectPath)
+ 
+   // Install dependencies (uses file: reference)
+-  execSync('npm install --silent --install-links', {
++  execFileSync('npm', ['install', '--silent', '--install-links'], {
+     cwd: projectPath,
+     stdio: 'inherit',
+   })
+ 
+   // Run all tests
+-  execSync('npm run test:all', { cwd: projectPath, stdio: 'inherit' })
++  execFileSync('npm', ['run', 'test:all'], {
++    cwd: projectPath,
++    stdio: 'inherit',
++  })
+ 
+   success(`${projectName} passed`)
+ }
