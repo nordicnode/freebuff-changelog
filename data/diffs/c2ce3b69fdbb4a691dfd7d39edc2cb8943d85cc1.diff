@@ -1,0 +1,283 @@
+diff --git a/common/src/util/__tests__/log-data.test.ts b/common/src/util/__tests__/log-data.test.ts
+index 2f1803384..793c2fed4 100644
+--- a/common/src/util/__tests__/log-data.test.ts
++++ b/common/src/util/__tests__/log-data.test.ts
+@@ -9,50 +9,88 @@ describe('serializeLogData', () => {
+     const handle = 'fbm1.synthetic-catalog-handle'
+     for (const metric of [
+       'stream_recovery_detected',
+       'stream_recovery_rescued',
+       'stream_recovery_gave_up',
+       'stream_silent_timeout_continued',
+     ]) {
+       const data = { metric, model: handle, runId: 'run-123' }
+       expect(parse(data)).toEqual({ ...data, model: 'catalog' })
+       expect(data.model).toBe(handle)
+       const plain = { ...data, model: 'openrouter/example' }
+       expect(parse(plain)).toEqual(plain)
+     }
+   })
+ 
+   test('redacts an account-bound model in an unmarked error payload', () => {
+     const model = 'fbm1.synthetic-catalog-handle'
+     const error = { name: 'TypeError', message: 'fetch failed' }
+     expect(parse({ model, error })).toEqual({ model: 'catalog', error })
+     expect(parse({ model: 'openrouter/example', error })).toEqual({
+       model: 'openrouter/example',
+       error,
+     })
+   })
+ 
++  test('redacts compaction root selectors without changing ordinary models', () => {
++    const data = {
++      compaction_root_model: 'fbm1.synthetic-catalog-handle',
++      model: 'openrouter/example',
++      receipt_complete: true,
++    }
++    expect(parse(data)).toEqual({ ...data, compaction_root_model: 'catalog' })
++    const plain = { ...data, compaction_root_model: 'openrouter/other' }
++    expect(parse(plain)).toEqual(plain)
++    expect(
++      parse({ ...data, blob: 'x'.repeat(200_000) }).compaction_root_model,
++    ).toBe('catalog')
++  })
++
++  test('redacts selectors in nested CLI request diagnostics, even when capped', () => {
++    const handle = 'fbm1.synthetic-catalog-handle'
++    const error = {
++      requestBody: { model: handle, messageCount: 2 },
++      cause: {
++        requestBody: { model: 'openrouter/example' },
++        requestBodyValues: `{"fallback":{"model":"openrouter/example"},"model":"${handle}`,
++      },
++    }
++    const expected = {
++      requestBody: { model: 'catalog', messageCount: 2 },
++      cause: {
++        ...error.cause,
++        requestBodyValues:
++          '{"fallback":{"model":"openrouter/example"},"model":"catalog',
++      },
++    }
++    expect(toJsonSafeLogData({ error })).toEqual({ error: expected })
++    const row = parse({ error, blob: 'x'.repeat(200_000) })
++    expect(row._truncated).toBe(true)
++    expect(row.error).toEqual(expected)
++    expect(error.requestBody.model).toBe(handle)
++  })
++
+   // JSON.stringify(new Error('x')) is '{}': the reason never reached Axiom.
+   test('an error keeps its name and message', () => {
+     const row = parse({ error: new TypeError('fetch failed') })
+     expect(row.error.name).toBe('TypeError')
+     expect(row.error.message).toBe('fetch failed')
+     expect(typeof row.error.stack).toBe('string')
+   })
+ 
+   test('keeps the fields a library adds, and walks the cause', () => {
+     const cause = Object.assign(new Error('canceling statement'), {
+       code: '57014',
+     })
+     const error = Object.assign(new Error('Failed query', { cause }), {
+       query: 'select 1',
+     })
+     const row = parse({ error })
+     expect(row.error.query).toBe('select 1')
+     expect(row.error.cause.message).toBe('canceling statement')
+     expect(row.error.cause.code).toBe('57014')
+   })
+ 
+   // The 2026-10-02 ad-revenue rollup failure: a bulk insert's DrizzleQueryError
+   // was 522 KB of SQL and params, the row was cut at the data cap, and the
+   // Postgres reason on `cause` never reached Axiom.
+   test('a huge failed query keeps its cause and drops the payload', () => {
+diff --git a/common/src/util/log-data.ts b/common/src/util/log-data.ts
+index 44d181e99..a466e5118 100644
+--- a/common/src/util/log-data.ts
++++ b/common/src/util/log-data.ts
+@@ -53,169 +53,168 @@ function errorToJson(original: Error): Record<string, unknown> {
+   // MAX_LOG_DATA_BYTES, and the `cause` holding the Postgres reason came after
+   // the cut. Keep the head of the statement and the cause.
+   const error = redactQueryErrorForLog(original)
+   const fields: Record<string, unknown> = { ...error }
+   if (typeof fields.query === 'string') {
+     fields.query = clip(fields.query, MAX_ERROR_QUERY_CHARS)
+   }
+   // An AI SDK `APICallError` carries the whole LLM request (every message),
+   // both header sets and the URL, and Bun's fetch errors the URL as `path`:
+   // keep their shape, never the prompt or a key. The same function redacts
+   // `getErrorObject`'s raw dump, so the two paths cannot drift apart.
+   for (const key of Object.keys(fields)) {
+     fields[key] = redactErrorFieldForLog(key, fields[key])
+   }
+   return {
+     ...fields,
+     name: error.name,
+     message: clip(error.message, MAX_ERROR_MESSAGE_CHARS),
+     ...(error.stack
+       ? { stack: error.stack.slice(0, MAX_ERROR_STACK_CHARS) }
+       : {}),
+     ...(error.cause !== undefined ? { cause: error.cause } : {}),
+   }
+ }
+ 
++function redactModelSelector(key: string, value: unknown): unknown {
++  if (typeof value !== 'string') return value
++  if (key === 'model' || key === 'compaction_root_model') {
++    return isFreebuffModelHandle(value) ? 'catalog' : value
++  }
++  if (key === 'requestBodyValues') {
++    return value.replace(/("model"\s*:\s*")fbm1\.[\w-]*/g, '$1catalog')
++  }
++  return value
++}
++
+ /** Stringify a log payload, tolerating circular refs and unwrapping Errors. */
+ export function stringifyLogData(data: unknown): string | undefined {
+   try {
+     const seen = new WeakSet()
+-    return JSON.stringify(data, (_k, v) => {
++    return JSON.stringify(data, (key, v) => {
+       if (typeof v === 'object' && v !== null) {
+         if (seen.has(v)) return '[Circular]'
+         seen.add(v)
+         if (v instanceof Error) return errorToJson(v)
+       }
+-      return v
++      return redactModelSelector(key, v)
+     })
+   } catch {
+     return undefined
+   }
+ }
+ 
+ /**
+  * Fit an oversized log payload inside MAX_LOG_DATA_BYTES **without losing the
+  * fields that identify it.**
+  *
+  * The whole payload used to be replaced by one `preview` string, so a single
+  * oversized field took every small field beside it down with it. Measured on
+  * 2026-10-14 against one hour of production: **171 of 281 `Agent execution
+  * failed` rows (61%, 149 distinct users) carried no queryable `error`,
+  * `agentType`, `agentId` or `runId`** — the CLI's failure line logs
+  * `messageHistory` and `systemPrompt`, which alone run past the cap (121 KB in
+  * the sampled row), so every row of the busiest error line in the dataset was
+  * unattributable. `errorToJson`'s comment above records the same accident
+  * happening to a drizzle `cause` on 2026-10-02 and fixes it for that one
+  * shape; this fixes it for every shape.
+  *
+  * Keeps fields smallest-first until the budget is spent, so the scalars that
+  * identify a row (ids, counts, status codes) survive by construction and only
+  * the payloads are dropped. `_omitted` names each dropped field and its size,
+  * because "this row had no error" and "this row's error did not fit" are
+  * different facts and the old shape could not tell them apart. The byte cap is
+  * unchanged, so ingest cost is unchanged.
+  */
+ function fitLogDataToCap(data: unknown, originalBytes: number): string {
+   const wholePayloadPreview = (serialized: string) =>
+     JSON.stringify({
+       _truncated: true,
+       original_bytes: originalBytes,
+       preview: serialized.slice(0, MAX_LOG_DATA_BYTES),
+     })
+ 
+   if (!data || typeof data !== 'object' || Array.isArray(data)) {
+     return wholePayloadPreview(stringifyLogData(data) ?? '')
+   }
+ 
+   const sized: { key: string; value: unknown; bytes: number }[] = []
+   for (const [key, value] of Object.entries(data)) {
+     if (value === undefined) continue
+-    const serialized = stringifyLogData(value)
++    const serialized = stringifyLogData(redactModelSelector(key, value))
+     if (serialized === undefined) continue
+     // `"key":` plus a separator, so the budget counts what the row will cost.
+     sized.push({ key, value, bytes: serialized.length + key.length + 4 })
+   }
+   sized.sort((a, b) => a.bytes - b.bytes)
+ 
+   const kept: Record<string, unknown> = {}
+   const omitted: Record<string, number> = {}
+   // Headroom for the `_truncated` / `original_bytes` / `_omitted` markers.
+   let budget = MAX_LOG_DATA_BYTES - 256
+   for (const field of sized) {
+     if (field.bytes <= budget) {
+       kept[field.key] = field.value
+       budget -= field.bytes
+     } else {
+       omitted[field.key] = field.bytes
+       // A dropped field still costs its name in `_omitted`.
+       budget -= field.key.length + 12
+     }
+   }
+ 
+   // Nothing fit: fall back to a preview, so a single enormous field still
+   // leaves a readable head rather than only its byte count.
+   if (Object.keys(kept).length === 0) {
+     return wholePayloadPreview(stringifyLogData(data) ?? '')
+   }
+ 
+   const fitted = stringifyLogData({
+     ...kept,
+     _truncated: true,
+     original_bytes: originalBytes,
+     _omitted: omitted,
+   })
+   // The budget arithmetic should make this unreachable; a payload whose
+   // serialization grew anyway falls back rather than breaking the cap.
+   if (fitted === undefined || fitted.length > MAX_LOG_DATA_BYTES) {
+     return wholePayloadPreview(stringifyLogData(data) ?? '')
+   }
+   return fitted
+ }
+ 
+-function redactAccountBoundModel(data: unknown): unknown {
+-  if (data === null || typeof data !== 'object' || Array.isArray(data)) {
+-    return data
+-  }
+-  const { model } = data as Record<string, unknown>
+-  if (typeof model === 'string' && isFreebuffModelHandle(model)) {
+-    return { ...data, model: 'catalog' }
+-  }
+-  return data
+-}
+-
+ /**
+  * Serialize a log payload to a single string field, tolerating circular refs
+  * and capping size. The cap applies to ALL sources so a large `data` payload
+  * can't inflate Axiom ingest cost. The truncated form is still valid JSON so
+  * query scripts can `parse_json(data)`.
+  *
+  * An oversized object keeps the fields that fit (see {@link fitLogDataToCap});
+  * only an oversized string or array collapses to a `preview`.
+  */
+-export function serializeLogData(input: unknown): string | null {
+-  if (input == null) return null
+-  const data = redactAccountBoundModel(input)
++export function serializeLogData(data: unknown): string | null {
++  if (data == null) return null
+   let serialized: string
+   if (typeof data === 'string') {
+     serialized = data
+   } else {
+     const stringified = stringifyLogData(data)
+     if (stringified === undefined) return null
+     serialized = stringified
+   }
+   if (serialized.length > MAX_LOG_DATA_BYTES) {
+     return typeof data === 'string'
+       ? JSON.stringify({
+           _truncated: true,
+           original_bytes: serialized.length,
+           preview: serialized.slice(0, MAX_LOG_DATA_BYTES),
+         })
+       : fitLogDataToCap(data, serialized.length)
+   }
+   return serialized
+ }
+ 
+ /**
+  * The same payload with every `Error` replaced by its JSON form, as plain
+  * JSON values rather than a string.
+  *
+  * For producers that hand their payload to ANOTHER process before it reaches
